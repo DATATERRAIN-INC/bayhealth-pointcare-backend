@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -26,6 +27,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "apps.ai_caller.apps.AiCallerConfig",
     "apps.users.apps.UsersConfig",
+    "apps.notifications.apps.NotificationsConfig",
 ]
 
 MIDDLEWARE = [
@@ -77,8 +79,12 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": [],
-    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "apps.users.authentication.CognitoBearerAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
     "EXCEPTION_HANDLER": "common.exceptions.custom_exception_handler",
     "UNAUTHENTICATED_USER": None,
 }
@@ -120,3 +126,35 @@ EMAIL_RESTRICTION = os.environ.get("EMAIL_RESTRICTION", "false").strip().lower()
     "yes",
 )
 PASSWORD_RESET_URL = os.environ.get("PASSWORD_RESET_URL", "")
+
+# Celery — automated AI caller
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = os.getenv("CELERY_TIMEZONE", "UTC")
+CELERY_BEAT_SCHEDULE = {
+    "ai-caller-process-outbound-calls": {
+        "task": "ai_caller.process_outbound_calls",
+        "schedule": timedelta(
+            seconds=float(os.getenv("CELERY_OUTBOUND_INTERVAL_SECONDS", "60"))
+        ),
+    },
+}
+
+# Twilio warm-transfer (AI + live-agent H2H recording / merge)
+BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "") or os.getenv(
+    "TOLLFREE_TWILIO_PHONE_NUMBER", ""
+)
+TWILIO_VOICE = os.getenv("TWILIO_VOICE", "Joanna")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+CALL_TRANSCRIPTION_MODEL = os.getenv("CALL_TRANSCRIPTION_MODEL", "")
+WARM_TRANSFER_ENABLED = os.getenv("WARM_TRANSFER_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)

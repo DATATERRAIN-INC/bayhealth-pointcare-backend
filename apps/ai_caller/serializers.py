@@ -3,7 +3,7 @@ from datetime import date
 from rest_framework import serializers
 
 from apps.ai_caller.constants import ALLOWED_UPLOAD_EXTENSIONS
-from apps.ai_caller.models import Call, Patient
+from apps.ai_caller.models import Call, CallerSettings, Patient
 from common.s3 import build_s3_url
 
 
@@ -24,6 +24,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "phone_number",
             "live_agent_country_code",
             "live_agent_number",
+            "is_blocked",
             "source",
             "upload_file_key",
             "created_at",
@@ -109,3 +110,47 @@ class CallSerializer(serializers.ModelSerializer):
 
     def get_message_count(self, obj):
         return len(obj.transcript or [])
+
+
+class CallerSettingsSerializer(serializers.ModelSerializer):
+    window_summary = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CallerSettings
+        fields = (
+            "calls_enabled",
+            "recording_enabled",
+            "start_time",
+            "end_time",
+            "timezone",
+            "max_calls_per_run",
+            "window_summary",
+            "updated_at",
+        )
+        read_only_fields = ("window_summary", "updated_at")
+
+    def get_window_summary(self, obj):
+        from apps.ai_caller.services import build_calling_window_summary
+
+        return build_calling_window_summary(obj)
+
+    def validate_timezone(self, value):
+        tz_name = (value or "").strip()
+        if not tz_name:
+            raise serializers.ValidationError("Timezone is required.")
+        try:
+            from apps.ai_caller.services import resolve_timezone
+
+            resolve_timezone(tz_name)
+        except Exception:
+            raise serializers.ValidationError("Invalid timezone.")
+        return tz_name
+
+    def validate(self, attrs):
+        start = attrs.get("start_time", getattr(self.instance, "start_time", None))
+        end = attrs.get("end_time", getattr(self.instance, "end_time", None))
+        if start and end and start >= end:
+            raise serializers.ValidationError(
+                {"end_time": "End time must be after start time."}
+            )
+        return attrs

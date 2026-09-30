@@ -20,5 +20,15 @@ def custom_exception_handler(exc, context):
     else:
         message = str(data)
 
+    # Never leak raw Cognito / AWS validation text to clients.
+    lowered = message.lower()
+    if (
+        "validation error detected" in lowered
+        or "failed to satisfy constraint" in lowered
+        or "member must satisfy regular expression" in lowered
+        or "accesstoken" in lowered.replace(" ", "")
+    ):
+        message = "Invalid or expired access token."
+
     response.data = {"message": message}
     return response
