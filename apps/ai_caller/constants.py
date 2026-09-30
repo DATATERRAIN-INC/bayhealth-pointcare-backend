@@ -1,5 +1,6 @@
 PATIENT_EXCEL_COLUMNS = (
-    "name",
+    "first_name",
+    "last_name",
     "address",
     "dob",
     "doctor",

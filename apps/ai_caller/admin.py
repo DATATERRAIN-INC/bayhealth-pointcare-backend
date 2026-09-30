@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from apps.ai_caller.models import Patient, UploadedFile
+from apps.ai_caller.models import Call, Patient, UploadedFile
 
 
 @admin.register(UploadedFile)
@@ -23,7 +23,8 @@ class UploadedFileAdmin(admin.ModelAdmin):
 class PatientAdmin(admin.ModelAdmin):
     list_display = (
         "id",
-        "name",
+        "first_name",
+        "last_name",
         "phone_number",
         "live_agent_country_code",
         "live_agent_number",
@@ -34,6 +35,38 @@ class PatientAdmin(admin.ModelAdmin):
         "created_at",
     )
     list_filter = ("source", "doctor")
-    search_fields = ("name", "doctor", "phone_number", "live_agent_number", "address")
+    search_fields = (
+        "first_name",
+        "last_name",
+        "doctor",
+        "phone_number",
+        "live_agent_number",
+        "address",
+    )
     ordering = ("-created_at",)
     raw_id_fields = ("upload",)
+
+
+@admin.register(Call)
+class CallAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "patient",
+        "retell_call_id",
+        "flow",
+        "status",
+        "to_number",
+        "started_at",
+        "ended_at",
+        "created_at",
+    )
+    list_filter = ("status", "flow")
+    search_fields = (
+        "retell_call_id",
+        "to_number",
+        "patient__first_name",
+        "patient__last_name",
+    )
+    ordering = ("-started_at",)
+    raw_id_fields = ("patient",)
+    readonly_fields = ("created_at", "updated_at")
