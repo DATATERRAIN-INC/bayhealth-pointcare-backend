@@ -12,6 +12,7 @@ ALLOWED_HOSTS = ["*"]
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:4200",
+    "https://bach.gapincare.socialroots-dev.net",
 ]
 
 INSTALLED_APPS = [
