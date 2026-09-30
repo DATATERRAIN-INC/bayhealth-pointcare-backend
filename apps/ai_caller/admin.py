@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from apps.ai_caller.models import Call, Patient, UploadedFile
+from apps.ai_caller.models import Call, CallerSettings, Patient, UploadedFile
 
 
 @admin.register(UploadedFile)
@@ -26,6 +26,7 @@ class PatientAdmin(admin.ModelAdmin):
         "first_name",
         "last_name",
         "phone_number",
+        "is_blocked",
         "live_agent_country_code",
         "live_agent_number",
         "doctor",
@@ -34,7 +35,7 @@ class PatientAdmin(admin.ModelAdmin):
         "dob",
         "created_at",
     )
-    list_filter = ("source", "doctor")
+    list_filter = ("source", "doctor", "is_blocked")
     search_fields = (
         "first_name",
         "last_name",
@@ -70,3 +71,23 @@ class CallAdmin(admin.ModelAdmin):
     ordering = ("-started_at",)
     raw_id_fields = ("patient",)
     readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(CallerSettings)
+class CallerSettingsAdmin(admin.ModelAdmin):
+    list_display = (
+        "calls_enabled",
+        "recording_enabled",
+        "start_time",
+        "end_time",
+        "timezone",
+        "max_calls_per_run",
+        "updated_at",
+    )
+    readonly_fields = ("updated_at",)
+
+    def has_add_permission(self, request):
+        return not CallerSettings.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False

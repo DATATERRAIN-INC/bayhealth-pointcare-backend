@@ -8,11 +8,13 @@ from rest_framework.views import APIView
 from apps.ai_caller.models import Call, PatientSource
 from apps.ai_caller.serializers import (
     CallSerializer,
+    CallerSettingsSerializer,
     PatientSerializer,
     PlaceOutboundCallSerializer,
 )
 from apps.ai_caller.services import (
     get_call_queryset,
+    get_caller_settings,
     get_patient_queryset,
     place_outbound_call_for_patient,
     sync_call_transcript,
@@ -26,29 +28,47 @@ from common.responses import error_response, message_response
 
 class PatientViewSet(viewsets.ModelViewSet):
     serializer_class = PatientSerializer
-    permission_classes = [AllowAny]
-    authentication_classes = []
     pagination_class = CommonPagination
 
     def get_queryset(self):
+        blocked = self.request.query_params.get("is_blocked")
+        is_blocked = None
+        if blocked is not None and str(blocked).strip() != "":
+            is_blocked = str(blocked).strip().lower() in ("1", "true", "yes")
         return get_patient_queryset(
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
+            is_blocked=is_blocked,
         )
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save(source=PatientSource.MANUAL)
+        patient = serializer.save(source=PatientSource.MANUAL)
+        from apps.notifications.services import notify_patient_created
+
+        notify_patient_created(patient)
         return message_response("Patient saved successfully.", 201)
 
     def update(self, request, *args, **kwargs):
         patient = self.get_object()
+        was_blocked = patient.is_blocked
         serializer = self.get_serializer(
             patient, data=request.data, partial=kwargs.pop("partial", False)
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        changed_fields = sorted(serializer.validated_data.keys())
+        patient = serializer.save()
+
+        from apps.notifications.services import (
+            notify_patient_block_toggle,
+            notify_patient_updated,
+        )
+
+        if "is_blocked" in changed_fields and patient.is_blocked != was_blocked:
+            notify_patient_block_toggle(patient)
+        elif changed_fields:
+            notify_patient_updated(patient, changed_fields=changed_fields)
         return message_response("Patient updated successfully.")
 
     def destroy(self, request, *args, **kwargs):
@@ -77,8 +97,6 @@ class PatientViewSet(viewsets.ModelViewSet):
 
 class CallViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = CallSerializer
-    permission_classes = [AllowAny]
-    authentication_classes = []
     pagination_class = CommonPagination
 
     def get_queryset(self):
@@ -120,9 +138,6 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class PlaceOutboundCallView(APIView):
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
     def post(self, request):
         serializer = PlaceOutboundCallSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -139,8 +154,28 @@ class PlaceOutboundCallView(APIView):
         return message_response("Call placed successfully.")
 
 
+class CallerSettingsView(APIView):
+    """GET/PATCH controller settings for the automated AI caller."""
+
+    def get(self, request):
+        settings_obj = get_caller_settings()
+        return Response(CallerSettingsSerializer(settings_obj).data)
+
+    def patch(self, request):
+        settings_obj = get_caller_settings()
+        serializer = CallerSettingsSerializer(
+            settings_obj, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(CallerSettingsSerializer(settings_obj).data)
+
+    def put(self, request):
+        return self.patch(request)
+
+
 class RetellWebhookView(APIView):
-    """Receive Retell call events and store status/transcript."""
+    """Receive Retell call events and store status/transcript. Public (no auth)."""
 
     permission_classes = [AllowAny]
     authentication_classes = []

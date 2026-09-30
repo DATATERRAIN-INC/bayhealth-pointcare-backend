@@ -1,3 +1,5 @@
+from datetime import time
+
 from django.db import models
 from django.utils import timezone
 
@@ -42,6 +44,7 @@ class Patient(models.Model):
     phone_number = models.CharField(max_length=32)
     live_agent_country_code = models.CharField(max_length=8, blank=True, default="")
     live_agent_number = models.CharField(max_length=32)
+    is_blocked = models.BooleanField(default=False)
     source = models.CharField(
         max_length=16,
         choices=PatientSource.choices,
@@ -98,6 +101,10 @@ class Call(models.Model):
     agent_id = models.CharField(max_length=120, blank=True, default="")
     transfer_number = models.CharField(max_length=32, blank=True, default="")
     transcript = models.JSONField(default=list, blank=True)
+    retell_transcript = models.JSONField(default=list, blank=True)
+    live_agent_transcript = models.JSONField(default=list, blank=True)
+    recording_url = models.CharField(max_length=1024, blank=True, default="")
+    warm_transfer_session_id = models.CharField(max_length=64, blank=True, default="")
     started_at = models.DateTimeField(default=timezone.now)
     ended_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now, editable=False)
@@ -121,3 +128,35 @@ class Call(models.Model):
     @property
     def has_transcript(self):
         return bool(self.transcript)
+
+
+class CallerSettings(models.Model):
+    """Singleton controller settings for automated AI calling."""
+
+    calls_enabled = models.BooleanField(default=False)
+    recording_enabled = models.BooleanField(default=True)
+    start_time = models.TimeField(default=time(9, 0))
+    end_time = models.TimeField(default=time(17, 0))
+    timezone = models.CharField(max_length=64, default="America/New_York")
+    max_calls_per_run = models.PositiveIntegerField(default=5)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Caller settings"
+        verbose_name_plural = "Caller settings"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        pass
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        state = "enabled" if self.calls_enabled else "disabled"
+        return f"Caller settings ({state})"

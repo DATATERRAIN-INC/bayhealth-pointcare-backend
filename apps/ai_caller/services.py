@@ -1,10 +1,11 @@
-from datetime import date
+from datetime import date, datetime, time, timedelta
 
+from django.conf import settings
 from django.db.models import CharField, Q, Value
 from django.db.models.functions import Cast, Concat
 from django.utils import timezone
 
-from apps.ai_caller.models import Call, Patient, PatientSource, UploadedFile
+from apps.ai_caller.models import Call, CallerSettings, Patient, PatientSource, UploadedFile
 from apps.ai_caller.retell import (
     get_retell_call,
     normalize_phone,
@@ -12,11 +13,12 @@ from apps.ai_caller.retell import (
     place_retell_guardian_call,
 )
 from apps.ai_caller.serializers import PatientSerializer, PatientUploadSerializer
+from apps.ai_caller.transcript_merge import merge_ai_and_humans
 from common.excel import parse_patient_upload
 from common.s3 import upload_bytes
 
 
-def get_patient_queryset(*, search="", source=""):
+def get_patient_queryset(*, search="", source="", is_blocked=None):
     queryset = Patient.objects.all()
     search = (search or "").strip()
     source = (source or "").strip().lower()
@@ -34,6 +36,8 @@ def get_patient_queryset(*, search="", source=""):
         )
     if source and source != "all":
         queryset = queryset.filter(source=source)
+    if is_blocked is not None:
+        queryset = queryset.filter(is_blocked=is_blocked)
     return queryset
 
 
@@ -201,6 +205,15 @@ def upload_patients_from_file(django_file):
         update_fields=["uploaded_count", "failed_count", "status", "error_message"]
     )
 
+    from apps.notifications.services import notify_patient_upload
+
+    notify_patient_upload(
+        uploaded_count=len(created),
+        failed_count=len(skipped),
+        upload_id=file_log.id,
+        file_name=filename,
+    )
+
     return {
         "upload_id": file_log.id,
         "file_name": filename,
@@ -309,7 +322,7 @@ def _parse_retell_time(value):
     return None
 
 
-def _save_call(patient, result, *, dial_number, transfer_number):
+def _save_call(patient, result, *, dial_number, transfer_number, session_id=""):
     return Call.objects.create(
         patient=patient,
         retell_call_id=result["call_id"],
@@ -319,7 +332,29 @@ def _save_call(patient, result, *, dial_number, transfer_number):
         to_number=dial_number,
         agent_id=result.get("agent_id") or "",
         transfer_number=transfer_number,
+        warm_transfer_session_id=(session_id or "")[:64],
         started_at=timezone.now(),
+    )
+
+
+def _warm_transfer_enabled():
+    return bool(getattr(settings, "WARM_TRANSFER_ENABLED", False))
+
+
+def _prepare_warm_transfer_bridge(*, patient, dial_number, live_agent_number):
+    from apps.ai_caller.twilio_bridge import prepare_retell_bridge
+
+    return prepare_retell_bridge(
+        phone_number=dial_number,
+        name=patient.full_name or "there",
+        transfer_number=live_agent_number,
+        service_name="care",
+        extra={
+            "patient_id": patient.id,
+            "live_agent_number": live_agent_number,
+            "inbound_speaker": "patient",
+            "dial_speaker": "provider",
+        },
     )
 
 
@@ -332,6 +367,20 @@ def place_outbound_call_for_patient(patient_id):
             "status_code": 404,
         }
 
+    if patient.is_blocked:
+        return {
+            "ok": False,
+            "error": "Patient is blocked.",
+            "status_code": 400,
+        }
+
+    if Call.objects.filter(patient=patient, status=Call.Status.COMPLETED).exists():
+        return {
+            "ok": False,
+            "error": "Patient already has a completed call.",
+            "status_code": 400,
+        }
+
     dial_number = _combine_phone(patient.country_code, patient.phone_number)
     if not dial_number:
         return {
@@ -340,16 +389,30 @@ def place_outbound_call_for_patient(patient_id):
             "status_code": 400,
         }
 
-    transfer_number = _combine_phone(
+    live_agent_number = _combine_phone(
         patient.live_agent_country_code,
         patient.live_agent_number,
     )
-    if not transfer_number:
+    if not live_agent_number:
         return {
             "ok": False,
             "error": "Live agent number is invalid.",
             "status_code": 400,
         }
+
+    retell_transfer_number = live_agent_number
+    session_id = ""
+    bridge = None
+    if _warm_transfer_enabled():
+        bridge = _prepare_warm_transfer_bridge(
+            patient=patient,
+            dial_number=dial_number,
+            live_agent_number=live_agent_number,
+        )
+        if not bridge.get("ok"):
+            return bridge
+        retell_transfer_number = bridge["bridge_number"]
+        session_id = bridge.get("session_id") or ""
 
     if _is_minor(patient.dob):
         result = place_retell_guardian_call(
@@ -357,7 +420,7 @@ def place_outbound_call_for_patient(patient_id):
             patient_name=patient.full_name,
             address_on_file=patient.address,
             provider_name=patient.doctor,
-            transfer_number=transfer_number,
+            transfer_number=retell_transfer_number,
         )
         result["flow"] = result.get("flow") or Call.Flow.GUARDIAN
     else:
@@ -366,18 +429,31 @@ def place_outbound_call_for_patient(patient_id):
             name=patient.doctor,
             patient_name=patient.full_name,
             address_on_file=patient.address,
-            transfer_number=transfer_number,
+            transfer_number=retell_transfer_number,
         )
         result["flow"] = result.get("flow") or Call.Flow.OUTBOUND
 
-    if result.get("ok"):
-        call = _save_call(
-            patient,
-            result,
-            dial_number=dial_number,
-            transfer_number=transfer_number,
-        )
-        result["db_call_id"] = call.id
+    if not result.get("ok"):
+        if bridge and bridge.get("session"):
+            from apps.ai_caller.twilio_bridge import restore_inbound_voice_url
+
+            restore_inbound_voice_url(bridge.get("session") or {})
+        return result
+
+    call = _save_call(
+        patient,
+        result,
+        dial_number=dial_number,
+        transfer_number=live_agent_number,
+        session_id=session_id,
+    )
+    result["db_call_id"] = call.id
+    result["warm_transfer"] = bool(session_id)
+
+    if session_id and result.get("call_id"):
+        from apps.ai_caller.twilio_bridge import attach_retell_call
+
+        attach_retell_call(session_id, result["call_id"])
 
     return result
 
@@ -413,10 +489,21 @@ def update_call_from_retell_payload(payload):
 
     transcript = data.get("transcript_object") or data.get("transcript")
     if transcript is not None:
-        call.transcript = _normalize_transcript(transcript)
+        ai_items = _normalize_transcript(transcript)
+        for item in ai_items:
+            item["segment"] = "ai"
+        call.retell_transcript = ai_items
+        call.transcript = merge_ai_and_humans(ai_items, call.live_agent_transcript or [])
 
     call.save(
-        update_fields=["status", "transcript", "started_at", "ended_at", "updated_at"]
+        update_fields=[
+            "status",
+            "transcript",
+            "retell_transcript",
+            "started_at",
+            "ended_at",
+            "updated_at",
+        ]
     )
     return call, None
 
@@ -430,3 +517,158 @@ def sync_call_transcript(call):
     if error:
         return None, error
     return updated, None
+
+
+def resolve_timezone(tz_name):
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # Python < 3.9
+        from backports.zoneinfo import ZoneInfo
+
+    return ZoneInfo((tz_name or "America/New_York").strip())
+
+
+def get_caller_settings():
+    return CallerSettings.load()
+
+
+def _as_time(value):
+    if isinstance(value, time):
+        return value.replace(second=0, microsecond=0)
+    if isinstance(value, str):
+        raw = value.strip()
+        for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p"):
+            try:
+                return datetime.strptime(raw, fmt).time().replace(second=0, microsecond=0)
+            except ValueError:
+                continue
+    raise ValueError(f"Invalid time value: {value!r}")
+
+
+def build_calling_window_summary(settings_obj=None):
+    settings_obj = settings_obj or get_caller_settings()
+    start_t = _as_time(settings_obj.start_time)
+    end_t = _as_time(settings_obj.end_time)
+    start = start_t.strftime("%I:%M %p").lstrip("0")
+    end = end_t.strftime("%I:%M %p").lstrip("0")
+    tz_name = settings_obj.timezone
+    try:
+        now = timezone.now().astimezone(resolve_timezone(tz_name))
+        abbrev = now.tzname() or tz_name
+    except Exception:
+        abbrev = tz_name
+
+    start_minutes = start_t.hour * 60 + start_t.minute
+    end_minutes = end_t.hour * 60 + end_t.minute
+    hours = max(0, (end_minutes - start_minutes) / 60)
+    hours_label = f"{hours:g} hour" if hours == 1 else f"{hours:g} hours"
+    return (
+        f"Calls run {start} – {end} {abbrev} ({hours_label}). "
+        "Calls outside this window wait until it opens."
+    )
+
+
+def is_within_calling_window(settings_obj=None, when=None):
+    settings_obj = settings_obj or get_caller_settings()
+    try:
+        tz = resolve_timezone(settings_obj.timezone)
+    except Exception:
+        return False
+
+    local_now = (when or timezone.now()).astimezone(tz)
+    current = local_now.time().replace(second=0, microsecond=0)
+    start = _as_time(settings_obj.start_time)
+    end = _as_time(settings_obj.end_time)
+    return start <= current <= end
+
+
+def _local_day_bounds(settings_obj):
+    tz = resolve_timezone(settings_obj.timezone)
+    local_now = timezone.now().astimezone(tz)
+    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    return start_local, end_local
+
+
+def patients_due_for_outbound(settings_obj=None, limit=None):
+    """Eligible patients: not blocked, no completed call, no attempt today."""
+    settings_obj = settings_obj or get_caller_settings()
+    day_start, day_end = _local_day_bounds(settings_obj)
+
+    completed_ids = Call.objects.filter(
+        status=Call.Status.COMPLETED,
+    ).values_list("patient_id", flat=True)
+
+    already_called_today = Call.objects.filter(
+        started_at__gte=day_start,
+        started_at__lt=day_end,
+    ).values_list("patient_id", flat=True)
+
+    queryset = (
+        Patient.objects.filter(is_blocked=False)
+        .exclude(id__in=completed_ids)
+        .exclude(id__in=already_called_today)
+        .order_by("id")
+    )
+    limit = limit if limit is not None else settings_obj.max_calls_per_run
+    if limit:
+        queryset = queryset[: max(1, int(limit))]
+    return list(queryset)
+
+
+def run_scheduled_outbound_calls():
+    """
+    Celery entrypoint: place outbound calls when enabled and inside the window.
+    Reuses place_outbound_call_for_patient (same path as PlaceOutboundCallView).
+    """
+    settings_obj = get_caller_settings()
+    if not settings_obj.calls_enabled:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "calls_disabled",
+            "placed": 0,
+            "failed": 0,
+        }
+
+    if not is_within_calling_window(settings_obj):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "outside_calling_window",
+            "placed": 0,
+            "failed": 0,
+            "window_summary": build_calling_window_summary(settings_obj),
+        }
+
+    patients = patients_due_for_outbound(settings_obj)
+    placed = 0
+    failed = 0
+    results = []
+    for patient in patients:
+        result = place_outbound_call_for_patient(patient.id)
+        entry = {
+            "patient_id": patient.id,
+            "ok": bool(result.get("ok")),
+            "error": result.get("error") or "",
+            "call_id": result.get("call_id") or "",
+        }
+        results.append(entry)
+        if entry["ok"]:
+            placed += 1
+        else:
+            failed += 1
+
+    payload = {
+        "ok": True,
+        "skipped": False,
+        "placed": placed,
+        "failed": failed,
+        "attempted": len(patients),
+        "results": results,
+    }
+    if patients:
+        from apps.notifications.services import notify_outbound_batch
+
+        notify_outbound_batch(payload)
+    return payload

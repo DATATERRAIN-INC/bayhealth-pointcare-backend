@@ -246,6 +246,12 @@ def global_sign_out(*, access_token):
     return _call(lambda: _public_client().global_sign_out(AccessToken=access_token))
 
 
+def get_user(*, access_token):
+    """Validate a Cognito access token and return GetUser response."""
+    ensure_config()
+    return _call(lambda: _public_client().get_user(AccessToken=access_token))
+
+
 def revoke_refresh_token(*, refresh_token):
     ensure_config()
     params = {
