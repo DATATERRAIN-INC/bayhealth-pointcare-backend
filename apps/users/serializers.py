@@ -22,7 +22,12 @@ class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.CharField(required=False, allow_blank=True)
 
 
-class ResetPasswordSerializer(serializers.Serializer):
+class VerifyResetCodeSerializer(serializers.Serializer):
     email = serializers.CharField(required=False, allow_blank=True)
-    code = serializers.CharField(required=False, allow_blank=True)
+    reset_code = serializers.CharField(required=False, allow_blank=True)
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    token = serializers.CharField(required=False, allow_blank=True)
     new_password = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    confirm_password = serializers.CharField(required=False, allow_blank=True, write_only=True)

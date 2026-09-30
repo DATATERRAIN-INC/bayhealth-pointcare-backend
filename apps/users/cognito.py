@@ -257,6 +257,27 @@ def revoke_refresh_token(*, refresh_token):
     return _call(lambda: _public_client().revoke_token(**params))
 
 
+def admin_set_user_password(*, username, password):
+    """Set a permanent password via Cognito admin API (requires AWS credentials)."""
+    ensure_config()
+    if not settings.AWS_ACCESS_KEY_ID or not settings.AWS_SECRET_ACCESS_KEY:
+        raise CognitoError(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required to reset passwords.",
+            "NoCredentials",
+            500,
+        )
+
+    def set_password():
+        _admin_client().admin_set_user_password(
+            UserPoolId=settings.COGNITO_USER_POOL_ID,
+            Username=username,
+            Password=password,
+            Permanent=True,
+        )
+
+    _call(set_password)
+
+
 def lookup_cognito_user(username):
     """Return (sub, is_confirmed, username) using AdminGetUser, or None without credentials."""
     ensure_config()

@@ -140,3 +140,19 @@ COGNITO_APP_CLIENT_ID = _env("COGNITO_CLIENT_ID", "COGNITO_APP_CLIENT_ID")
 COGNITO_APP_CLIENT_SECRET = _env("COGNITO_CLIENT_SECRET", "COGNITO_APP_CLIENT_SECRET")
 AWS_S3_BASE_URL = os.environ.get("AWS_S3_BASE_URL", "").rstrip("/")
 AWS_MEDIA_FOLDER = os.environ.get("AWS_MEDIA_FOLDER", "bayhealth")
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    }
+}
+
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "")
+EMAIL_TITLE_CARD_NAME = os.environ.get("EMAIL_TITLE_CARD_NAME", "BayHealth PointCare")
+EMAIL_RESTRICTION = os.environ.get("EMAIL_RESTRICTION", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+PASSWORD_RESET_URL = os.environ.get("PASSWORD_RESET_URL", "")

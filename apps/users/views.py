@@ -10,6 +10,7 @@ from apps.users.serializers import (
     LogoutSerializer,
     RegisterSerializer,
     ResetPasswordSerializer,
+    VerifyResetCodeSerializer,
 )
 from apps.users.services import (
     forgot_password_user,
@@ -17,6 +18,8 @@ from apps.users.services import (
     logout_user,
     register_user,
     reset_password_user,
+    validate_password_token,
+    verify_reset_code_user,
 )
 
 
@@ -109,6 +112,31 @@ class ForgotPasswordView(UsersAPIView):
         except CognitoError as exc:
             return self._cognito_error(exc)
         return Response(body, status=status.HTTP_200_OK)
+
+
+class VerifyResetCodeView(UsersAPIView):
+    def post(self, request):
+        data, error_response = self._payload(request)
+        if error_response is not None:
+            return error_response
+        serializer = VerifyResetCodeSerializer(data=data)
+        serializer.is_valid(raise_exception=False)
+        try:
+            body = verify_reset_code_user(serializer.initial_data)
+        except CognitoError as exc:
+            return self._cognito_error(exc)
+        return Response(body, status=status.HTTP_200_OK)
+
+
+class ValidatePasswordTokenView(UsersAPIView):
+    def get(self, request):
+        token = (request.query_params.get("token") or "").strip()
+        if not token:
+            return Response({"valid": False}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"valid": validate_password_token(token)},
+            status=status.HTTP_200_OK,
+        )
 
 
 class ResetPasswordView(UsersAPIView):
