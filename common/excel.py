@@ -7,6 +7,10 @@ from openpyxl import Workbook, load_workbook
 from apps.ai_caller.constants import PATIENT_EXCEL_COLUMNS
 
 HEADER_ALIASES = {
+    "first_name": "first_name",
+    "firstname": "first_name",
+    "last_name": "last_name",
+    "lastname": "last_name",
     "name": "name",
     "patient_name": "name",
     "address": "address",
@@ -35,13 +39,14 @@ def build_patient_template_bytes():
     sheet.append(list(PATIENT_EXCEL_COLUMNS))
     sheet.append(
         [
-            "Maria Santos",
+            "Maria",
+            "Santos",
             "14 Oak Street, Dover, DE 19901",
             "1984-03-12",
             "Dr. Alan Brooks",
-            "+1",
+            "",
             "3025550101",
-            "+1",
+            "",
             "3025550199",
         ]
     )
@@ -61,8 +66,10 @@ def _map_headers(raw_headers):
 
 
 def _row_to_dict(values, mapping):
+    # Include legacy "name" so services can split it when first/last are blank.
+    fields = list(PATIENT_EXCEL_COLUMNS) + ["name"]
     row = {}
-    for field in PATIENT_EXCEL_COLUMNS:
+    for field in fields:
         index = mapping.get(field)
         if index is None or index >= len(values):
             row[field] = ""

@@ -1,27 +1,34 @@
 from django.http import HttpResponse
-from rest_framework import status, viewsets
+from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.ai_caller.models import PatientSource
-from apps.ai_caller.retell import place_retell_care_call, place_retell_guardian_call
+from apps.ai_caller.models import Call, PatientSource
 from apps.ai_caller.serializers import (
+    CallSerializer,
     PatientSerializer,
-    PlaceRetellCareCallSerializer,
-    PlaceRetellGuardianCallSerializer,
+    PlaceOutboundCallSerializer,
 )
-from apps.ai_caller.services import get_patient_queryset, upload_patients_from_file
+from apps.ai_caller.services import (
+    get_call_queryset,
+    get_patient_queryset,
+    place_outbound_call_for_patient,
+    sync_call_transcript,
+    update_call_from_retell_payload,
+    upload_patients_from_file,
+)
 from common.excel import build_patient_template_bytes
+from common.pagination import CommonPagination
 from common.responses import error_response, message_response
 
 
 class PatientViewSet(viewsets.ModelViewSet):
-    """CRUD for patient records, plus Excel upload and template download."""
-
     serializer_class = PatientSerializer
     permission_classes = [AllowAny]
     authentication_classes = []
+    pagination_class = CommonPagination
 
     def get_queryset(self):
         return get_patient_queryset(
@@ -33,15 +40,13 @@ class PatientViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save(source=PatientSource.MANUAL)
-        return message_response(
-            "Patient saved successfully.",
-            code=status.HTTP_201_CREATED,
-        )
+        return message_response("Patient saved successfully.", 201)
 
     def update(self, request, *args, **kwargs):
-        partial = kwargs.pop("partial", False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        patient = self.get_object()
+        serializer = self.get_serializer(
+            patient, data=request.data, partial=kwargs.pop("partial", False)
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return message_response("Patient updated successfully.")
@@ -52,95 +57,96 @@ class PatientViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], url_path="upload")
     def upload(self, request):
-        result, errors = upload_patients_from_file(request.FILES.get("file"))
+        _, errors = upload_patients_from_file(request.FILES.get("file"))
         if errors:
-            first_field = next(iter(errors))
-            first_error = errors[first_field]
-            if isinstance(first_error, (list, tuple)) and first_error:
-                detail = first_error[0]
-            else:
-                detail = first_error
+            field = next(iter(errors))
+            value = errors[field]
+            detail = value[0] if isinstance(value, (list, tuple)) and value else value
             return error_response(str(detail))
-        return message_response(
-            "Patients uploaded successfully.",
-            code=status.HTTP_201_CREATED,
-        )
+        return message_response("Patients uploaded successfully.", 201)
 
     @action(detail=False, methods=["get"], url_path="template")
     def template(self, request):
-        content = build_patient_template_bytes()
         response = HttpResponse(
-            content,
-            content_type=(
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            ),
+            build_patient_template_bytes(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        response["Content-Disposition"] = (
-            'attachment; filename="patient_upload_template.xlsx"'
-        )
+        response["Content-Disposition"] = 'attachment; filename="patient_upload_template.xlsx"'
         return response
 
 
-class PlaceRetellCareCallView(APIView):
-    """Place an outbound phone call through Retell AI."""
+class CallViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = CallSerializer
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pagination_class = CommonPagination
 
+    def get_queryset(self):
+        return get_call_queryset(
+            search=self.request.query_params.get("search", ""),
+            source=self.request.query_params.get("source", ""),
+            status=self.request.query_params.get("status", ""),
+            patient_id=self.request.query_params.get("patient_id", ""),
+            retell_call_id=self.request.query_params.get("retell_call_id", ""),
+        )
+
+    def list(self, request, *args, **kwargs):
+        retell_call_id = (request.query_params.get("retell_call_id") or "").strip()
+        if retell_call_id:
+            call = self.get_queryset().first()
+            if not call:
+                return error_response("Call not found.", 404)
+            return Response({"transcript": call.transcript or []})
+        return super().list(request, *args, **kwargs)
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        queryset = Call.objects.all()
+        return Response(
+            {
+                "all": queryset.count(),
+                "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
+                "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
+                "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="sync-transcript")
+    def sync_transcript(self, request, pk=None):
+        call, error = sync_call_transcript(self.get_object())
+        if error:
+            return error_response(error)
+        return message_response("Transcript synced successfully.")
+
+
+class PlaceOutboundCallView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
     def post(self, request):
-        serializer = PlaceRetellCareCallSerializer(data=request.data)
+        serializer = PlaceOutboundCallSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        result = place_retell_care_call(
-            phone_number=serializer.validated_data["phone_number"],
-            name=serializer.validated_data.get("name") or "",
-            patient_name=serializer.validated_data.get("patient_name") or "",
-            service_name=serializer.validated_data.get("service_name") or "",
-            address_on_file=serializer.validated_data.get("address_on_file") or "",
-            insurance_name=serializer.validated_data.get("insurance_name") or "",
-            agent_id=serializer.validated_data.get("agent_id") or "",
-            transfer_number=serializer.validated_data.get("transfer_number") or "",
-        )
+        result = place_outbound_call_for_patient(serializer.validated_data["id"])
         if not result.get("ok"):
-            code = int(result.get("status_code") or status.HTTP_502_BAD_GATEWAY)
             return error_response(
                 result.get("error") or "Failed to place call.",
-                code=code,
+                int(result.get("status_code") or 502),
             )
 
+        if result.get("flow") == "guardian":
+            return message_response("Guardian call placed successfully.")
         return message_response("Call placed successfully.")
 
 
-class PlaceRetellGuardianCallView(APIView):
-    """Place an outbound call to a parent or guardian of a minor patient."""
+class RetellWebhookView(APIView):
+    """Receive Retell call events and store status/transcript."""
 
     permission_classes = [AllowAny]
     authentication_classes = []
 
     def post(self, request):
-        serializer = PlaceRetellGuardianCallSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-
-        result = place_retell_guardian_call(
-            phone_number=data["phone_number"],
-            patient_name=data.get("patient_name") or "",
-            guardian_name=data.get("guardian_name") or "",
-            insurance_name=data.get("insurance_name") or "",
-            measure_name=data.get("measure_name") or "",
-            service_name=data.get("service_name") or "",
-            address_on_file=data.get("address_on_file") or "",
-            clinic_name=data.get("clinic_name") or "",
-            appointment_date=data.get("appointment_date") or "",
-            appointment_time=data.get("appointment_time") or "",
-            provider_name=data.get("provider_name") or "",
-            transfer_number=data["transfer_number"],
-        )
-        if not result.get("ok"):
-            code = int(result.get("status_code") or status.HTTP_502_BAD_GATEWAY)
-            return error_response(
-                result.get("error") or "Failed to place call.",
-                code=code,
-            )
-
-        return message_response("Guardian call placed successfully.")
+        _, error = update_call_from_retell_payload(request.data)
+        if error:
+            return error_response(error, 404 if error == "Call not found." else 400)
+        return message_response("Call updated successfully.")

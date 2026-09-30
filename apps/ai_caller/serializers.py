@@ -1,19 +1,22 @@
 from datetime import date
 
-from django.conf import settings
 from rest_framework import serializers
 
 from apps.ai_caller.constants import ALLOWED_UPLOAD_EXTENSIONS
-from apps.ai_caller.models import Patient
+from apps.ai_caller.models import Call, Patient
 from common.s3 import build_s3_url
 
 
 class PatientSerializer(serializers.ModelSerializer):
+    full_name = serializers.CharField(read_only=True)
+
     class Meta:
         model = Patient
         fields = (
             "id",
-            "name",
+            "first_name",
+            "last_name",
+            "full_name",
             "address",
             "dob",
             "doctor",
@@ -28,6 +31,7 @@ class PatientSerializer(serializers.ModelSerializer):
         )
         read_only_fields = (
             "id",
+            "full_name",
             "source",
             "upload_file_key",
             "created_at",
@@ -53,19 +57,10 @@ class PatientSerializer(serializers.ModelSerializer):
     def _normalize_country_code(self, value):
         code = (value or "").strip()
         if not code:
-            return settings.DEFAULT_COUNTRY_CODE
+            return ""
         if not code.startswith("+"):
             code = f"+{code.lstrip('+')}"
         return code
-
-    def to_internal_value(self, data):
-        if isinstance(data, dict):
-            data = {**data}
-            if not (data.get("country_code") or "").strip():
-                data["country_code"] = settings.DEFAULT_COUNTRY_CODE
-            if not (data.get("live_agent_country_code") or "").strip():
-                data["live_agent_country_code"] = settings.DEFAULT_COUNTRY_CODE
-        return super().to_internal_value(data)
 
 
 class PatientUploadSerializer(serializers.Serializer):
@@ -79,59 +74,38 @@ class PatientUploadSerializer(serializers.Serializer):
         return value
 
 
-class PlaceRetellCareCallSerializer(serializers.Serializer):
-    phone_number = serializers.CharField(max_length=32)
-    name = serializers.CharField(max_length=120, required=False, allow_blank=True, default="")
-    patient_name = serializers.CharField(
-        max_length=120, required=False, allow_blank=True, default=""
-    )
-    service_name = serializers.CharField(
-        max_length=200, required=False, allow_blank=True, default=""
-    )
-    address_on_file = serializers.CharField(
-        max_length=300, required=False, allow_blank=True, default=""
-    )
-    insurance_name = serializers.CharField(
-        max_length=120, required=False, allow_blank=True, default=""
-    )
-    agent_id = serializers.CharField(
-        max_length=120, required=False, allow_blank=True, default=""
-    )
-    transfer_number = serializers.CharField(
-        max_length=32, required=False, allow_blank=True, default=""
-    )
+class PlaceOutboundCallSerializer(serializers.Serializer):
+    id = serializers.IntegerField(min_value=1)
 
 
-class PlaceRetellGuardianCallSerializer(serializers.Serializer):
-    phone_number = serializers.CharField(max_length=32)
-    patient_name = serializers.CharField(
-        max_length=120, required=False, allow_blank=True, default=""
-    )
-    guardian_name = serializers.CharField(
-        max_length=120, required=False, allow_blank=True, default=""
-    )
-    insurance_name = serializers.CharField(
-        max_length=120, required=False, allow_blank=True, default=""
-    )
-    measure_name = serializers.CharField(
-        max_length=200, required=False, allow_blank=True, default=""
-    )
-    service_name = serializers.CharField(
-        max_length=200, required=False, allow_blank=True, default=""
-    )
-    address_on_file = serializers.CharField(
-        max_length=300, required=False, allow_blank=True, default=""
-    )
-    clinic_name = serializers.CharField(
-        max_length=200, required=False, allow_blank=True, default=""
-    )
-    appointment_date = serializers.CharField(
-        max_length=80, required=False, allow_blank=True, default=""
-    )
-    appointment_time = serializers.CharField(
-        max_length=80, required=False, allow_blank=True, default=""
-    )
-    provider_name = serializers.CharField(
-        max_length=120, required=False, allow_blank=True, default=""
-    )
-    transfer_number = serializers.CharField(max_length=32)
+class CallSerializer(serializers.ModelSerializer):
+    patient_name = serializers.CharField(source="patient.full_name", read_only=True)
+    duration_seconds = serializers.IntegerField(read_only=True)
+    has_transcript = serializers.BooleanField(read_only=True)
+    message_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Call
+        fields = (
+            "id",
+            "patient",
+            "patient_name",
+            "retell_call_id",
+            "flow",
+            "status",
+            "from_number",
+            "to_number",
+            "agent_id",
+            "transfer_number",
+            "started_at",
+            "ended_at",
+            "duration_seconds",
+            "has_transcript",
+            "message_count",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_message_count(self, obj):
+        return len(obj.transcript or [])
