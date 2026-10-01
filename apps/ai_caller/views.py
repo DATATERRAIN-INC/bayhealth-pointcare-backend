@@ -169,11 +169,17 @@ class CallerSettingsView(APIView):
     """GET/PATCH controller settings for the automated AI caller."""
 
     def get(self, request):
-        settings_obj = get_caller_settings(request.user)
+        try:
+            settings_obj = get_caller_settings(request.user)
+        except ValueError as exc:
+            return error_response(str(exc), 400)
         return Response(CallerSettingsSerializer(settings_obj).data)
 
     def patch(self, request):
-        settings_obj = get_caller_settings(request.user)
+        try:
+            settings_obj = get_caller_settings(request.user)
+        except ValueError as exc:
+            return error_response(str(exc), 400)
         serializer = CallerSettingsSerializer(
             settings_obj, data=request.data, partial=True
         )

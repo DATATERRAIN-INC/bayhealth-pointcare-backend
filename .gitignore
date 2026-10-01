@@ -5,6 +5,8 @@ __pycache__/
 db.sqlite3
 .env
 *.log
+logs/*
+!logs/.gitkeep
 .idea/
 .vscode/
 apps/ai_caller/data/
