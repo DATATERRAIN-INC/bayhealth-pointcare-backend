@@ -1,4 +1,5 @@
 from datetime import date, datetime, time, timedelta
+import logging
 
 from django.conf import settings
 from django.db.models import CharField, Q, Value
@@ -16,6 +17,8 @@ from apps.ai_caller.serializers import PatientSerializer, PatientUploadSerialize
 from apps.ai_caller.transcript_merge import merge_ai_and_humans
 from common.excel import parse_patient_upload
 from common.s3 import upload_bytes
+
+dialer_logger = logging.getLogger("ai_caller.dialer")
 
 
 def get_patient_queryset(*, user=None, search="", source="", is_blocked=None):
@@ -562,8 +565,9 @@ def resolve_timezone(tz_name):
 
 
 def get_caller_settings(user=None):
-    if user is None:
-        raise ValueError("user is required for get_caller_settings()")
+    user_id = getattr(user, "pk", None)
+    if not user_id:
+        raise ValueError("Authentication required to load caller settings.")
     return CallerSettings.load(user)
 
 
@@ -659,28 +663,71 @@ def patients_due_for_outbound(settings_obj=None, limit=None):
 
 
 def _run_scheduled_outbound_for_settings(settings_obj):
+    user_id = settings_obj.user_id
+    email = getattr(settings_obj.user, "email", "") or ""
+
     if not settings_obj.calls_enabled:
-        return {
+        payload = {
             "ok": True,
             "skipped": True,
             "reason": "calls_disabled",
             "placed": 0,
             "failed": 0,
-            "user_id": settings_obj.user_id,
+            "user_id": user_id,
         }
+        dialer_logger.info(
+            "NOT_TRIGGERED user_id=%s email=%s reason=calls_disabled",
+            user_id,
+            email,
+        )
+        return payload
 
     if not is_within_calling_window(settings_obj):
-        return {
+        window_summary = build_calling_window_summary(settings_obj)
+        payload = {
             "ok": True,
             "skipped": True,
             "reason": "outside_calling_window",
             "placed": 0,
             "failed": 0,
-            "user_id": settings_obj.user_id,
-            "window_summary": build_calling_window_summary(settings_obj),
+            "user_id": user_id,
+            "window_summary": window_summary,
         }
+        dialer_logger.info(
+            "NOT_TRIGGERED user_id=%s email=%s reason=outside_calling_window detail=%s",
+            user_id,
+            email,
+            window_summary,
+        )
+        return payload
 
     patients = patients_due_for_outbound(settings_obj)
+    if not patients:
+        # Explain why the dialer found nobody to call.
+        total = Patient.objects.filter(user=settings_obj.user).count()
+        blocked = Patient.objects.filter(
+            user=settings_obj.user, is_blocked=True
+        ).count()
+        dialer_logger.info(
+            "NOT_TRIGGERED user_id=%s email=%s reason=no_eligible_patients "
+            "total_patients=%s blocked=%s max_calls_per_run=%s",
+            user_id,
+            email,
+            total,
+            blocked,
+            settings_obj.max_calls_per_run,
+        )
+        return {
+            "ok": True,
+            "skipped": False,
+            "placed": 0,
+            "failed": 0,
+            "attempted": 0,
+            "results": [],
+            "user_id": user_id,
+            "reason": "no_eligible_patients",
+        }
+
     placed = 0
     failed = 0
     results = []
@@ -695,8 +742,22 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         results.append(entry)
         if entry["ok"]:
             placed += 1
+            dialer_logger.info(
+                "TRIGGERED user_id=%s email=%s patient_id=%s call_id=%s",
+                user_id,
+                email,
+                patient.id,
+                entry["call_id"],
+            )
         else:
             failed += 1
+            dialer_logger.info(
+                "NOT_TRIGGERED user_id=%s email=%s patient_id=%s reason=place_failed error=%s",
+                user_id,
+                email,
+                patient.id,
+                entry["error"],
+            )
 
     payload = {
         "ok": True,
@@ -705,7 +766,7 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         "failed": failed,
         "attempted": len(patients),
         "results": results,
-        "user_id": settings_obj.user_id,
+        "user_id": user_id,
     }
     if patients:
         from apps.notifications.services import notify_outbound_batch
@@ -723,6 +784,11 @@ def run_scheduled_outbound_calls():
     queryset = CallerSettings.objects.filter(
         calls_enabled=True, user__isnull=False
     ).select_related("user")
+    count = queryset.count()
+    if count == 0:
+        dialer_logger.info(
+            "NOT_TRIGGERED reason=no_users_with_calls_enabled"
+        )
     for settings_obj in queryset:
         runs.append(_run_scheduled_outbound_for_settings(settings_obj))
     return {

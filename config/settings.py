@@ -158,3 +158,35 @@ WARM_TRANSFER_ENABLED = os.getenv("WARM_TRANSFER_ENABLED", "false").lower() in (
     "true",
     "yes",
 )
+
+# Dialer / outbound call decision logs (separate folder)
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "dialer": {
+            "format": "[{asctime}] {levelname} {message}",
+            "style": "{",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "dialer_file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(LOG_DIR / "dialer.log"),
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 5,
+            "formatter": "dialer",
+        },
+    },
+    "loggers": {
+        "ai_caller.dialer": {
+            "handlers": ["dialer_file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}

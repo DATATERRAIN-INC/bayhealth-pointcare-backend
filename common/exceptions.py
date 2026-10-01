@@ -1,9 +1,26 @@
+from django.db import IntegrityError
+from rest_framework import status
+from rest_framework.response import Response
 from rest_framework.views import exception_handler
 
 
 def custom_exception_handler(exc, context):
     response = exception_handler(exc, context)
+
     if response is None:
+        if isinstance(exc, IntegrityError):
+            return Response(
+                {
+                    "message": (
+                        "Unable to save data due to a database conflict. "
+                        "Please try again or contact support."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if isinstance(exc, ValueError):
+            message = str(exc).strip() or "Invalid request."
+            return Response({"message": message}, status=status.HTTP_400_BAD_REQUEST)
         return None
 
     data = response.data
@@ -29,6 +46,17 @@ def custom_exception_handler(exc, context):
         or "accesstoken" in lowered.replace(" ", "")
     ):
         message = "Invalid or expired access token."
+
+    if "null value in column" in lowered and "user_id" in lowered:
+        message = (
+            "Unable to load caller settings for this account. "
+            "Sign in again or contact support."
+        )
+    elif "duplicate key" in lowered or "unique constraint" in lowered:
+        message = (
+            "Unable to save data due to a database conflict. "
+            "Please try again or contact support."
+        )
 
     response.data = {"message": message}
     return response

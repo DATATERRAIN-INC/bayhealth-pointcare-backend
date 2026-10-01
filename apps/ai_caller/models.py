@@ -229,13 +229,33 @@ class CallerSettings(models.Model):
 
     @classmethod
     def load(cls, user):
-        if user is None:
-            raise ValueError("user is required for CallerSettings.load()")
-        obj, _ = cls.objects.get_or_create(
-            user=user,
-            defaults={"created_by": user, "updated_by": user},
-        )
-        return obj
+        user_id = getattr(user, "pk", None)
+        if not user_id:
+            raise ValueError("A valid authenticated user is required for caller settings.")
+
+        try:
+            obj, _ = cls.objects.get_or_create(
+                user_id=user_id,
+                defaults={
+                    "user_id": user_id,
+                    "created_by_id": user_id,
+                    "updated_by_id": user_id,
+                },
+            )
+            return obj
+        except Exception as exc:
+            from django.db import IntegrityError
+
+            if not isinstance(exc, IntegrityError):
+                raise
+            # Concurrent create or leftover bad row — return existing if possible.
+            existing = cls.objects.filter(user_id=user_id).first()
+            if existing:
+                return existing
+            raise ValueError(
+                "Unable to create caller settings for this account. "
+                "Please try again or contact support."
+            ) from exc
 
     def __str__(self):
         state = "enabled" if self.calls_enabled else "disabled"
