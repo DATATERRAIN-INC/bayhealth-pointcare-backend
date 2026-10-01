@@ -1,5 +1,6 @@
 import csv
 import io
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -61,6 +62,19 @@ def _map_headers(raw_headers):
     return mapping
 
 
+def _cell_to_str(value, *, field=""):
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        # Excel often stores DOB as datetime; API expects YYYY-MM-DD.
+        if field == "dob":
+            return value.date().isoformat()
+        return value.isoformat(sep=" ", timespec="seconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value).strip()
+
+
 def _row_to_dict(values, mapping):
     # Include legacy "name" so services can split it when first/last are blank.
     fields = list(PATIENT_EXCEL_COLUMNS) + ["name"]
@@ -70,8 +84,7 @@ def _row_to_dict(values, mapping):
         if index is None or index >= len(values):
             row[field] = ""
             continue
-        value = values[index]
-        row[field] = "" if value is None else str(value).strip()
+        row[field] = _cell_to_str(values[index], field=field)
     return row
 
 
