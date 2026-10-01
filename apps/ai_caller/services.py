@@ -699,13 +699,34 @@ def update_call_from_retell_payload(payload):
     elif call.status in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED} and not call.ended_at:
         call.ended_at = timezone.now()
 
-    transcript = data.get("transcript_object") or data.get("transcript")
+    transcript = (
+        data.get("transcript_object")
+        or data.get("transcript_with_tool_calls")
+        or data.get("transcript")
+    )
     if transcript is not None:
+        # Drop pure tool-call rows; keep spoken turns only.
+        if isinstance(transcript, list):
+            spoken = []
+            for entry in transcript:
+                if not isinstance(entry, dict):
+                    spoken.append(entry)
+                    continue
+                role = str(entry.get("role") or "").strip().lower()
+                if role in {"tool_call_invocation", "tool_call_result", "tool"}:
+                    continue
+                spoken.append(entry)
+            transcript = spoken
         ai_items = _normalize_transcript(transcript)
         for item in ai_items:
             item["segment"] = "ai"
-        call.retell_transcript = ai_items
-        call.transcript = merge_ai_and_humans(ai_items, call.live_agent_transcript or [])
+        # Keep non-empty lines only.
+        ai_items = [item for item in ai_items if (item.get("text") or "").strip()]
+        if ai_items or not (call.retell_transcript or []):
+            call.retell_transcript = ai_items
+            call.transcript = merge_ai_and_humans(
+                ai_items, call.live_agent_transcript or []
+            )
 
     update_fields = [
         "status",
