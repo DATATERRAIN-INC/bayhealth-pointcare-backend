@@ -1,6 +1,12 @@
 from django.contrib import admin
 
-from apps.ai_caller.models import Call, CallerSettings, Patient, UploadedFile
+from apps.ai_caller.models import (
+    Call,
+    CallerSettings,
+    LiveAgentNumber,
+    Patient,
+    UploadedFile,
+)
 
 
 @admin.register(UploadedFile)
@@ -30,9 +36,8 @@ class PatientAdmin(admin.ModelAdmin):
         "last_name",
         "phone_number",
         "is_blocked",
-        "live_agent_country_code",
-        "live_agent_number",
         "doctor",
+        "service_name",
         "source",
         "upload",
         "dob",
@@ -43,8 +48,8 @@ class PatientAdmin(admin.ModelAdmin):
         "first_name",
         "last_name",
         "doctor",
+        "service_name",
         "phone_number",
-        "live_agent_number",
         "address",
         "user__email",
     )
@@ -64,6 +69,7 @@ class CallAdmin(admin.ModelAdmin):
         "to_number",
         "started_at",
         "ended_at",
+        "decline_reason",
         "created_at",
     )
     list_filter = ("status", "flow")
@@ -79,6 +85,12 @@ class CallAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at")
 
 
+class LiveAgentNumberInline(admin.TabularInline):
+    model = LiveAgentNumber
+    extra = 1
+    fields = ("country_code", "phone_number", "label", "is_active")
+
+
 @admin.register(CallerSettings)
 class CallerSettingsAdmin(admin.ModelAdmin):
     list_display = (
@@ -89,7 +101,27 @@ class CallerSettingsAdmin(admin.ModelAdmin):
         "end_time",
         "timezone",
         "max_calls_per_run",
+        "call_trigger_count",
+        "text_sms_enabled",
         "updated_at",
     )
     readonly_fields = ("updated_at",)
     raw_id_fields = ("user", "created_by", "updated_by")
+    inlines = [LiveAgentNumberInline]
+
+
+@admin.register(LiveAgentNumber)
+class LiveAgentNumberAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "caller_settings",
+        "country_code",
+        "phone_number",
+        "label",
+        "is_active",
+        "created_at",
+    )
+    list_filter = ("is_active",)
+    search_fields = ("phone_number", "label", "caller_settings__user__email")
+    raw_id_fields = ("caller_settings",)
+    readonly_fields = ("created_at", "updated_at")

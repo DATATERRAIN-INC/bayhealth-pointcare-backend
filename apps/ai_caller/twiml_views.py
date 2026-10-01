@@ -19,6 +19,7 @@ from apps.ai_caller.twilio_bridge import (
     is_negative,
     load_pending_session,
     load_session,
+    maybe_failover_on_agent_status,
     participant_join_twiml,
     persist_humans_transcript,
     save_session,
@@ -158,6 +159,14 @@ def warm_transfer_dial_status(request):
         if dial_sid:
             session["dial_call_sid"] = dial_sid
         save_session(session)
+        if maybe_failover_on_agent_status(
+            session, call_status=status, call_sid=dial_sid
+        ):
+            # Keep patient on the line; next agent is being dialed.
+            return _xml(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<Response></Response>"
+            )
     return _xml(dial_status_twiml(status))
 
 
@@ -189,4 +198,7 @@ def warm_transfer_status(request):
         if call_sid and not session.get("call_sid"):
             session["call_sid"] = call_sid
         save_session(session)
+        maybe_failover_on_agent_status(
+            session, call_status=call_status, call_sid=call_sid
+        )
     return HttpResponse("ok")

@@ -261,14 +261,144 @@ def start_coordinator_leg(session: Dict[str, Any]) -> None:
         session["status"] = "dialing_coordinator"
         save_session(session)
         logger.info(
-            "Dialed coordinator session=%s sid=%s",
+            "Dialed coordinator session=%s number=%s sid=%s index=%s",
             session_id,
+            destination,
             session["dial_call_sid"],
+            session.get("transfer_number_index", 0),
+        )
+        dialer_logger = logging.getLogger("ai_caller.dialer")
+        dialer_logger.info(
+            "AGENT_DIAL session=%s number=%s index=%s sid=%s",
+            session_id,
+            destination,
+            session.get("transfer_number_index", 0),
+            session.get("dial_call_sid"),
         )
     except Exception:
         session["b_dialed"] = False
         save_session(session)
         logger.exception("Failed to dial coordinator session=%s", session_id)
+        # Try next agent if this dial could not be created.
+        failover_to_next_live_agent(session, reason="dial_create_failed")
+
+
+_AGENT_FAIL_STATUSES = frozenset(
+    {"busy", "failed", "no-answer", "canceled", "cancelled"}
+)
+
+
+def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") -> bool:
+    """
+    If the current live agent did not answer, dial the next active number.
+    Returns True when another dial was started.
+    """
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    session_id = str(session.get("session_id") or "")
+    numbers = [
+        str(n).strip()
+        for n in (session.get("transfer_numbers") or session.get("live_agent_numbers") or [])
+        if str(n).strip()
+    ]
+    if len(numbers) < 2:
+        return False
+
+    try:
+        idx = int(session.get("transfer_number_index") or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    next_idx = idx + 1
+    if next_idx >= len(numbers):
+        dialer_logger = logging.getLogger("ai_caller.dialer")
+        dialer_logger.info(
+            "AGENT_FAILOVER_EXHAUSTED session=%s reason=%s tried=%s",
+            session_id,
+            reason or "unknown",
+            len(numbers),
+        )
+        session["status"] = "agent_unreachable"
+        save_session(session)
+        return False
+
+    previous = numbers[idx] if idx < len(numbers) else session.get("transfer_number")
+    nxt = numbers[next_idx]
+    attempts = list(session.get("failover_attempts") or [])
+    attempts.append(
+        {
+            "from": previous,
+            "to": nxt,
+            "reason": reason or "no_answer",
+            "index": next_idx,
+        }
+    )
+    session["failover_attempts"] = attempts
+    session["transfer_number_index"] = next_idx
+    session["transfer_number"] = nxt
+    session["live_agent_number"] = nxt
+    session["b_dialed"] = False
+    session["dial_call_sid"] = ""
+    session["provider_recording_started"] = False
+    session["status"] = "failover_dialing"
+    save_session(session)
+
+    dialer_logger = logging.getLogger("ai_caller.dialer")
+    dialer_logger.info(
+        "AGENT_FAILOVER session=%s reason=%s from=%s to=%s index=%s",
+        session_id,
+        reason or "no_answer",
+        previous,
+        nxt,
+        next_idx,
+    )
+    logger.info(
+        "Failing over live agent session=%s %s -> %s (%s)",
+        session_id,
+        previous,
+        nxt,
+        reason,
+    )
+
+    # Keep Call.transfer_number in sync with the number we are trying.
+    retell_call_id = str(session.get("retell_call_id") or "").strip()
+    if retell_call_id:
+        try:
+            from apps.ai_caller.models import Call
+
+            Call.objects.filter(retell_call_id=retell_call_id).update(
+                transfer_number=nxt
+            )
+        except Exception:
+            logger.exception(
+                "Failed to update Call.transfer_number on failover session=%s",
+                session_id,
+            )
+
+    start_coordinator_leg(session)
+    return True
+
+
+def maybe_failover_on_agent_status(
+    session: Dict[str, Any], *, call_status: str, call_sid: str = ""
+) -> bool:
+    """Failover when the outbound agent leg fails to connect."""
+    status = (call_status or "").strip().lower()
+    if status not in _AGENT_FAIL_STATUSES:
+        return False
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    dial_sid = str(session.get("dial_call_sid") or "").strip()
+    call_sid = (call_sid or "").strip()
+    # Only react to the agent (dial) leg, not the patient inbound leg.
+    if not dial_sid:
+        return False
+    if call_sid and call_sid != dial_sid:
+        return False
+    if session.get("spoke_now") or session.get("status") == "connected":
+        return False
+    return failover_to_next_live_agent(session, reason=status)
 
 
 def start_leg_recording(session: Dict[str, Any], call_sid: str, leg: str) -> None:
@@ -729,6 +859,7 @@ def prepare_retell_bridge(
     transfer_number: str,
     service_name: str,
     extra: Optional[Dict[str, Any]] = None,
+    transfer_numbers: Optional[list] = None,
 ) -> Dict[str, Any]:
     """Point our Twilio number at inbound TwiML so Retell can transfer A to us."""
     bridge_number = _from_number()
@@ -773,12 +904,21 @@ def prepare_retell_bridge(
             "status_code": 502,
         }
 
+    numbers = [
+        str(n).strip()
+        for n in (transfer_numbers or ([transfer_number] if transfer_number else []) or [])
+        if str(n).strip()
+    ]
+    primary = numbers[0] if numbers else str(transfer_number or "").strip()
+
     session_data: Dict[str, Any] = {
         "session_id": session_id,
         "name": name,
         "service_name": service_name,
         "phone_number": normalize_phone(phone_number),
-        "transfer_number": transfer_number,
+        "transfer_number": primary,
+        "transfer_numbers": numbers,
+        "transfer_number_index": 0,
         "bridge_number": bridge_number,
         "status": "awaiting_retell_transfer",
         "humans_saved": False,
@@ -788,6 +928,16 @@ def prepare_retell_bridge(
     }
     if extra:
         session_data.update(extra)
+        # Keep ordered list authoritative if caller also passed live_agent_numbers.
+        extra_numbers = [
+            str(n).strip()
+            for n in (extra.get("live_agent_numbers") or extra.get("transfer_numbers") or [])
+            if str(n).strip()
+        ]
+        if extra_numbers:
+            session_data["transfer_numbers"] = extra_numbers
+            session_data["transfer_number"] = extra_numbers[0]
+            session_data["transfer_number_index"] = 0
     session = save_session(session_data)
     (sessions_dir() / "pending.json").write_text(
         json.dumps({"session_id": session_id}, indent=2) + "\n",
@@ -795,9 +945,10 @@ def prepare_retell_bridge(
     )
     _schedule_voice_url_restore(session_id)
     logger.info(
-        "Retell bridge ready session=%s inbound=%s",
+        "Retell bridge ready session=%s inbound=%s agents=%s",
         session_id,
         inbound_url,
+        session_data.get("transfer_numbers"),
     )
     return {
         "ok": True,

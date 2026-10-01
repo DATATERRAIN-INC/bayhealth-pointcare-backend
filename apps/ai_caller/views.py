@@ -17,7 +17,9 @@ from apps.ai_caller.services import (
     get_caller_settings,
     get_patient_queryset,
     place_outbound_call_for_patient,
+    save_call_decline_reason,
     sync_call_transcript,
+    sync_in_progress_calls_from_retell,
     update_call_from_retell_payload,
     upload_patients_from_file,
 )
@@ -118,6 +120,8 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
     def list(self, request, *args, **kwargs):
+        # Keep statuses fresh even if Retell webhooks were missed.
+        sync_in_progress_calls_from_retell(user=request.user, limit=25)
         retell_call_id = (request.query_params.get("retell_call_id") or "").strip()
         if retell_call_id:
             call = self.get_queryset().first()
@@ -128,6 +132,7 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
+        sync_in_progress_calls_from_retell(user=request.user, limit=25)
         queryset = Call.objects.filter(user=request.user)
         return Response(
             {
@@ -198,7 +203,57 @@ class RetellWebhookView(APIView):
     authentication_classes = []
 
     def post(self, request):
-        _, error = update_call_from_retell_payload(request.data)
+        data = request.data if isinstance(request.data, dict) else {}
+        call, error = update_call_from_retell_payload(data)
         if error:
             return error_response(error, 404 if error == "Call not found." else 400)
+
+        # On end/analyze events, refresh from Retell get-call so status/transcript stick.
+        event = str(data.get("event") or data.get("name") or "").strip().lower()
+        if call and event in {"call_ended", "call_analyzed"}:
+            sync_call_transcript(call)
         return message_response("Call updated successfully.")
+
+
+class RetellToolWebhookView(APIView):
+    """Receive Retell custom function calls (e.g. log_decline_reason). Public."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        data = request.data if isinstance(request.data, dict) else {}
+        name = str(
+            data.get("name")
+            or data.get("tool_name")
+            or data.get("function_name")
+            or ""
+        ).strip()
+        call_id = str(
+            data.get("call_id")
+            or data.get("retell_call_id")
+            or (data.get("call") or {}).get("call_id")
+            or ""
+        ).strip()
+        args = data.get("args") or data.get("arguments") or data.get("parameters") or {}
+        if isinstance(args, str):
+            try:
+                import json
+
+                args = json.loads(args)
+            except Exception:
+                args = {"reason": args}
+
+        if name and name != "log_decline_reason":
+            return message_response("Tool ignored.")
+
+        reason = ""
+        if isinstance(args, dict):
+            reason = str(args.get("reason") or args.get("decline_reason") or "").strip()
+        if not reason:
+            reason = str(data.get("reason") or "").strip()
+
+        _, error = save_call_decline_reason(retell_call_id=call_id, reason=reason)
+        if error:
+            return error_response(error, 404 if error == "Call not found." else 400)
+        return message_response("Decline reason saved.")

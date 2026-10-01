@@ -26,6 +26,14 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
+        # Frontend polls this often; use it to refresh call status/transcript
+        # when Retell webhooks cannot reach localhost.
+        try:
+            from apps.ai_caller.services import sync_in_progress_calls_from_retell
+
+            sync_in_progress_calls_from_retell(user=request.user, limit=10)
+        except Exception:
+            pass
         queryset = Notification.objects.filter(user=request.user)
         return Response(
             {

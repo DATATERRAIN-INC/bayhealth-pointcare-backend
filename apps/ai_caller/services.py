@@ -37,7 +37,6 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None):
             | Q(_full_name__icontains=search)
             | Q(doctor__icontains=search)
             | Q(phone_number__icontains=search)
-            | Q(live_agent_number__icontains=search)
         )
     if source and source != "all":
         queryset = queryset.filter(source=source)
@@ -110,10 +109,9 @@ def create_patient_from_row(row, *, source, upload=None, upload_file_key="", use
             "address": row.get("address", ""),
             "dob": row.get("dob", ""),
             "doctor": row.get("doctor", ""),
+            "service_name": row.get("service_name") or row.get("service") or "",
             "country_code": row.get("country_code") or "",
             "phone_number": row.get("phone_number", ""),
-            "live_agent_country_code": row.get("live_agent_country_code") or "",
-            "live_agent_number": row.get("live_agent_number", ""),
         }
     )
     if not serializer.is_valid():
@@ -273,12 +271,54 @@ def _combine_phone(country_code, phone_number):
     )
 
 
-def _map_retell_status(raw_status):
+def _resolve_live_agent_numbers(user):
+    """Ordered E.164 list of active live-agent numbers from CallerSettings."""
+    if user is None or not getattr(user, "pk", None):
+        return []
+    settings_obj = CallerSettings.load(user)
+    numbers = []
+    for agent in settings_obj.active_live_agent_numbers():
+        combined = _combine_phone(agent.country_code, agent.phone_number)
+        if combined and combined not in numbers:
+            numbers.append(combined)
+    return numbers
+
+
+def _resolve_live_agent_number(user):
+    """First active live-agent number (compat helper)."""
+    numbers = _resolve_live_agent_numbers(user)
+    return numbers[0] if numbers else ""
+
+
+def _map_retell_status(raw_status, *, disconnection_reason="", event=""):
     status = (raw_status or "").strip().lower()
-    if status in {"ended", "completed", "done"}:
-        return Call.Status.COMPLETED
-    if status in {"not_connected", "failed", "busy", "no_answer", "voicemail"}:
+    reason = (disconnection_reason or "").strip().lower()
+    event = (event or "").strip().lower()
+
+    not_attended_reasons = {
+        "dial_no_answer",
+        "dial_busy",
+        "dial_failed",
+        "dial_invalid",
+        "no_answer",
+        "busy",
+        "failed",
+        "voicemail_reached",
+        "machine_detected",
+    }
+    if reason in not_attended_reasons:
         return Call.Status.NOT_ATTENDED
+    if status in {"not_connected", "failed", "busy", "no_answer", "voicemail", "error"}:
+        return Call.Status.NOT_ATTENDED
+
+    # Answered then hung up (user/agent) still counts as completed.
+    if status in {"ended", "completed", "done", "analyzed"}:
+        return Call.Status.COMPLETED
+    if event in {"call_ended", "call_analyzed"}:
+        return Call.Status.COMPLETED
+
+    if status in {"ongoing", "registered", "in_progress", "ringing"}:
+        return Call.Status.IN_PROGRESS
     return Call.Status.IN_PROGRESS
 
 
@@ -373,17 +413,21 @@ def _warm_transfer_enabled():
     return bool(getattr(settings, "WARM_TRANSFER_ENABLED", False))
 
 
-def _prepare_warm_transfer_bridge(*, patient, dial_number, live_agent_number):
+def _prepare_warm_transfer_bridge(*, patient, dial_number, live_agent_numbers):
     from apps.ai_caller.twilio_bridge import prepare_retell_bridge
 
+    numbers = [n for n in (live_agent_numbers or []) if n]
+    primary = numbers[0] if numbers else ""
     return prepare_retell_bridge(
         phone_number=dial_number,
         name=patient.full_name or "there",
-        transfer_number=live_agent_number,
-        service_name="care",
+        transfer_number=primary,
+        transfer_numbers=numbers,
+        service_name=(getattr(patient, "service_name", None) or "").strip() or "care",
         extra={
             "patient_id": patient.id,
-            "live_agent_number": live_agent_number,
+            "live_agent_number": primary,
+            "live_agent_numbers": numbers,
             "inbound_speaker": "patient",
             "dial_speaker": "provider",
         },
@@ -416,6 +460,30 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
             "status_code": 400,
         }
 
+    if Call.objects.filter(patient=patient, status=Call.Status.IN_PROGRESS).exists():
+        return {
+            "ok": False,
+            "error": "Patient already has a call in progress.",
+            "status_code": 400,
+        }
+
+    if patient.user_id:
+        trigger_cap = max(
+            1, int(CallerSettings.load(patient.user).call_trigger_count or 1)
+        )
+        not_attended_count = Call.objects.filter(
+            patient=patient, status=Call.Status.NOT_ATTENDED
+        ).count()
+        if not_attended_count >= trigger_cap:
+            return {
+                "ok": False,
+                "error": (
+                    f"Patient reached max not-attended attempts "
+                    f"({trigger_cap})."
+                ),
+                "status_code": 400,
+            }
+
     dial_number = _combine_phone(patient.country_code, patient.phone_number)
     if not dial_number:
         return {
@@ -424,16 +492,14 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
             "status_code": 400,
         }
 
-    live_agent_number = _combine_phone(
-        patient.live_agent_country_code,
-        patient.live_agent_number,
-    )
-    if not live_agent_number:
+    live_agent_numbers = _resolve_live_agent_numbers(patient.user)
+    if not live_agent_numbers:
         return {
             "ok": False,
-            "error": "Live agent number is invalid.",
+            "error": "No active live agent number configured in caller settings.",
             "status_code": 400,
         }
+    live_agent_number = live_agent_numbers[0]
 
     retell_transfer_number = live_agent_number
     session_id = ""
@@ -442,12 +508,14 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
         bridge = _prepare_warm_transfer_bridge(
             patient=patient,
             dial_number=dial_number,
-            live_agent_number=live_agent_number,
+            live_agent_numbers=live_agent_numbers,
         )
         if not bridge.get("ok"):
             return bridge
         retell_transfer_number = bridge["bridge_number"]
         session_id = bridge.get("session_id") or ""
+
+    service = (getattr(patient, "service_name", None) or "").strip() or "care"
 
     if _is_minor(patient.dob):
         result = place_retell_guardian_call(
@@ -455,6 +523,8 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
             patient_name=patient.full_name,
             address_on_file=patient.address,
             provider_name=patient.doctor,
+            service_name=service,
+            measure_name=service,
             transfer_number=retell_transfer_number,
         )
         result["flow"] = result.get("flow") or Call.Flow.GUARDIAN
@@ -464,6 +534,7 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
             name=patient.doctor,
             patient_name=patient.full_name,
             address_on_file=patient.address,
+            service_name=service,
             transfer_number=retell_transfer_number,
         )
         result["flow"] = result.get("flow") or Call.Flow.OUTBOUND
@@ -494,11 +565,106 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
     return result
 
 
+def _extract_decline_reason(data):
+    """Pull decline reason from Retell tool-call payloads or transcript metadata."""
+    if not isinstance(data, dict):
+        return ""
+
+    candidates = []
+
+    for key in ("tool_calls", "function_calls", "tool_call_outputs"):
+        items = data.get(key)
+        if isinstance(items, list):
+            candidates.extend(items)
+
+    transcript = data.get("transcript_with_tool_calls") or data.get("transcript_object")
+    if isinstance(transcript, list):
+        for entry in transcript:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("role") in {"tool_call_invocation", "tool_call_result", "tool"}:
+                candidates.append(entry)
+            inv = entry.get("tool_call") or entry.get("invocation")
+            if isinstance(inv, dict):
+                candidates.append(inv)
+
+    collected = data.get("collected_dynamic_variables") or data.get("retell_llm_dynamic_variables")
+    if isinstance(collected, dict):
+        for key in ("decline_reason", "not_interested_reason", "reason"):
+            value = collected.get(key)
+            if value:
+                return str(value).strip()[:2000]
+
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        name = str(
+            item.get("name")
+            or item.get("tool_name")
+            or item.get("function_name")
+            or ""
+        ).strip()
+        if name and name != "log_decline_reason":
+            continue
+        args = (
+            item.get("arguments")
+            or item.get("args")
+            or item.get("parameters")
+            or item.get("content")
+            or {}
+        )
+        if isinstance(args, str):
+            try:
+                import json
+
+                args = json.loads(args)
+            except Exception:
+                if args.strip():
+                    return args.strip()[:2000]
+                continue
+        if isinstance(args, dict):
+            reason = (
+                args.get("reason")
+                or args.get("decline_reason")
+                or args.get("not_interested_reason")
+                or ""
+            )
+            if reason:
+                return str(reason).strip()[:2000]
+    return ""
+
+
+def save_call_decline_reason(*, retell_call_id="", reason="", call=None):
+    """Persist not-interested / decline reason onto the Call row."""
+    text = (reason or "").strip()[:2000]
+    if not text:
+        return None, "Reason is required."
+
+    if call is None:
+        call_id = str(retell_call_id or "").strip()
+        if not call_id:
+            return None, "call_id is missing."
+        call = Call.objects.filter(retell_call_id=call_id).first()
+        if not call:
+            return None, "Call not found."
+
+    call.decline_reason = text
+    call.save(update_fields=["decline_reason", "updated_at"])
+    dialer_logger.info(
+        "DECLINE_REASON call_id=%s retell_call_id=%s reason=%s",
+        call.id,
+        call.retell_call_id,
+        text[:200],
+    )
+    return call, None
+
+
 def update_call_from_retell_payload(payload):
     """Update call status/transcript from Retell webhook or get-call payload."""
     if not isinstance(payload, dict):
         return None, "Invalid payload."
 
+    event = str(payload.get("event") or payload.get("name") or "").strip()
     data = payload.get("call") if isinstance(payload.get("call"), dict) else payload
     call_id = str(data.get("call_id") or data.get("id") or "").strip()
     if not call_id:
@@ -508,7 +674,17 @@ def update_call_from_retell_payload(payload):
     if not call:
         return None, "Call not found."
 
-    call.status = _map_retell_status(data.get("call_status") or data.get("status"))
+    raw_status = data.get("call_status") or data.get("status") or ""
+    if not raw_status and event.lower() in {"call_ended", "call_analyzed"}:
+        raw_status = "ended"
+
+    call.status = _map_retell_status(
+        raw_status,
+        disconnection_reason=str(
+            data.get("disconnection_reason") or data.get("disconnect_reason") or ""
+        ),
+        event=event,
+    )
 
     started_at = _parse_retell_time(
         data.get("start_timestamp") or data.get("started_at") or data.get("start_time")
@@ -523,23 +699,62 @@ def update_call_from_retell_payload(payload):
     elif call.status in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED} and not call.ended_at:
         call.ended_at = timezone.now()
 
-    transcript = data.get("transcript_object") or data.get("transcript")
+    transcript = (
+        data.get("transcript_object")
+        or data.get("transcript_with_tool_calls")
+        or data.get("transcript")
+    )
     if transcript is not None:
+        # Drop pure tool-call rows; keep spoken turns only.
+        if isinstance(transcript, list):
+            spoken = []
+            for entry in transcript:
+                if not isinstance(entry, dict):
+                    spoken.append(entry)
+                    continue
+                role = str(entry.get("role") or "").strip().lower()
+                if role in {"tool_call_invocation", "tool_call_result", "tool"}:
+                    continue
+                spoken.append(entry)
+            transcript = spoken
         ai_items = _normalize_transcript(transcript)
         for item in ai_items:
             item["segment"] = "ai"
-        call.retell_transcript = ai_items
-        call.transcript = merge_ai_and_humans(ai_items, call.live_agent_transcript or [])
+        # Keep non-empty lines only.
+        ai_items = [item for item in ai_items if (item.get("text") or "").strip()]
+        if ai_items or not (call.retell_transcript or []):
+            call.retell_transcript = ai_items
+            call.transcript = merge_ai_and_humans(
+                ai_items, call.live_agent_transcript or []
+            )
 
-    call.save(
-        update_fields=[
-            "status",
-            "transcript",
-            "retell_transcript",
-            "started_at",
-            "ended_at",
-            "updated_at",
-        ]
+    update_fields = [
+        "status",
+        "transcript",
+        "retell_transcript",
+        "started_at",
+        "ended_at",
+        "updated_at",
+    ]
+    reason = _extract_decline_reason(data) or _extract_decline_reason(payload)
+    if reason and not (call.decline_reason or "").strip():
+        call.decline_reason = reason
+        update_fields.append("decline_reason")
+
+    recording = data.get("recording_url") or data.get("public_log_url") or ""
+    if recording and not (call.recording_url or "").strip():
+        call.recording_url = str(recording)[:1024]
+        update_fields.append("recording_url")
+
+    call.save(update_fields=update_fields)
+    dialer_logger.info(
+        "CALL_STATUS_UPDATE call_id=%s retell_call_id=%s status=%s event=%s raw=%s reason=%s",
+        call.id,
+        call.retell_call_id,
+        call.status,
+        event or "-",
+        raw_status or "-",
+        str(data.get("disconnection_reason") or "")[:80],
     )
     return call, None
 
@@ -553,6 +768,29 @@ def sync_call_transcript(call):
     if error:
         return None, error
     return updated, None
+
+
+def sync_in_progress_calls_from_retell(*, user=None, limit=25):
+    """
+    Fallback when Retell webhooks are missing/misconfigured:
+    pull latest status for recent in_progress rows from Retell get-call.
+    """
+    qs = Call.objects.filter(status=Call.Status.IN_PROGRESS).order_by("-started_at")
+    if user is not None:
+        qs = qs.filter(user=user)
+    synced = 0
+    for call in qs[: max(1, int(limit))]:
+        try:
+            updated, error = sync_call_transcript(call)
+            if updated and not error:
+                synced += 1
+        except Exception:
+            dialer_logger.exception(
+                "Failed syncing in_progress call id=%s retell=%s",
+                call.id,
+                call.retell_call_id,
+            )
+    return synced
 
 
 def resolve_timezone(tz_name):
@@ -632,28 +870,58 @@ def _local_day_bounds(settings_obj):
 
 
 def patients_due_for_outbound(settings_obj=None, limit=None):
-    """Eligible patients: not blocked, no completed call, no attempt today."""
+    """
+    Eligible patients for auto dial:
+    - not blocked
+    - no completed call (never redial)
+    - no in-progress call (leave alone)
+    - not_attended attempts under call_trigger_count
+    - no in-progress/completed attempt today
+    Retries only apply after not_attended.
+    """
     settings_obj = settings_obj or None
     if settings_obj is None:
         raise ValueError("settings_obj is required")
     day_start, day_end = _local_day_bounds(settings_obj)
     user = settings_obj.user
+    trigger_cap = max(1, int(settings_obj.call_trigger_count or 1))
 
     completed_ids = Call.objects.filter(
         status=Call.Status.COMPLETED,
         user=user,
     ).values_list("patient_id", flat=True)
 
-    already_called_today = Call.objects.filter(
+    in_progress_ids = Call.objects.filter(
+        status=Call.Status.IN_PROGRESS,
         user=user,
-        started_at__gte=day_start,
-        started_at__lt=day_end,
     ).values_list("patient_id", flat=True)
+
+    # Block same-day only for in_progress / completed — not_attended may retry.
+    active_today_ids = (
+        Call.objects.filter(
+            user=user,
+            started_at__gte=day_start,
+            started_at__lt=day_end,
+            status__in=[Call.Status.IN_PROGRESS, Call.Status.COMPLETED],
+        ).values_list("patient_id", flat=True)
+    )
+
+    from django.db.models import Count
+
+    exhausted_ids = (
+        Call.objects.filter(user=user, status=Call.Status.NOT_ATTENDED)
+        .values("patient_id")
+        .annotate(attempts=Count("id"))
+        .filter(attempts__gte=trigger_cap)
+        .values_list("patient_id", flat=True)
+    )
 
     queryset = (
         Patient.objects.filter(user=user, is_blocked=False)
         .exclude(id__in=completed_ids)
-        .exclude(id__in=already_called_today)
+        .exclude(id__in=in_progress_ids)
+        .exclude(id__in=active_today_ids)
+        .exclude(id__in=exhausted_ids)
         .order_by("id")
     )
     limit = limit if limit is not None else settings_obj.max_calls_per_run

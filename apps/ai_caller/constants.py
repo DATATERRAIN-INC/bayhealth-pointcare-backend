@@ -4,10 +4,9 @@ PATIENT_EXCEL_COLUMNS = (
     "address",
     "dob",
     "doctor",
+    "service_name",
     "country_code",
     "phone_number",
-    "live_agent_country_code",
-    "live_agent_number",
 )
 
 PATIENT_UPLOAD_CONTENT_TYPES = {
