@@ -18,8 +18,10 @@ from common.excel import parse_patient_upload
 from common.s3 import upload_bytes
 
 
-def get_patient_queryset(*, search="", source="", is_blocked=None):
+def get_patient_queryset(*, user=None, search="", source="", is_blocked=None):
     queryset = Patient.objects.all()
+    if user is not None:
+        queryset = queryset.filter(user=user)
     search = (search or "").strip()
     source = (source or "").strip().lower()
 
@@ -43,6 +45,7 @@ def get_patient_queryset(*, search="", source="", is_blocked=None):
 
 def get_call_queryset(
     *,
+    user=None,
     search="",
     source="",
     status="",
@@ -50,6 +53,8 @@ def get_call_queryset(
     retell_call_id="",
 ):
     queryset = Call.objects.select_related("patient").all()
+    if user is not None:
+        queryset = queryset.filter(user=user)
     search = (search or "").strip()
     source = (source or "").strip().lower()
     status = (status or "").strip().lower()
@@ -89,7 +94,7 @@ def _split_full_name(value):
     return parts[0], parts[1] if len(parts) > 1 else ""
 
 
-def create_patient_from_row(row, *, source, upload=None, upload_file_key=""):
+def create_patient_from_row(row, *, source, upload=None, upload_file_key="", user=None):
     first_name = (row.get("first_name") or "").strip()
     last_name = (row.get("last_name") or "").strip()
     if not first_name and not last_name:
@@ -115,6 +120,9 @@ def create_patient_from_row(row, *, source, upload=None, upload_file_key=""):
         source=source,
         upload=upload,
         upload_file_key=upload_file_key or "",
+        user=user,
+        created_by=user,
+        updated_by=user,
     )
     return PatientSerializer(patient).data, None
 
@@ -129,7 +137,7 @@ def _resolve_upload_status(uploaded_count, failed_count, error_message=""):
     return UploadedFile.Status.SUCCESS
 
 
-def upload_patients_from_file(django_file):
+def upload_patients_from_file(django_file, *, user=None):
     upload_serializer = PatientUploadSerializer(data={"file": django_file})
     if not upload_serializer.is_valid():
         return None, upload_serializer.errors
@@ -138,6 +146,9 @@ def upload_patients_from_file(django_file):
     filename = getattr(upload, "name", "") or ""
     content_type = getattr(upload, "content_type", None)
     file_log = UploadedFile.objects.create(
+        user=user,
+        created_by=user,
+        updated_by=user,
         file_name=filename,
         status=UploadedFile.Status.FAILED,
     )
@@ -148,13 +159,15 @@ def upload_patients_from_file(django_file):
     except Exception as exc:
         message = f"Could not read upload: {exc}"
         file_log.error_message = message
-        file_log.save(update_fields=["error_message"])
+        file_log.updated_by = user
+        file_log.save(update_fields=["error_message", "updated_by"])
         return None, {"file": [message]}
 
     if not file_bytes:
         message = "Uploaded file is empty."
         file_log.error_message = message
-        file_log.save(update_fields=["error_message"])
+        file_log.updated_by = user
+        file_log.save(update_fields=["error_message", "updated_by"])
         return None, {"file": [message]}
 
     try:
@@ -166,11 +179,13 @@ def upload_patients_from_file(django_file):
         )
     except (ValueError, RuntimeError) as exc:
         file_log.error_message = str(exc)
-        file_log.save(update_fields=["error_message"])
+        file_log.updated_by = user
+        file_log.save(update_fields=["error_message", "updated_by"])
         return None, {"file": [str(exc)]}
 
     file_log.file_key = file_key
-    file_log.save(update_fields=["file_key"])
+    file_log.updated_by = user
+    file_log.save(update_fields=["file_key", "updated_by"])
 
     try:
         rows = parse_patient_upload(file_bytes, filename)
@@ -178,7 +193,8 @@ def upload_patients_from_file(django_file):
         message = f"Could not read upload: {exc}"
         file_log.error_message = message
         file_log.status = UploadedFile.Status.FAILED
-        file_log.save(update_fields=["error_message", "status"])
+        file_log.updated_by = user
+        file_log.save(update_fields=["error_message", "status", "updated_by"])
         return None, {"file": [message]}
 
     created = []
@@ -190,6 +206,7 @@ def upload_patients_from_file(django_file):
             source=PatientSource.EXCEL,
             upload=file_log,
             upload_file_key=file_key,
+            user=user,
         )
         if errors:
             skipped.append({"row": row_number, "errors": errors})
@@ -201,8 +218,15 @@ def upload_patients_from_file(django_file):
     file_log.status = _resolve_upload_status(len(created), len(skipped))
     if skipped and not created:
         file_log.error_message = "All rows failed validation."
+    file_log.updated_by = user
     file_log.save(
-        update_fields=["uploaded_count", "failed_count", "status", "error_message"]
+        update_fields=[
+            "uploaded_count",
+            "failed_count",
+            "status",
+            "error_message",
+            "updated_by",
+        ]
     )
 
     from apps.notifications.services import notify_patient_upload
@@ -212,6 +236,7 @@ def upload_patients_from_file(django_file):
         failed_count=len(skipped),
         upload_id=file_log.id,
         file_name=filename,
+        user=user,
     )
 
     return {
@@ -322,8 +347,12 @@ def _parse_retell_time(value):
     return None
 
 
-def _save_call(patient, result, *, dial_number, transfer_number, session_id=""):
+def _save_call(patient, result, *, dial_number, transfer_number, session_id="", actor=None):
+    actor = actor or patient.user
     return Call.objects.create(
+        user=patient.user,
+        created_by=actor,
+        updated_by=actor,
         patient=patient,
         retell_call_id=result["call_id"],
         flow=result.get("flow") or Call.Flow.OUTBOUND,
@@ -358,8 +387,11 @@ def _prepare_warm_transfer_bridge(*, patient, dial_number, live_agent_number):
     )
 
 
-def place_outbound_call_for_patient(patient_id):
-    patient = Patient.objects.filter(pk=patient_id).first()
+def place_outbound_call_for_patient(patient_id, *, user=None):
+    queryset = Patient.objects.all()
+    if user is not None:
+        queryset = queryset.filter(user=user)
+    patient = queryset.filter(pk=patient_id).first()
     if not patient:
         return {
             "ok": False,
@@ -446,6 +478,7 @@ def place_outbound_call_for_patient(patient_id):
         dial_number=dial_number,
         transfer_number=live_agent_number,
         session_id=session_id,
+        actor=user or patient.user,
     )
     result["db_call_id"] = call.id
     result["warm_transfer"] = bool(session_id)
@@ -528,8 +561,10 @@ def resolve_timezone(tz_name):
     return ZoneInfo((tz_name or "America/New_York").strip())
 
 
-def get_caller_settings():
-    return CallerSettings.load()
+def get_caller_settings(user=None):
+    if user is None:
+        raise ValueError("user is required for get_caller_settings()")
+    return CallerSettings.load(user)
 
 
 def _as_time(value):
@@ -546,7 +581,8 @@ def _as_time(value):
 
 
 def build_calling_window_summary(settings_obj=None):
-    settings_obj = settings_obj or get_caller_settings()
+    if settings_obj is None:
+        raise ValueError("settings_obj is required")
     start_t = _as_time(settings_obj.start_time)
     end_t = _as_time(settings_obj.end_time)
     start = start_t.strftime("%I:%M %p").lstrip("0")
@@ -569,7 +605,8 @@ def build_calling_window_summary(settings_obj=None):
 
 
 def is_within_calling_window(settings_obj=None, when=None):
-    settings_obj = settings_obj or get_caller_settings()
+    if settings_obj is None:
+        raise ValueError("settings_obj is required")
     try:
         tz = resolve_timezone(settings_obj.timezone)
     except Exception:
@@ -592,20 +629,25 @@ def _local_day_bounds(settings_obj):
 
 def patients_due_for_outbound(settings_obj=None, limit=None):
     """Eligible patients: not blocked, no completed call, no attempt today."""
-    settings_obj = settings_obj or get_caller_settings()
+    settings_obj = settings_obj or None
+    if settings_obj is None:
+        raise ValueError("settings_obj is required")
     day_start, day_end = _local_day_bounds(settings_obj)
+    user = settings_obj.user
 
     completed_ids = Call.objects.filter(
         status=Call.Status.COMPLETED,
+        user=user,
     ).values_list("patient_id", flat=True)
 
     already_called_today = Call.objects.filter(
+        user=user,
         started_at__gte=day_start,
         started_at__lt=day_end,
     ).values_list("patient_id", flat=True)
 
     queryset = (
-        Patient.objects.filter(is_blocked=False)
+        Patient.objects.filter(user=user, is_blocked=False)
         .exclude(id__in=completed_ids)
         .exclude(id__in=already_called_today)
         .order_by("id")
@@ -616,12 +658,7 @@ def patients_due_for_outbound(settings_obj=None, limit=None):
     return list(queryset)
 
 
-def run_scheduled_outbound_calls():
-    """
-    Celery entrypoint: place outbound calls when enabled and inside the window.
-    Reuses place_outbound_call_for_patient (same path as PlaceOutboundCallView).
-    """
-    settings_obj = get_caller_settings()
+def _run_scheduled_outbound_for_settings(settings_obj):
     if not settings_obj.calls_enabled:
         return {
             "ok": True,
@@ -629,6 +666,7 @@ def run_scheduled_outbound_calls():
             "reason": "calls_disabled",
             "placed": 0,
             "failed": 0,
+            "user_id": settings_obj.user_id,
         }
 
     if not is_within_calling_window(settings_obj):
@@ -638,6 +676,7 @@ def run_scheduled_outbound_calls():
             "reason": "outside_calling_window",
             "placed": 0,
             "failed": 0,
+            "user_id": settings_obj.user_id,
             "window_summary": build_calling_window_summary(settings_obj),
         }
 
@@ -646,7 +685,7 @@ def run_scheduled_outbound_calls():
     failed = 0
     results = []
     for patient in patients:
-        result = place_outbound_call_for_patient(patient.id)
+        result = place_outbound_call_for_patient(patient.id, user=settings_obj.user)
         entry = {
             "patient_id": patient.id,
             "ok": bool(result.get("ok")),
@@ -666,9 +705,28 @@ def run_scheduled_outbound_calls():
         "failed": failed,
         "attempted": len(patients),
         "results": results,
+        "user_id": settings_obj.user_id,
     }
     if patients:
         from apps.notifications.services import notify_outbound_batch
 
-        notify_outbound_batch(payload)
+        notify_outbound_batch(payload, user=settings_obj.user)
     return payload
+
+
+def run_scheduled_outbound_calls():
+    """
+    Celery entrypoint: place outbound calls per user when enabled and in window.
+    Reuses place_outbound_call_for_patient (same path as PlaceOutboundCallView).
+    """
+    runs = []
+    queryset = CallerSettings.objects.filter(
+        calls_enabled=True, user__isnull=False
+    ).select_related("user")
+    for settings_obj in queryset:
+        runs.append(_run_scheduled_outbound_for_settings(settings_obj))
+    return {
+        "ok": True,
+        "runs": runs,
+        "users": len(runs),
+    }
