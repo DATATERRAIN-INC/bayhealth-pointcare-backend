@@ -96,6 +96,18 @@ def _split_full_name(value):
     return parts[0], parts[1] if len(parts) > 1 else ""
 
 
+def _normalize_upload_dob(value):
+    """Excel may send '2000-10-30 00:00:00'; DateField wants YYYY-MM-DD."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if " " in text:
+        text = text.split(" ", 1)[0]
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    return text
+
+
 def create_patient_from_row(row, *, source, upload=None, upload_file_key="", user=None):
     first_name = (row.get("first_name") or "").strip()
     last_name = (row.get("last_name") or "").strip()
@@ -107,7 +119,7 @@ def create_patient_from_row(row, *, source, upload=None, upload_file_key="", use
             "first_name": first_name,
             "last_name": last_name,
             "address": row.get("address", ""),
-            "dob": row.get("dob", ""),
+            "dob": _normalize_upload_dob(row.get("dob", "")),
             "doctor": row.get("doctor", ""),
             "service_name": row.get("service_name") or row.get("service") or "",
             "country_code": row.get("country_code") or "",
