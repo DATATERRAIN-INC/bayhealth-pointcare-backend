@@ -13,7 +13,7 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = CommonPagination
 
     def get_queryset(self):
-        queryset = Notification.objects.all()
+        queryset = Notification.objects.filter(user=self.request.user)
         event_type = (self.request.query_params.get("event_type") or "").strip()
         is_read = self.request.query_params.get("is_read")
         if event_type:
@@ -26,7 +26,7 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
-        queryset = Notification.objects.all()
+        queryset = Notification.objects.filter(user=request.user)
         return Response(
             {
                 "all": queryset.count(),
@@ -40,10 +40,13 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
         notification = self.get_object()
         if not notification.is_read:
             notification.is_read = True
-            notification.save(update_fields=["is_read"])
+            notification.updated_by = request.user
+            notification.save(update_fields=["is_read", "updated_by"])
         return message_response("Notification marked as read.")
 
     @action(detail=False, methods=["post"], url_path="mark-all-read")
     def mark_all_read(self, request):
-        updated = Notification.objects.filter(is_read=False).update(is_read=True)
+        updated = Notification.objects.filter(
+            user=request.user, is_read=False
+        ).update(is_read=True, updated_by=request.user)
         return message_response(f"Marked {updated} notification(s) as read.")

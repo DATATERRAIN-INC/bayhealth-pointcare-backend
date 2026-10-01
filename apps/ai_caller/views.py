@@ -36,6 +36,7 @@ class PatientViewSet(viewsets.ModelViewSet):
         if blocked is not None and str(blocked).strip() != "":
             is_blocked = str(blocked).strip().lower() in ("1", "true", "yes")
         return get_patient_queryset(
+            user=self.request.user,
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
             is_blocked=is_blocked,
@@ -44,7 +45,12 @@ class PatientViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        patient = serializer.save(source=PatientSource.MANUAL)
+        patient = serializer.save(
+            source=PatientSource.MANUAL,
+            user=request.user,
+            created_by=request.user,
+            updated_by=request.user,
+        )
         from apps.notifications.services import notify_patient_created
 
         notify_patient_created(patient)
@@ -58,7 +64,7 @@ class PatientViewSet(viewsets.ModelViewSet):
         )
         serializer.is_valid(raise_exception=True)
         changed_fields = sorted(serializer.validated_data.keys())
-        patient = serializer.save()
+        patient = serializer.save(updated_by=request.user)
 
         from apps.notifications.services import (
             notify_patient_block_toggle,
@@ -77,7 +83,9 @@ class PatientViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], url_path="upload")
     def upload(self, request):
-        _, errors = upload_patients_from_file(request.FILES.get("file"))
+        _, errors = upload_patients_from_file(
+            request.FILES.get("file"), user=request.user
+        )
         if errors:
             field = next(iter(errors))
             value = errors[field]
@@ -101,6 +109,7 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return get_call_queryset(
+            user=self.request.user,
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
             status=self.request.query_params.get("status", ""),
@@ -119,7 +128,7 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
-        queryset = Call.objects.all()
+        queryset = Call.objects.filter(user=request.user)
         return Response(
             {
                 "all": queryset.count(),
@@ -142,7 +151,9 @@ class PlaceOutboundCallView(APIView):
         serializer = PlaceOutboundCallSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        result = place_outbound_call_for_patient(serializer.validated_data["id"])
+        result = place_outbound_call_for_patient(
+            serializer.validated_data["id"], user=request.user
+        )
         if not result.get("ok"):
             return error_response(
                 result.get("error") or "Failed to place call.",
@@ -158,16 +169,16 @@ class CallerSettingsView(APIView):
     """GET/PATCH controller settings for the automated AI caller."""
 
     def get(self, request):
-        settings_obj = get_caller_settings()
+        settings_obj = get_caller_settings(request.user)
         return Response(CallerSettingsSerializer(settings_obj).data)
 
     def patch(self, request):
-        settings_obj = get_caller_settings()
+        settings_obj = get_caller_settings(request.user)
         serializer = CallerSettingsSerializer(
             settings_obj, data=request.data, partial=True
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        serializer.save(updated_by=request.user)
         return Response(CallerSettingsSerializer(settings_obj).data)
 
     def put(self, request):

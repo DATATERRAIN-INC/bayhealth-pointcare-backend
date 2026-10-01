@@ -7,6 +7,7 @@ from apps.ai_caller.models import Call, CallerSettings, Patient, UploadedFile
 class UploadedFileAdmin(admin.ModelAdmin):
     list_display = (
         "id",
+        "user",
         "file_name",
         "status",
         "uploaded_count",
@@ -14,15 +15,17 @@ class UploadedFileAdmin(admin.ModelAdmin):
         "created_at",
     )
     list_filter = ("status",)
-    search_fields = ("file_name", "file_key", "error_message")
+    search_fields = ("file_name", "file_key", "error_message", "user__email")
     ordering = ("-created_at",)
     readonly_fields = ("created_at",)
+    raw_id_fields = ("user", "created_by", "updated_by")
 
 
 @admin.register(Patient)
 class PatientAdmin(admin.ModelAdmin):
     list_display = (
         "id",
+        "user",
         "first_name",
         "last_name",
         "phone_number",
@@ -43,15 +46,17 @@ class PatientAdmin(admin.ModelAdmin):
         "phone_number",
         "live_agent_number",
         "address",
+        "user__email",
     )
     ordering = ("-created_at",)
-    raw_id_fields = ("upload",)
+    raw_id_fields = ("upload", "user", "created_by", "updated_by")
 
 
 @admin.register(Call)
 class CallAdmin(admin.ModelAdmin):
     list_display = (
         "id",
+        "user",
         "patient",
         "retell_call_id",
         "flow",
@@ -67,15 +72,17 @@ class CallAdmin(admin.ModelAdmin):
         "to_number",
         "patient__first_name",
         "patient__last_name",
+        "user__email",
     )
     ordering = ("-started_at",)
-    raw_id_fields = ("patient",)
+    raw_id_fields = ("patient", "user", "created_by", "updated_by")
     readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(CallerSettings)
 class CallerSettingsAdmin(admin.ModelAdmin):
     list_display = (
+        "user",
         "calls_enabled",
         "recording_enabled",
         "start_time",
@@ -85,9 +92,4 @@ class CallerSettingsAdmin(admin.ModelAdmin):
         "updated_at",
     )
     readonly_fields = ("updated_at",)
-
-    def has_add_permission(self, request):
-        return not CallerSettings.objects.exists()
-
-    def has_delete_permission(self, request, obj=None):
-        return False
+    raw_id_fields = ("user", "created_by", "updated_by")

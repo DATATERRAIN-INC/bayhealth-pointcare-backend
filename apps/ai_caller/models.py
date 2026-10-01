@@ -15,6 +15,27 @@ class UploadedFile(models.Model):
         PARTIAL = "partial", "Partial"
         FAILED = "failed", "Failed"
 
+    user = models.ForeignKey(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="uploads",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="uploads_created",
+        null=True,
+        blank=True,
+    )
+    updated_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="uploads_updated",
+        null=True,
+        blank=True,
+    )
     file_name = models.CharField(max_length=255)
     file_key = models.CharField(max_length=512, blank=True, default="")
     status = models.CharField(
@@ -35,6 +56,27 @@ class UploadedFile(models.Model):
 
 
 class Patient(models.Model):
+    user = models.ForeignKey(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="patients",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="patients_created",
+        null=True,
+        blank=True,
+    )
+    updated_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="patients_updated",
+        null=True,
+        blank=True,
+    )
     first_name = models.CharField(max_length=60)
     last_name = models.CharField(max_length=60, blank=True, default="")
     address = models.CharField(max_length=300)
@@ -84,6 +126,27 @@ class Call(models.Model):
         OUTBOUND = "outbound", "Outbound"
         GUARDIAN = "guardian", "Guardian"
 
+    user = models.ForeignKey(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="calls",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="calls_created",
+        null=True,
+        blank=True,
+    )
+    updated_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="calls_updated",
+        null=True,
+        blank=True,
+    )
     patient = models.ForeignKey(
         Patient,
         on_delete=models.CASCADE,
@@ -131,8 +194,27 @@ class Call(models.Model):
 
 
 class CallerSettings(models.Model):
-    """Singleton controller settings for automated AI calling."""
+    """Per-user controller settings for automated AI calling."""
 
+    user = models.OneToOneField(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="caller_settings",
+    )
+    created_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="caller_settings_created",
+        null=True,
+        blank=True,
+    )
+    updated_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="caller_settings_updated",
+        null=True,
+        blank=True,
+    )
     calls_enabled = models.BooleanField(default=False)
     recording_enabled = models.BooleanField(default=True)
     start_time = models.TimeField(default=time(9, 0))
@@ -145,18 +227,17 @@ class CallerSettings(models.Model):
         verbose_name = "Caller settings"
         verbose_name_plural = "Caller settings"
 
-    def save(self, *args, **kwargs):
-        self.pk = 1
-        super().save(*args, **kwargs)
-
-    def delete(self, *args, **kwargs):
-        pass
-
     @classmethod
-    def load(cls):
-        obj, _ = cls.objects.get_or_create(pk=1)
+    def load(cls, user):
+        if user is None:
+            raise ValueError("user is required for CallerSettings.load()")
+        obj, _ = cls.objects.get_or_create(
+            user=user,
+            defaults={"created_by": user, "updated_by": user},
+        )
         return obj
 
     def __str__(self):
         state = "enabled" if self.calls_enabled else "disabled"
-        return f"Caller settings ({state})"
+        owner = getattr(self.user, "email", None) or "unassigned"
+        return f"Caller settings ({owner}, {state})"

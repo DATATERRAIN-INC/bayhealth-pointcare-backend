@@ -12,6 +12,27 @@ class NotificationEvent(models.TextChoices):
 
 
 class Notification(models.Model):
+    user = models.ForeignKey(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="notifications",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="notifications_created",
+        null=True,
+        blank=True,
+    )
+    updated_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="notifications_updated",
+        null=True,
+        blank=True,
+    )
     event_type = models.CharField(max_length=32, choices=NotificationEvent.choices)
     title = models.CharField(max_length=200)
     message = models.TextField(blank=True, default="")
