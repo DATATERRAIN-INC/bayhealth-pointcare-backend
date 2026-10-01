@@ -82,10 +82,9 @@ class Patient(models.Model):
     address = models.CharField(max_length=300)
     dob = models.DateField()
     doctor = models.CharField(max_length=120)
+    service_name = models.CharField(max_length=120, default="")
     country_code = models.CharField(max_length=8, blank=True, default="")
     phone_number = models.CharField(max_length=32)
-    live_agent_country_code = models.CharField(max_length=8, blank=True, default="")
-    live_agent_number = models.CharField(max_length=32)
     is_blocked = models.BooleanField(default=False)
     source = models.CharField(
         max_length=16,
@@ -163,6 +162,7 @@ class Call(models.Model):
     to_number = models.CharField(max_length=32, blank=True, default="")
     agent_id = models.CharField(max_length=120, blank=True, default="")
     transfer_number = models.CharField(max_length=32, blank=True, default="")
+    decline_reason = models.TextField(blank=True, default="")
     transcript = models.JSONField(default=list, blank=True)
     retell_transcript = models.JSONField(default=list, blank=True)
     live_agent_transcript = models.JSONField(default=list, blank=True)
@@ -217,10 +217,12 @@ class CallerSettings(models.Model):
     )
     calls_enabled = models.BooleanField(default=False)
     recording_enabled = models.BooleanField(default=True)
+    text_sms_enabled = models.BooleanField(default=False)
     start_time = models.TimeField(default=time(9, 0))
     end_time = models.TimeField(default=time(17, 0))
     timezone = models.CharField(max_length=64, default="America/New_York")
     max_calls_per_run = models.PositiveIntegerField(default=5)
+    call_trigger_count = models.PositiveIntegerField(default=3)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -261,3 +263,36 @@ class CallerSettings(models.Model):
         state = "enabled" if self.calls_enabled else "disabled"
         owner = getattr(self.user, "email", None) or "unassigned"
         return f"Caller settings ({owner}, {state})"
+
+    def active_live_agent_numbers(self):
+        return self.live_agent_numbers.filter(is_active=True).order_by("id")
+
+    def primary_live_agent_number(self):
+        """First active live-agent number for outbound transfer."""
+        return self.active_live_agent_numbers().first()
+
+
+class LiveAgentNumber(models.Model):
+    """Transfer / live-agent numbers owned by a user's CallerSettings (many per user)."""
+
+    caller_settings = models.ForeignKey(
+        CallerSettings,
+        on_delete=models.CASCADE,
+        related_name="live_agent_numbers",
+    )
+    country_code = models.CharField(max_length=8, blank=True, default="")
+    phone_number = models.CharField(max_length=32)
+    label = models.CharField(max_length=64, blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["id"]
+        verbose_name = "Live agent number"
+        verbose_name_plural = "Live agent numbers"
+
+    def __str__(self):
+        label = (self.label or "").strip()
+        number = f"{self.country_code}{self.phone_number}".strip()
+        return label or number or f"LiveAgentNumber #{self.id}"

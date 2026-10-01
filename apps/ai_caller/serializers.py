@@ -3,8 +3,17 @@ from datetime import date
 from rest_framework import serializers
 
 from apps.ai_caller.constants import ALLOWED_UPLOAD_EXTENSIONS
-from apps.ai_caller.models import Call, CallerSettings, Patient
+from apps.ai_caller.models import Call, CallerSettings, LiveAgentNumber, Patient
 from common.s3 import build_s3_url
+
+
+def _normalize_country_code(value):
+    code = (value or "").strip()
+    if not code:
+        return ""
+    if not code.startswith("+"):
+        code = f"+{code.lstrip('+')}"
+    return code
 
 
 class PatientSerializer(serializers.ModelSerializer):
@@ -20,10 +29,9 @@ class PatientSerializer(serializers.ModelSerializer):
             "address",
             "dob",
             "doctor",
+            "service_name",
             "country_code",
             "phone_number",
-            "live_agent_country_code",
-            "live_agent_number",
             "is_blocked",
             "source",
             "upload_file_key",
@@ -50,18 +58,13 @@ class PatientSerializer(serializers.ModelSerializer):
         return value
 
     def validate_country_code(self, value):
-        return self._normalize_country_code(value)
+        return _normalize_country_code(value)
 
-    def validate_live_agent_country_code(self, value):
-        return self._normalize_country_code(value)
-
-    def _normalize_country_code(self, value):
-        code = (value or "").strip()
-        if not code:
-            return ""
-        if not code.startswith("+"):
-            code = f"+{code.lstrip('+')}"
-        return code
+    def validate_service_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("Service name is required.")
+        return name
 
 
 class PatientUploadSerializer(serializers.Serializer):
@@ -98,6 +101,7 @@ class CallSerializer(serializers.ModelSerializer):
             "to_number",
             "agent_id",
             "transfer_number",
+            "decline_reason",
             "started_at",
             "ended_at",
             "duration_seconds",
@@ -112,18 +116,46 @@ class CallSerializer(serializers.ModelSerializer):
         return len(obj.transcript or [])
 
 
+class LiveAgentNumberSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LiveAgentNumber
+        fields = (
+            "id",
+            "country_code",
+            "phone_number",
+            "label",
+            "is_active",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate_country_code(self, value):
+        return _normalize_country_code(value)
+
+    def validate_phone_number(self, value):
+        number = (value or "").strip()
+        if not number:
+            raise serializers.ValidationError("Phone number is required.")
+        return number
+
+
 class CallerSettingsSerializer(serializers.ModelSerializer):
     window_summary = serializers.SerializerMethodField()
+    live_agent_numbers = LiveAgentNumberSerializer(many=True, required=False)
 
     class Meta:
         model = CallerSettings
         fields = (
             "calls_enabled",
             "recording_enabled",
+            "text_sms_enabled",
             "start_time",
             "end_time",
             "timezone",
             "max_calls_per_run",
+            "call_trigger_count",
+            "live_agent_numbers",
             "window_summary",
             "updated_at",
         )
@@ -153,4 +185,35 @@ class CallerSettingsSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"end_time": "End time must be after start time."}
             )
+        trigger = attrs.get(
+            "call_trigger_count",
+            getattr(self.instance, "call_trigger_count", None),
+        )
+        if trigger is not None and int(trigger) < 1:
+            raise serializers.ValidationError(
+                {"call_trigger_count": "Must be at least 1."}
+            )
         return attrs
+
+    def update(self, instance, validated_data):
+        numbers_data = validated_data.pop("live_agent_numbers", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if numbers_data is not None:
+            # Full replace of the list when provided in PATCH/PUT.
+            instance.live_agent_numbers.all().delete()
+            LiveAgentNumber.objects.bulk_create(
+                [
+                    LiveAgentNumber(
+                        caller_settings=instance,
+                        country_code=item.get("country_code") or "",
+                        phone_number=item.get("phone_number") or "",
+                        label=item.get("label") or "",
+                        is_active=item.get("is_active", True),
+                    )
+                    for item in numbers_data
+                ]
+            )
+        return instance

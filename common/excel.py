@@ -17,14 +17,11 @@ HEADER_ALIASES = {
     "dob": "dob",
     "date_of_birth": "dob",
     "doctor": "doctor",
+    "service_name": "service_name",
+    "service": "service_name",
     "country_code": "country_code",
     "phone": "phone_number",
     "phone_number": "phone_number",
-    "live_agent_country_code": "live_agent_country_code",
-    "agent_country_code": "live_agent_country_code",
-    "live_agent_number": "live_agent_number",
-    "agent_number": "live_agent_number",
-    "transfer_number": "live_agent_number",
 }
 
 
@@ -44,10 +41,9 @@ def build_patient_template_bytes():
             "14 Oak Street, Dover, DE 19901",
             "1984-03-12",
             "Dr. Alan Brooks",
+            "annual wellness visit",
             "",
             "3025550101",
-            "",
-            "3025550199",
         ]
     )
     buffer = io.BytesIO()

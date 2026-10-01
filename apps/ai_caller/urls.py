@@ -6,6 +6,7 @@ from apps.ai_caller.views import (
     CallerSettingsView,
     PatientViewSet,
     PlaceOutboundCallView,
+    RetellToolWebhookView,
     RetellWebhookView,
 )
 from apps.ai_caller import twiml_views
@@ -29,6 +30,11 @@ urlpatterns = [
         "webhooks/retell/",
         RetellWebhookView.as_view(),
         name="retell-webhook",
+    ),
+    path(
+        "webhooks/retell-tool/",
+        RetellToolWebhookView.as_view(),
+        name="retell-tool-webhook",
     ),
     path(
         "twilio/warm-transfer/answer/",

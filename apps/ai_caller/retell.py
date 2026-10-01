@@ -281,6 +281,13 @@ def _agent_call_settings() -> Dict[str, Any]:
     }
 
 
+def _tool_webhook_url() -> str:
+    base = (getattr(settings, "BACKEND_URL", "") or "").rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/api/ai-call/webhooks/retell-tool/"
+
+
 def _end_call_tool() -> Dict[str, Any]:
     return {
         "type": "end_call",
@@ -291,6 +298,45 @@ def _end_call_tool() -> Dict[str, Any]:
     }
 
 
+def _decline_reason_tool() -> Dict[str, Any]:
+    tool: Dict[str, Any] = {
+        "type": "custom",
+        "name": "log_decline_reason",
+        "description": (
+            "Required whenever the caller says they are not interested in the call, "
+            "screening, or scheduling. Pass their reason in their own words before ending."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why the caller is not interested, in their own words. "
+                        "Use a short paraphrase only if they refuse to give detail."
+                    ),
+                }
+            },
+            "required": ["reason"],
+        },
+        "speak_during_execution": False,
+        "speak_after_execution": False,
+    }
+    url = _tool_webhook_url()
+    if url:
+        tool["url"] = url
+        tool["method"] = "POST"
+    return tool
+
+
+def _default_care_tools() -> List[Dict[str, Any]]:
+    return [_end_call_tool(), _transfer_tool(), _decline_reason_tool()]
+
+
+def _default_guardian_tools() -> List[Dict[str, Any]]:
+    return [_end_call_tool(), _minor_transfer_tool(), _decline_reason_tool()]
+
+
 def _transfer_tool() -> Dict[str, Any]:
     return {
         "type": "transfer_call",
@@ -298,8 +344,8 @@ def _transfer_tool() -> Dict[str, Any]:
         "description": (
             "Transfer to a live Bay Area Community Health team member ONLY when the "
             "patient has said yes to booking or rescheduling an appointment, when "
-            "they say their insurance is different from what is on file, or when "
-            "they declined to talk to an AI and then agreed to be connected."
+            "they want a live agent to update address, phone, email, or insurance, "
+            "or when they declined to talk to an AI and then agreed to be connected."
         ),
         "transfer_destination": {
             "type": "predefined",
@@ -314,8 +360,8 @@ def _minor_transfer_tool() -> Dict[str, Any]:
     tool["description"] = (
         "Transfer to a live Bay Area Community Health team member only after the "
         "caller has agreed to be connected because the offered appointment date or "
-        "time does not work, when they say their insurance is different from "
-        "what is on file, or when they declined to talk to an AI and then agreed "
+        "time does not work, when they want a live agent to update address, phone, "
+        "email, or insurance, or when they declined to talk to an AI and then agreed "
         "to be connected. Do not transfer for a date or time change, or for an AI "
         "decline, until they have said yes to being connected."
     )
@@ -348,7 +394,7 @@ def _create_llm(
         "general_prompt": prompt,
         "begin_message": BEGIN_MESSAGE if begin_message is None else begin_message,
         "start_speaker": "agent",
-        "general_tools": tools if tools is not None else [_end_call_tool(), _transfer_tool()],
+        "general_tools": tools if tools is not None else _default_care_tools(),
     }
     payload = {k: v for k, v in payload.items() if v is not None}
     status_code, parsed, err = _retell_request(
@@ -374,7 +420,7 @@ def _update_llm(
         "general_prompt": prompt,
         "begin_message": BEGIN_MESSAGE if begin_message is None else begin_message,
         "start_speaker": "agent",
-        "general_tools": tools if tools is not None else [_end_call_tool(), _transfer_tool()],
+        "general_tools": tools if tools is not None else _default_care_tools(),
     }
     model = (getattr(settings, "RETELL_MODEL", "") or "").strip()
     if model:
@@ -481,6 +527,7 @@ def place_retell_care_call(
     patient_name: str = "",
     service_name: str = "",
     address_on_file: str = "",
+    email_on_file: str = "",
     insurance_name: str = "",
     agent_id: str = "",
     transfer_number: str = "",
@@ -530,6 +577,8 @@ def place_retell_care_call(
             "patient_name": patient,
             "service_name": service,
             "address_on_file": (address_on_file or "").strip(),
+            "phone_last4": _phone_last4(phone),
+            "email_on_file": (email_on_file or "").strip(),
             "insurance_name": (insurance_name or "").strip(),
             "provider_name": _PROVIDER_NAME,
             "transfer_number": transfer,
@@ -593,7 +642,7 @@ def _guardian_call_settings() -> Dict[str, Any]:
 
 def _ensure_guardian_agent() -> Tuple[str, str]:
     prompt = guardian_prompt()
-    tools = [_end_call_tool(), _minor_transfer_tool()]
+    tools = _default_guardian_tools()
     agent_id = ""
     agent: Dict[str, Any] = {}
     for item in _list_agents():
@@ -642,6 +691,7 @@ def place_retell_guardian_call(
     measure_name: str = "",
     service_name: str = "",
     address_on_file: str = "",
+    email_on_file: str = "",
     clinic_name: str = "",
     appointment_date: str = "",
     appointment_time: str = "",
@@ -688,6 +738,8 @@ def place_retell_guardian_call(
             "insurance_name": (insurance_name or "").strip(),
             "measure_name": measure,
             "address_on_file": (address_on_file or "").strip(),
+            "phone_last4": _phone_last4(phone),
+            "email_on_file": (email_on_file or "").strip(),
             "provider_name": (provider_name or "").strip() or _PROVIDER_NAME,
             "clinic_name": (clinic_name or "").strip(),
             "appointment_date": (appointment_date or "").strip(),
