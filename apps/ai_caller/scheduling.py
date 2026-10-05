@@ -40,6 +40,10 @@ def cancel_scheduled_for_patient(
         qs = qs.filter(kind__in=list(kinds))
     if exclude_source_call is not None:
         qs = qs.exclude(source_call=exclude_source_call)
+
+    queued_call_ids = list(
+        qs.exclude(queued_call_id__isnull=True).values_list("queued_call_id", flat=True)
+    )
     count = qs.count()
     if count:
         qs.update(
@@ -47,7 +51,30 @@ def cancel_scheduled_for_patient(
             error_message=(reason or "")[:512],
             updated_at=timezone.now(),
         )
+    # Drop unused queued dials that belonged to cancelled outreaches.
+    if queued_call_ids:
+        Call.objects.filter(
+            id__in=queued_call_ids,
+            status=Call.Status.QUEUED,
+        ).delete()
     return count
+
+
+def create_queued_call_for_patient(patient, *, user=None, actor=None) -> Call:
+    actor = actor or user or getattr(patient, "user", None)
+    to_number = f"{patient.country_code or ''}{patient.phone_number or ''}".strip()
+    return Call.objects.create(
+        user=user or getattr(patient, "user", None),
+        created_by=actor,
+        updated_by=actor,
+        patient=patient,
+        retell_call_id=None,
+        flow=Call.Flow.OUTBOUND,
+        status=Call.Status.QUEUED,
+        is_paused=False,
+        to_number=to_number,
+        started_at=None,
+    )
 
 
 def parse_callback_datetime(
@@ -188,10 +215,12 @@ def schedule_callback_request(
         reason="Replaced by new callback request",
     )
 
+    queued_call = create_queued_call_for_patient(patient, user=user, actor=user)
     row = ScheduledOutreach.objects.create(
         user=user,
         patient=patient,
         source_call=call,
+        queued_call=queued_call,
         kind=ScheduledOutreach.Kind.CALLBACK_REQUESTED,
         status=ScheduledOutreach.Status.SCHEDULED,
         scheduled_at=scheduled_at,
@@ -200,9 +229,10 @@ def schedule_callback_request(
     call.status = Call.Status.CALLBACK
     call.save(update_fields=["status", "updated_at"])
     dialer_logger.info(
-        "CALLBACK_SCHEDULED id=%s patient_id=%s scheduled_at=%s raw=%s",
+        "CALLBACK_SCHEDULED id=%s patient_id=%s queued_call_id=%s scheduled_at=%s raw=%s",
         row.id,
         patient.id,
+        queued_call.id,
         scheduled_at.isoformat(),
         (raw_time_text or "")[:120],
     )
@@ -265,19 +295,22 @@ def schedule_reminder_for_missed_call(call: Call) -> Optional[ScheduledOutreach]
         reason="Replaced by newer reminder",
     )
 
+    queued_call = create_queued_call_for_patient(patient, user=user, actor=user)
     row = ScheduledOutreach.objects.create(
         user=user,
         patient=patient,
         source_call=call,
+        queued_call=queued_call,
         kind=ScheduledOutreach.Kind.REMINDER,
         status=ScheduledOutreach.Status.SCHEDULED,
         scheduled_at=scheduled_at,
         raw_time_text=f"Auto reminder after {hours}h",
     )
     dialer_logger.info(
-        "REMINDER_SCHEDULED id=%s patient_id=%s scheduled_at=%s hours=%s",
+        "REMINDER_SCHEDULED id=%s patient_id=%s queued_call_id=%s scheduled_at=%s hours=%s",
         row.id,
         patient.id,
+        queued_call.id,
         scheduled_at.isoformat(),
         hours,
     )
@@ -285,7 +318,7 @@ def schedule_reminder_for_missed_call(call: Call) -> Optional[ScheduledOutreach]
 
 
 def due_scheduled_outreaches(settings_obj, *, limit: int):
-    """Open scheduled rows that are due now for this user."""
+    """Open scheduled rows that are due now for this user (skip paused queued calls)."""
     now = timezone.now()
     return list(
         ScheduledOutreach.objects.filter(
@@ -306,7 +339,9 @@ def due_scheduled_outreaches(settings_obj, *, limit: int):
                 status=Call.Status.IN_PROGRESS,
             ).values_list("patient_id", flat=True)
         )
-        .select_related("patient")
+        # Paused future dials stay scheduled but are not placed.
+        .exclude(queued_call__is_paused=True)
+        .select_related("patient", "queued_call")
         .order_by("scheduled_at", "id")[: max(1, int(limit))]
     )
 

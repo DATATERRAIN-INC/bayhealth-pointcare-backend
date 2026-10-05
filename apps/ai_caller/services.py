@@ -16,6 +16,7 @@ from apps.ai_caller.models import (
 )
 from apps.ai_caller.scheduling import (
     cancel_scheduled_for_patient,
+    create_queued_call_for_patient,
     due_scheduled_outreaches,
     mark_outreach_triggered,
     schedule_reminder_for_missed_call,
@@ -104,8 +105,12 @@ def get_call_queryset(
 
     if source and source != "all":
         queryset = queryset.filter(patient__source=source)
-    if status and status != "all" and status != "queued":
+    if status and status != "all":
         queryset = queryset.filter(status=status)
+    else:
+        # Default list excludes queued (use ?status=queued for the dial queue).
+        if not status:
+            queryset = queryset.exclude(status=Call.Status.QUEUED)
     if patient_id:
         queryset = queryset.filter(patient_id=patient_id)
     if retell_call_id:
@@ -113,101 +118,18 @@ def get_call_queryset(
     return queryset
 
 
-def get_queued_patients_queryset(*, user=None, search="", source=""):
+def ensure_first_queued_call(patient, *, actor=None):
     """
-    Patients still waiting for an outbound call:
-    - first-time / eligible auto-dial patients
-    - patients with an open ScheduledOutreach (callback/reminder)
-    Excludes blocked, completed, in-progress, and attempt-exhausted patients.
+    Ensure a first-time queued Call exists for a newly added patient.
+    Skips if patient already has any call history.
     """
-    if user is None:
-        return Patient.objects.none()
-
-    settings_obj = CallerSettings.load(user)
-    trigger_cap = max(1, int(settings_obj.call_trigger_count or 1))
-
-    completed_ids = Call.objects.filter(
-        user=user, status=Call.Status.COMPLETED
-    ).values_list("patient_id", flat=True)
-    in_progress_ids = Call.objects.filter(
-        user=user, status=Call.Status.IN_PROGRESS
-    ).values_list("patient_id", flat=True)
-
-    from django.db.models import Count
-
-    exhausted_ids = (
-        Call.objects.filter(user=user, status=Call.Status.NOT_ATTENDED)
-        .values("patient_id")
-        .annotate(attempts=Count("id"))
-        .filter(attempts__gte=trigger_cap)
-        .values_list("patient_id", flat=True)
+    if not patient or patient.is_blocked:
+        return None
+    if Call.objects.filter(patient=patient).exists():
+        return None
+    return create_queued_call_for_patient(
+        patient, user=getattr(patient, "user", None), actor=actor
     )
-
-    scheduled_ids = ScheduledOutreach.objects.filter(
-        user=user,
-        status=ScheduledOutreach.Status.SCHEDULED,
-    ).values_list("patient_id", flat=True)
-
-    # First-time style queue (same exclusions as dialer, no day/limit cut).
-    ever_not_attended_ids = Call.objects.filter(
-        user=user, status=Call.Status.NOT_ATTENDED
-    ).values_list("patient_id", flat=True)
-
-    first_time_ids = (
-        Patient.objects.filter(user=user, is_blocked=False)
-        .exclude(id__in=completed_ids)
-        .exclude(id__in=in_progress_ids)
-        .exclude(id__in=exhausted_ids)
-        .exclude(id__in=scheduled_ids)
-        .exclude(id__in=ever_not_attended_ids)
-        .values_list("id", flat=True)
-    )
-
-    queued_ids = set(first_time_ids) | set(scheduled_ids)
-    queryset = Patient.objects.filter(
-        user=user, is_blocked=False, id__in=queued_ids
-    ).exclude(id__in=completed_ids).exclude(id__in=in_progress_ids)
-
-    search = (search or "").strip()
-    source = (source or "").strip().lower()
-    if search:
-        queryset = queryset.annotate(
-            _full_name=Concat("first_name", Value(" "), "last_name")
-        ).filter(
-            Q(first_name__icontains=search)
-            | Q(last_name__icontains=search)
-            | Q(_full_name__icontains=search)
-            | Q(doctor__icontains=search)
-            | Q(phone_number__icontains=search)
-        )
-    if source and source != "all":
-        queryset = queryset.filter(source=source)
-    return queryset.order_by("id")
-
-
-def serialize_queued_patient_as_call(patient):
-    """Shape a waiting patient like a Call list row with status=queued."""
-    to_number = f"{patient.country_code or ''}{patient.phone_number or ''}".strip()
-    return {
-        "id": None,
-        "patient": patient.id,
-        "patient_name": patient.full_name,
-        "retell_call_id": "",
-        "flow": "",
-        "status": "queued",
-        "from_number": "",
-        "to_number": to_number,
-        "agent_id": "",
-        "transfer_number": "",
-        "decline_reason": "",
-        "started_at": None,
-        "ended_at": None,
-        "duration_seconds": None,
-        "has_transcript": False,
-        "message_count": 0,
-        "created_at": patient.created_at,
-        "updated_at": patient.updated_at,
-    }
 
 
 def _split_full_name(value):
@@ -259,6 +181,7 @@ def create_patient_from_row(row, *, source, upload=None, upload_file_key="", use
         created_by=user,
         updated_by=user,
     )
+    ensure_first_queued_call(patient, actor=user)
     return PatientSerializer(patient).data, None
 
 
@@ -524,23 +447,103 @@ def _parse_retell_time(value):
     return None
 
 
-def _save_call(patient, result, *, dial_number, transfer_number, session_id="", actor=None):
-    actor = actor or patient.user
-    return Call.objects.create(
-        user=patient.user,
-        created_by=actor,
-        updated_by=actor,
-        patient=patient,
-        retell_call_id=result["call_id"],
-        flow=result.get("flow") or Call.Flow.OUTBOUND,
+def _claim_queued_call(call, *, actor=None):
+    """
+    Atomically move queued → in_progress BEFORE Retell dial.
+    Prevents Beat from redialing the same queued row while place is in flight.
+    Returns True if this worker claimed it.
+    """
+    if call is None:
+        return False
+    updated = Call.objects.filter(
+        pk=call.pk,
+        status=Call.Status.QUEUED,
+        is_paused=False,
+    ).update(
         status=Call.Status.IN_PROGRESS,
-        from_number=result.get("from_number") or "",
-        to_number=dial_number,
-        agent_id=result.get("agent_id") or "",
-        transfer_number=transfer_number,
-        warm_transfer_session_id=(session_id or "")[:64],
+        is_paused=False,
+        updated_by=actor,
+        updated_at=timezone.now(),
         started_at=timezone.now(),
     )
+    if updated:
+        call.refresh_from_db()
+        return True
+    return False
+
+
+def _release_claimed_call(call):
+    """Return a claimed call to queued if Retell place failed."""
+    if call is None:
+        return
+    Call.objects.filter(pk=call.pk, status=Call.Status.IN_PROGRESS).filter(
+        Q(retell_call_id__isnull=True) | Q(retell_call_id="")
+    ).update(
+        status=Call.Status.QUEUED,
+        started_at=None,
+        updated_at=timezone.now(),
+    )
+    call.refresh_from_db()
+
+
+def _cleanup_orphan_queued_calls(patient, *, keep_call_id=None):
+    """
+    Remove leftover first-time queued rows after a dial was placed.
+    Prevents Beat from redialing the same patient via an old queued Call.
+    Keeps queued rows that belong to open ScheduledOutreach.
+    """
+    if patient is None:
+        return 0
+    outreach_queued_ids = ScheduledOutreach.objects.filter(
+        patient=patient,
+        status=ScheduledOutreach.Status.SCHEDULED,
+        queued_call_id__isnull=False,
+    ).values_list("queued_call_id", flat=True)
+    qs = Call.objects.filter(patient=patient, status=Call.Status.QUEUED).exclude(
+        id__in=outreach_queued_ids
+    )
+    if keep_call_id is not None:
+        qs = qs.exclude(pk=keep_call_id)
+    deleted, _ = qs.delete()
+    return deleted
+
+
+def _save_call(
+    patient,
+    result,
+    *,
+    dial_number,
+    transfer_number,
+    session_id="",
+    actor=None,
+    existing_call=None,
+):
+    actor = actor or patient.user
+    fields = {
+        "user": patient.user,
+        "updated_by": actor,
+        "patient": patient,
+        "retell_call_id": result["call_id"],
+        "flow": result.get("flow") or Call.Flow.OUTBOUND,
+        "status": Call.Status.IN_PROGRESS,
+        "is_paused": False,
+        "from_number": result.get("from_number") or "",
+        "to_number": dial_number,
+        "agent_id": result.get("agent_id") or "",
+        "transfer_number": transfer_number,
+        "warm_transfer_session_id": (session_id or "")[:64],
+        "started_at": timezone.now(),
+        "ended_at": None,
+    }
+    if existing_call is not None:
+        for key, value in fields.items():
+            setattr(existing_call, key, value)
+        if not existing_call.created_by_id and actor:
+            existing_call.created_by = actor
+        existing_call.save()
+        return existing_call
+
+    return Call.objects.create(created_by=actor, **fields)
 
 
 def _warm_transfer_enabled():
@@ -568,7 +571,7 @@ def _prepare_warm_transfer_bridge(*, patient, dial_number, live_agent_numbers):
     )
 
 
-def place_outbound_call_for_patient(patient_id, *, user=None):
+def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
     queryset = Patient.objects.all()
     if user is not None:
         queryset = queryset.filter(user=user)
@@ -587,6 +590,45 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
             "status_code": 400,
         }
 
+    existing_call = None
+    if call_id is not None:
+        existing_call = Call.objects.filter(pk=call_id, patient=patient).first()
+        if not existing_call:
+            return {
+                "ok": False,
+                "error": "Queued call not found.",
+                "status_code": 404,
+            }
+        if existing_call.status != Call.Status.QUEUED:
+            return {
+                "ok": False,
+                "error": "Only queued calls can be dialed from the queue.",
+                "status_code": 400,
+            }
+        if existing_call.is_paused:
+            return {
+                "ok": False,
+                "error": "Call is paused.",
+                "status_code": 400,
+            }
+    else:
+        # Prefer an existing unpaused first-time queued row for this patient.
+        outreach_queued_ids = ScheduledOutreach.objects.filter(
+            patient=patient,
+            status=ScheduledOutreach.Status.SCHEDULED,
+            queued_call_id__isnull=False,
+        ).values_list("queued_call_id", flat=True)
+        existing_call = (
+            Call.objects.filter(
+                patient=patient,
+                status=Call.Status.QUEUED,
+                is_paused=False,
+            )
+            .exclude(id__in=outreach_queued_ids)
+            .order_by("id")
+            .first()
+        )
+
     if Call.objects.filter(patient=patient, status=Call.Status.COMPLETED).exists():
         return {
             "ok": False,
@@ -594,7 +636,13 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
             "status_code": 400,
         }
 
-    if Call.objects.filter(patient=patient, status=Call.Status.IN_PROGRESS).exists():
+    # Allow the claimed/queued row itself; block any other in-progress call.
+    in_progress_qs = Call.objects.filter(
+        patient=patient, status=Call.Status.IN_PROGRESS
+    )
+    if existing_call is not None:
+        in_progress_qs = in_progress_qs.exclude(pk=existing_call.pk)
+    if in_progress_qs.exists():
         return {
             "ok": False,
             "error": "Patient already has a call in progress.",
@@ -635,59 +683,88 @@ def place_outbound_call_for_patient(patient_id, *, user=None):
         }
     live_agent_number = live_agent_numbers[0]
 
+    actor = user or patient.user
+
+    # Claim queued row first so the next Beat tick cannot dial it again.
+    if existing_call is not None:
+        if not _claim_queued_call(existing_call, actor=actor):
+            return {
+                "ok": False,
+                "error": "Call is already claimed, paused, or no longer queued.",
+                "status_code": 409,
+            }
+    else:
+        # Manual dial without a queued row: create a claimed in-progress placeholder
+        # only after Retell succeeds (legacy path).
+        pass
+
     retell_transfer_number = live_agent_number
     session_id = ""
     bridge = None
-    if _warm_transfer_enabled():
-        bridge = _prepare_warm_transfer_bridge(
-            patient=patient,
+    try:
+        if _warm_transfer_enabled():
+            bridge = _prepare_warm_transfer_bridge(
+                patient=patient,
+                dial_number=dial_number,
+                live_agent_numbers=live_agent_numbers,
+            )
+            if not bridge.get("ok"):
+                _release_claimed_call(existing_call)
+                return bridge
+            retell_transfer_number = bridge["bridge_number"]
+            session_id = bridge.get("session_id") or ""
+
+        service = (getattr(patient, "service_name", None) or "").strip() or "care"
+
+        if _is_minor(patient.dob):
+            result = place_retell_guardian_call(
+                phone_number=dial_number,
+                patient_name=patient.full_name,
+                address_on_file=patient.address,
+                provider_name=patient.doctor,
+                service_name=service,
+                measure_name=service,
+                transfer_number=retell_transfer_number,
+            )
+            result["flow"] = result.get("flow") or Call.Flow.GUARDIAN
+        else:
+            result = place_retell_care_call(
+                phone_number=dial_number,
+                name=patient.doctor,
+                patient_name=patient.full_name,
+                address_on_file=patient.address,
+                service_name=service,
+                transfer_number=retell_transfer_number,
+            )
+            result["flow"] = result.get("flow") or Call.Flow.OUTBOUND
+
+        if not result.get("ok"):
+            if bridge and bridge.get("session"):
+                from apps.ai_caller.twilio_bridge import restore_inbound_voice_url
+
+                restore_inbound_voice_url(bridge.get("session") or {})
+            _release_claimed_call(existing_call)
+            return result
+
+        call = _save_call(
+            patient,
+            result,
             dial_number=dial_number,
-            live_agent_numbers=live_agent_numbers,
+            transfer_number=live_agent_number,
+            session_id=session_id,
+            actor=actor,
+            existing_call=existing_call,
         )
-        if not bridge.get("ok"):
-            return bridge
-        retell_transfer_number = bridge["bridge_number"]
-        session_id = bridge.get("session_id") or ""
-
-    service = (getattr(patient, "service_name", None) or "").strip() or "care"
-
-    if _is_minor(patient.dob):
-        result = place_retell_guardian_call(
-            phone_number=dial_number,
-            patient_name=patient.full_name,
-            address_on_file=patient.address,
-            provider_name=patient.doctor,
-            service_name=service,
-            measure_name=service,
-            transfer_number=retell_transfer_number,
-        )
-        result["flow"] = result.get("flow") or Call.Flow.GUARDIAN
-    else:
-        result = place_retell_care_call(
-            phone_number=dial_number,
-            name=patient.doctor,
-            patient_name=patient.full_name,
-            address_on_file=patient.address,
-            service_name=service,
-            transfer_number=retell_transfer_number,
-        )
-        result["flow"] = result.get("flow") or Call.Flow.OUTBOUND
-
-    if not result.get("ok"):
+        # Drop any other leftover first-time queued rows for this patient.
+        _cleanup_orphan_queued_calls(patient, keep_call_id=call.id)
+    except Exception:
+        _release_claimed_call(existing_call)
         if bridge and bridge.get("session"):
             from apps.ai_caller.twilio_bridge import restore_inbound_voice_url
 
             restore_inbound_voice_url(bridge.get("session") or {})
-        return result
+        raise
 
-    call = _save_call(
-        patient,
-        result,
-        dial_number=dial_number,
-        transfer_number=live_agent_number,
-        session_id=session_id,
-        actor=user or patient.user,
-    )
     result["db_call_id"] = call.id
     result["warm_transfer"] = bool(session_id)
 
@@ -1024,16 +1101,12 @@ def _local_day_bounds(settings_obj):
     return start_local, end_local
 
 
-def patients_due_for_outbound(settings_obj=None, limit=None):
+def queued_calls_due_for_outbound(settings_obj=None, limit=None):
     """
-    Eligible patients for first-time / non-queue auto dial:
-    - not blocked
-    - no completed call (never redial)
-    - no in-progress call (leave alone)
-    - not_attended attempts under call_trigger_count
-    - no in-progress/completed attempt today
-    - no open ScheduledOutreach (callbacks/reminders are drained separately)
-    Retries after not_attended go through the ScheduledOutreach reminder queue.
+    First-time queued Call rows ready for auto dial:
+    - status=queued, not paused
+    - not linked to an open ScheduledOutreach (those use due_scheduled_outreaches)
+    - patient not blocked / completed / in-progress / exhausted / not_attended history
     """
     settings_obj = settings_obj or None
     if settings_obj is None:
@@ -1052,7 +1125,6 @@ def patients_due_for_outbound(settings_obj=None, limit=None):
         user=user,
     ).values_list("patient_id", flat=True)
 
-    # Block same-day only for in_progress / completed — not_attended may retry via queue.
     active_today_ids = (
         Call.objects.filter(
             user=user,
@@ -1072,30 +1144,47 @@ def patients_due_for_outbound(settings_obj=None, limit=None):
         .values_list("patient_id", flat=True)
     )
 
-    queued_ids = ScheduledOutreach.objects.filter(
+    outreach_queued_ids = ScheduledOutreach.objects.filter(
+        user=user,
+        status=ScheduledOutreach.Status.SCHEDULED,
+        queued_call_id__isnull=False,
+    ).values_list("queued_call_id", flat=True)
+
+    scheduled_patient_ids = ScheduledOutreach.objects.filter(
         user=user,
         status=ScheduledOutreach.Status.SCHEDULED,
     ).values_list("patient_id", flat=True)
 
-    # Patients who already have a not-attended attempt wait for the reminder queue.
     ever_not_attended_ids = Call.objects.filter(
         user=user, status=Call.Status.NOT_ATTENDED
     ).values_list("patient_id", flat=True)
 
     queryset = (
-        Patient.objects.filter(user=user, is_blocked=False)
-        .exclude(id__in=completed_ids)
-        .exclude(id__in=in_progress_ids)
-        .exclude(id__in=active_today_ids)
-        .exclude(id__in=exhausted_ids)
-        .exclude(id__in=queued_ids)
-        .exclude(id__in=ever_not_attended_ids)
+        Call.objects.filter(
+            user=user,
+            status=Call.Status.QUEUED,
+            is_paused=False,
+            patient__is_blocked=False,
+        )
+        .exclude(id__in=outreach_queued_ids)
+        .exclude(patient_id__in=completed_ids)
+        .exclude(patient_id__in=in_progress_ids)
+        .exclude(patient_id__in=active_today_ids)
+        .exclude(patient_id__in=exhausted_ids)
+        .exclude(patient_id__in=scheduled_patient_ids)
+        .exclude(patient_id__in=ever_not_attended_ids)
+        .select_related("patient")
         .order_by("id")
     )
     limit = limit if limit is not None else settings_obj.max_calls_per_run
     if limit:
         queryset = queryset[: max(1, int(limit))]
     return list(queryset)
+
+
+def patients_due_for_outbound(settings_obj=None, limit=None):
+    """Backward-compatible wrapper: patients for first-time dials from queued Calls."""
+    return [c.patient for c in queued_calls_due_for_outbound(settings_obj, limit=limit)]
 
 
 def _run_scheduled_outbound_for_settings(settings_obj):
@@ -1140,9 +1229,11 @@ def _run_scheduled_outbound_for_settings(settings_obj):
     max_per_run = max(1, int(settings_obj.max_calls_per_run or 1))
     due_queue = due_scheduled_outreaches(settings_obj, limit=max_per_run)
     remaining = max(0, max_per_run - len(due_queue))
-    patients = patients_due_for_outbound(settings_obj, limit=remaining) if remaining else []
+    queued_calls = (
+        queued_calls_due_for_outbound(settings_obj, limit=remaining) if remaining else []
+    )
 
-    if not due_queue and not patients:
+    if not due_queue and not queued_calls:
         total = Patient.objects.filter(user=settings_obj.user).count()
         blocked = Patient.objects.filter(
             user=settings_obj.user, is_blocked=True
@@ -1172,7 +1263,11 @@ def _run_scheduled_outbound_for_settings(settings_obj):
     results = []
 
     for row in due_queue:
-        result = place_outbound_call_for_patient(row.patient_id, user=settings_obj.user)
+        result = place_outbound_call_for_patient(
+            row.patient_id,
+            user=settings_obj.user,
+            call_id=row.queued_call_id,
+        )
         entry = {
             "patient_id": row.patient_id,
             "scheduled_outreach_id": row.id,
@@ -1218,10 +1313,14 @@ def _run_scheduled_outbound_for_settings(settings_obj):
                 entry["error"],
             )
 
-    for patient in patients:
-        result = place_outbound_call_for_patient(patient.id, user=settings_obj.user)
+    for queued_call in queued_calls:
+        result = place_outbound_call_for_patient(
+            queued_call.patient_id,
+            user=settings_obj.user,
+            call_id=queued_call.id,
+        )
         entry = {
-            "patient_id": patient.id,
+            "patient_id": queued_call.patient_id,
             "ok": bool(result.get("ok")),
             "error": result.get("error") or "",
             "call_id": result.get("call_id") or "",
@@ -1233,7 +1332,7 @@ def _run_scheduled_outbound_for_settings(settings_obj):
                 "TRIGGERED user_id=%s email=%s patient_id=%s call_id=%s",
                 user_id,
                 email,
-                patient.id,
+                queued_call.patient_id,
                 entry["call_id"],
             )
         else:
@@ -1242,7 +1341,7 @@ def _run_scheduled_outbound_for_settings(settings_obj):
                 "NOT_TRIGGERED user_id=%s email=%s patient_id=%s reason=place_failed error=%s",
                 user_id,
                 email,
-                patient.id,
+                queued_call.patient_id,
                 entry["error"],
             )
 
@@ -1251,11 +1350,11 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         "skipped": False,
         "placed": placed,
         "failed": failed,
-        "attempted": len(due_queue) + len(patients),
+        "attempted": len(due_queue) + len(queued_calls),
         "results": results,
         "user_id": user_id,
     }
-    if due_queue or patients:
+    if due_queue or queued_calls:
         from apps.notifications.services import notify_outbound_batch
 
         notify_outbound_batch(payload, user=settings_obj.user)
