@@ -41,6 +41,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "phone_number",
             "is_blocked",
             "source",
+            "upload",
             "upload_file_key",
             "call_status",
             "created_at",
@@ -50,6 +51,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "id",
             "full_name",
             "source",
+            "upload",
             "upload_file_key",
             "call_status",
             "created_at",
@@ -89,9 +91,30 @@ class PatientSerializer(serializers.ModelSerializer):
         return data
 
     def validate_dob(self, value):
+        from common.excel import parse_patient_dob
+
+        # DRF DateField may already give a date; still re-check bounds.
+        if isinstance(value, str):
+            parsed = parse_patient_dob(value)
+            if not parsed:
+                raise serializers.ValidationError(
+                    "Enter a valid date of birth (e.g. YYYY-MM-DD, MM/DD/YYYY)."
+                )
+            value = parsed
         if value and value > date.today():
             raise serializers.ValidationError("Date of birth can't be in the future.")
+        if value and value.year < 1900:
+            raise serializers.ValidationError("Date of birth year must be 1900 or later.")
         return value
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and "dob" in data and data.get("dob") not in (None, ""):
+            from common.excel import parse_patient_dob
+
+            parsed = parse_patient_dob(data.get("dob"))
+            if parsed:
+                data = {**data, "dob": parsed.isoformat()}
+        return super().to_internal_value(data)
 
     def validate_country_code(self, value):
         return _normalize_country_code(value)

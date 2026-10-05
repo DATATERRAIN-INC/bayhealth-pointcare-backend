@@ -49,6 +49,7 @@ class PatientViewSet(viewsets.ModelViewSet):
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
             is_blocked=is_blocked,
+            upload_id=self.request.query_params.get("upload_id", ""),
         )
 
     def create(self, request, *args, **kwargs):
@@ -102,27 +103,9 @@ class PatientViewSet(viewsets.ModelViewSet):
             return error_response(str(detail))
 
         uploaded = int((result or {}).get("uploaded") or 0)
-        failed = int((result or {}).get("failed") or 0)
-        skipped = (result or {}).get("skipped") or []
-        payload = {
-            "message": (
-                "Patients uploaded successfully."
-                if uploaded and not failed
-                else (
-                    "Upload finished with some row errors."
-                    if uploaded
-                    else "Upload finished but no patients were inserted."
-                )
-            ),
-            "upload_id": (result or {}).get("upload_id"),
-            "uploaded": uploaded,
-            "failed": failed,
-            "skipped": skipped,
-        }
-        # File accepted but every row failed validation (common on server).
         if uploaded == 0:
-            return Response(payload, status=400)
-        return Response(payload, status=201)
+            return error_response("Upload finished but no patients were inserted.")
+        return message_response("Patients uploaded successfully.", 201)
 
     @action(detail=False, methods=["get"], url_path="template")
     def template(self, request):
