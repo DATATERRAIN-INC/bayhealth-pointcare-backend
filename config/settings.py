@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "apps.ai_caller.apps.AiCallerConfig",
+    "apps.ai_sms.apps.AiSmsConfig",
     "apps.users.apps.UsersConfig",
     "apps.notifications.apps.NotificationsConfig",
 ]
@@ -156,6 +157,10 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "") or os.getenv(
     "TOLLFREE_TWILIO_PHONE_NUMBER", ""
 )
+TWILIO_CARECALL_FROM_NUMBER = os.getenv(
+    "TWILIO_CARECALL_FROM_NUMBER", ""
+) or TWILIO_PHONE_NUMBER
+TWILIO_MINOR_SMS_FROM_NUMBER = os.getenv("TWILIO_MINOR_SMS_FROM_NUMBER", "")
 TWILIO_VOICE = os.getenv("TWILIO_VOICE", "Joanna")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 CALL_TRANSCRIPTION_MODEL = os.getenv("CALL_TRANSCRIPTION_MODEL", "")
