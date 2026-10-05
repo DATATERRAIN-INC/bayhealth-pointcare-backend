@@ -35,12 +35,13 @@ from common.s3 import upload_bytes
 dialer_logger = logging.getLogger("ai_caller.dialer")
 
 
-def get_patient_queryset(*, user=None, search="", source="", is_blocked=None):
+def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, upload_id=""):
     queryset = Patient.objects.all()
     if user is not None:
         queryset = queryset.filter(user=user)
     search = (search or "").strip()
     source = (source or "").strip().lower()
+    upload_id = str(upload_id or "").strip()
 
     if search:
         queryset = queryset.annotate(
@@ -56,6 +57,8 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None):
         queryset = queryset.filter(source=source)
     if is_blocked is not None:
         queryset = queryset.filter(is_blocked=is_blocked)
+    if upload_id.isdigit():
+        queryset = queryset.filter(upload_id=int(upload_id))
 
     latest_status = (
         Call.objects.filter(patient_id=OuterRef("pk"))
@@ -141,32 +144,48 @@ def _split_full_name(value):
 
 
 def _normalize_upload_dob(value):
-    """Excel may send '2000-10-30 00:00:00'; DateField wants YYYY-MM-DD."""
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if " " in text:
-        text = text.split(" ", 1)[0]
-    if "T" in text:
-        text = text.split("T", 1)[0]
-    return text
+    """Normalize any common DOB format to YYYY-MM-DD for DateField storage."""
+    from common.excel import parse_patient_dob
+
+    parsed = parse_patient_dob(value)
+    return parsed.isoformat() if parsed else str(value or "").strip()
 
 
 def create_patient_from_row(row, *, source, upload=None, upload_file_key="", user=None):
+    from common.excel import parse_patient_dob
+
     first_name = (row.get("first_name") or "").strip()
     last_name = (row.get("last_name") or "").strip()
     if not first_name and not last_name:
         first_name, last_name = _split_full_name(row.get("name", ""))
 
+    country_code = (row.get("country_code") or "").strip()
+    if not country_code:
+        country_code = (getattr(settings, "DEFAULT_COUNTRY_CODE", None) or "+1").strip()
+
+    address = (row.get("address") or "").strip()
+    if not address:
+        # Upload files may omit a dedicated address column.
+        address = "Address not provided"
+
+    dob_value = row.get("dob", "")
+    parsed_dob = parse_patient_dob(dob_value)
+    if dob_value not in (None, "") and not parsed_dob:
+        return None, {
+            "dob": [
+                "Enter a valid date of birth (e.g. YYYY-MM-DD, MM/DD/YYYY, DD-MMM-YYYY)."
+            ]
+        }
+
     serializer = PatientSerializer(
         data={
             "first_name": first_name,
             "last_name": last_name,
-            "address": row.get("address", ""),
-            "dob": _normalize_upload_dob(row.get("dob", "")),
+            "address": address,
+            "dob": parsed_dob.isoformat() if parsed_dob else "",
             "doctor": row.get("doctor", ""),
             "service_name": row.get("service_name") or row.get("service") or "",
-            "country_code": row.get("country_code") or "",
+            "country_code": country_code,
             "phone_number": row.get("phone_number", ""),
         }
     )
