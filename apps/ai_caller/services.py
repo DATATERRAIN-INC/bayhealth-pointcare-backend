@@ -2,7 +2,7 @@ from datetime import date, datetime, time, timedelta
 import logging
 
 from django.conf import settings
-from django.db.models import CharField, Q, Value
+from django.db.models import CharField, Exists, OuterRef, Q, Subquery, Value
 from django.db.models.functions import Cast, Concat
 from django.utils import timezone
 
@@ -58,7 +58,19 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
         queryset = queryset.filter(is_blocked=is_blocked)
     if upload_id.isdigit():
         queryset = queryset.filter(upload_id=int(upload_id))
-    return queryset
+
+    latest_status = (
+        Call.objects.filter(patient_id=OuterRef("pk"))
+        .order_by("-started_at", "-id")
+        .values("status")[:1]
+    )
+    has_in_progress = Call.objects.filter(
+        patient_id=OuterRef("pk"), status=Call.Status.IN_PROGRESS
+    )
+    return queryset.annotate(
+        _latest_call_status=Subquery(latest_status),
+        _has_in_progress=Exists(has_in_progress),
+    )
 
 
 def get_call_queryset(
@@ -95,13 +107,110 @@ def get_call_queryset(
 
     if source and source != "all":
         queryset = queryset.filter(patient__source=source)
-    if status and status != "all":
+    if status and status != "all" and status != "queued":
         queryset = queryset.filter(status=status)
     if patient_id:
         queryset = queryset.filter(patient_id=patient_id)
     if retell_call_id:
         queryset = queryset.filter(retell_call_id=retell_call_id)
     return queryset
+
+
+def get_queued_patients_queryset(*, user=None, search="", source=""):
+    """
+    Patients still waiting for an outbound call:
+    - first-time / eligible auto-dial patients
+    - patients with an open ScheduledOutreach (callback/reminder)
+    Excludes blocked, completed, in-progress, and attempt-exhausted patients.
+    """
+    if user is None:
+        return Patient.objects.none()
+
+    settings_obj = CallerSettings.load(user)
+    trigger_cap = max(1, int(settings_obj.call_trigger_count or 1))
+
+    completed_ids = Call.objects.filter(
+        user=user, status=Call.Status.COMPLETED
+    ).values_list("patient_id", flat=True)
+    in_progress_ids = Call.objects.filter(
+        user=user, status=Call.Status.IN_PROGRESS
+    ).values_list("patient_id", flat=True)
+
+    from django.db.models import Count
+
+    exhausted_ids = (
+        Call.objects.filter(user=user, status=Call.Status.NOT_ATTENDED)
+        .values("patient_id")
+        .annotate(attempts=Count("id"))
+        .filter(attempts__gte=trigger_cap)
+        .values_list("patient_id", flat=True)
+    )
+
+    scheduled_ids = ScheduledOutreach.objects.filter(
+        user=user,
+        status=ScheduledOutreach.Status.SCHEDULED,
+    ).values_list("patient_id", flat=True)
+
+    # First-time style queue (same exclusions as dialer, no day/limit cut).
+    ever_not_attended_ids = Call.objects.filter(
+        user=user, status=Call.Status.NOT_ATTENDED
+    ).values_list("patient_id", flat=True)
+
+    first_time_ids = (
+        Patient.objects.filter(user=user, is_blocked=False)
+        .exclude(id__in=completed_ids)
+        .exclude(id__in=in_progress_ids)
+        .exclude(id__in=exhausted_ids)
+        .exclude(id__in=scheduled_ids)
+        .exclude(id__in=ever_not_attended_ids)
+        .values_list("id", flat=True)
+    )
+
+    queued_ids = set(first_time_ids) | set(scheduled_ids)
+    queryset = Patient.objects.filter(
+        user=user, is_blocked=False, id__in=queued_ids
+    ).exclude(id__in=completed_ids).exclude(id__in=in_progress_ids)
+
+    search = (search or "").strip()
+    source = (source or "").strip().lower()
+    if search:
+        queryset = queryset.annotate(
+            _full_name=Concat("first_name", Value(" "), "last_name")
+        ).filter(
+            Q(first_name__icontains=search)
+            | Q(last_name__icontains=search)
+            | Q(_full_name__icontains=search)
+            | Q(doctor__icontains=search)
+            | Q(phone_number__icontains=search)
+        )
+    if source and source != "all":
+        queryset = queryset.filter(source=source)
+    return queryset.order_by("id")
+
+
+def serialize_queued_patient_as_call(patient):
+    """Shape a waiting patient like a Call list row with status=queued."""
+    to_number = f"{patient.country_code or ''}{patient.phone_number or ''}".strip()
+    return {
+        "id": None,
+        "patient": patient.id,
+        "patient_name": patient.full_name,
+        "retell_call_id": "",
+        "flow": "",
+        "status": "queued",
+        "from_number": "",
+        "to_number": to_number,
+        "agent_id": "",
+        "transfer_number": "",
+        "decline_reason": "",
+        "started_at": None,
+        "ended_at": None,
+        "duration_seconds": None,
+        "has_transcript": False,
+        "message_count": 0,
+        "created_at": patient.created_at,
+        "updated_at": patient.updated_at,
+    }
 
 
 def _split_full_name(value):
@@ -723,13 +832,18 @@ def update_call_from_retell_payload(payload):
     if not raw_status and event.lower() in {"call_ended", "call_analyzed"}:
         raw_status = "ended"
 
-    call.status = _map_retell_status(
+    mapped_status = _map_retell_status(
         raw_status,
         disconnection_reason=str(
             data.get("disconnection_reason") or data.get("disconnect_reason") or ""
         ),
         event=event,
     )
+    # Keep callback if patient already asked to be called later on this call.
+    if previous_status == Call.Status.CALLBACK:
+        call.status = Call.Status.CALLBACK
+    else:
+        call.status = mapped_status
 
     started_at = _parse_retell_time(
         data.get("start_timestamp") or data.get("started_at") or data.get("start_time")

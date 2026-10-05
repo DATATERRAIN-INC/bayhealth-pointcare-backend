@@ -21,8 +21,10 @@ from apps.ai_caller.services import (
     get_call_queryset,
     get_caller_settings,
     get_patient_queryset,
+    get_queued_patients_queryset,
     place_outbound_call_for_patient,
     save_call_decline_reason,
+    serialize_queued_patient_as_call,
     sync_call_transcript,
     sync_in_progress_calls_from_retell,
     update_call_from_retell_payload,
@@ -138,18 +140,33 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
             if not call:
                 return error_response("Call not found.", 404)
             return Response({"transcript": call.transcript or []})
+
+        status = (request.query_params.get("status") or "").strip().lower()
+        if status == "queued":
+            queryset = get_queued_patients_queryset(
+                user=request.user,
+                search=request.query_params.get("search", ""),
+                source=request.query_params.get("source", ""),
+            )
+            page = self.paginate_queryset(queryset)
+            data = [serialize_queued_patient_as_call(p) for p in page]
+            return self.get_paginated_response(data)
+
         return super().list(request, *args, **kwargs)
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
         sync_in_progress_calls_from_retell(user=request.user, limit=25)
         queryset = Call.objects.filter(user=request.user)
+        queued = get_queued_patients_queryset(user=request.user).count()
         return Response(
             {
                 "all": queryset.count(),
                 "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
+                "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
+                "queued": queued,
             }
         )
 
