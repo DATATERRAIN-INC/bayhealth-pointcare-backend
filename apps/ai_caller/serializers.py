@@ -61,7 +61,7 @@ class PatientSerializer(serializers.ModelSerializer):
     def get_call_status(self, obj):
         """
         Current dial status for this patient:
-        in_progress > latest call status > queued (waiting) > null if blocked with no calls.
+        in_progress > latest call status > queued if open queued call > null if blocked.
         """
         if getattr(obj, "_has_in_progress", None):
             return Call.Status.IN_PROGRESS
@@ -69,10 +69,8 @@ class PatientSerializer(serializers.ModelSerializer):
         if annotated:
             return annotated
         if getattr(obj, "_has_in_progress", None) is False and annotated is None:
-            # Annotated queryset: no calls yet.
-            return None if obj.is_blocked else "queued"
+            return None if obj.is_blocked else Call.Status.QUEUED
 
-        # Fallback when instance was not annotated (create/upload paths).
         if Call.objects.filter(patient=obj, status=Call.Status.IN_PROGRESS).exists():
             return Call.Status.IN_PROGRESS
         latest = (
@@ -83,7 +81,9 @@ class PatientSerializer(serializers.ModelSerializer):
         )
         if latest:
             return latest
-        return None if obj.is_blocked else "queued"
+        if Call.objects.filter(patient=obj, status=Call.Status.QUEUED).exists():
+            return Call.Status.QUEUED
+        return None if obj.is_blocked else Call.Status.QUEUED
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -143,6 +143,8 @@ class PlaceOutboundCallSerializer(serializers.Serializer):
 
 class CallSerializer(serializers.ModelSerializer):
     patient_name = serializers.CharField(source="patient.full_name", read_only=True)
+    # Same value set on patient create as service_name (why we are calling).
+    reason = serializers.CharField(source="patient.service_name", read_only=True)
     duration_seconds = serializers.IntegerField(read_only=True)
     has_transcript = serializers.BooleanField(read_only=True)
     message_count = serializers.SerializerMethodField()
@@ -153,9 +155,11 @@ class CallSerializer(serializers.ModelSerializer):
             "id",
             "patient",
             "patient_name",
+            "reason",
             "retell_call_id",
             "flow",
             "status",
+            "is_paused",
             "from_number",
             "to_number",
             "agent_id",
@@ -173,6 +177,10 @@ class CallSerializer(serializers.ModelSerializer):
 
     def get_message_count(self, obj):
         return len(obj.transcript or [])
+
+
+class CallPauseSerializer(serializers.Serializer):
+    paused = serializers.BooleanField(required=True)
 
 
 class ScheduledOutreachSerializer(serializers.ModelSerializer):

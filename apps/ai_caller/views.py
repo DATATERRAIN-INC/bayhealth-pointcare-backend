@@ -11,6 +11,7 @@ from apps.ai_caller.scheduling import (
     schedule_callback_request,
 )
 from apps.ai_caller.serializers import (
+    CallPauseSerializer,
     CallSerializer,
     CallerSettingsSerializer,
     PatientSerializer,
@@ -18,13 +19,12 @@ from apps.ai_caller.serializers import (
     ScheduledOutreachSerializer,
 )
 from apps.ai_caller.services import (
+    ensure_first_queued_call,
     get_call_queryset,
     get_caller_settings,
     get_patient_queryset,
-    get_queued_patients_queryset,
     place_outbound_call_for_patient,
     save_call_decline_reason,
-    serialize_queued_patient_as_call,
     sync_call_transcript,
     sync_in_progress_calls_from_retell,
     update_call_from_retell_payload,
@@ -61,6 +61,7 @@ class PatientViewSet(viewsets.ModelViewSet):
             created_by=request.user,
             updated_by=request.user,
         )
+        ensure_first_queued_call(patient, actor=request.user)
         from apps.notifications.services import notify_patient_created
 
         notify_patient_created(patient)
@@ -117,9 +118,10 @@ class PatientViewSet(viewsets.ModelViewSet):
         return response
 
 
-class CallViewSet(viewsets.ReadOnlyModelViewSet):
+class CallViewSet(viewsets.ModelViewSet):
     serializer_class = CallSerializer
     pagination_class = CommonPagination
+    http_method_names = ["get", "put", "patch", "head", "options"]
 
     def get_queryset(self):
         return get_call_queryset(
@@ -140,33 +142,39 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
             if not call:
                 return error_response("Call not found.", 404)
             return Response({"transcript": call.transcript or []})
-
-        status = (request.query_params.get("status") or "").strip().lower()
-        if status == "queued":
-            queryset = get_queued_patients_queryset(
-                user=request.user,
-                search=request.query_params.get("search", ""),
-                source=request.query_params.get("source", ""),
-            )
-            page = self.paginate_queryset(queryset)
-            data = [serialize_queued_patient_as_call(p) for p in page]
-            return self.get_paginated_response(data)
-
         return super().list(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        """Pause / resume a specific queued call so Celery skips it until resumed."""
+        call = self.get_object()
+        if call.status != Call.Status.QUEUED:
+            return error_response("Only queued calls can be paused or resumed.", 400)
+
+        serializer = CallPauseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        call.is_paused = bool(serializer.validated_data["paused"])
+        call.updated_by = request.user
+        call.save(update_fields=["is_paused", "updated_by", "updated_at"])
+        return Response(CallSerializer(call).data)
+
+    def partial_update(self, request, *args, **kwargs):
+        return self.update(request, *args, **kwargs)
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
         sync_in_progress_calls_from_retell(user=request.user, limit=25)
         queryset = Call.objects.filter(user=request.user)
-        queued = get_queued_patients_queryset(user=request.user).count()
         return Response(
             {
-                "all": queryset.count(),
+                "all": queryset.exclude(status=Call.Status.QUEUED).count(),
                 "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
                 "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
-                "queued": queued,
+                "queued": queryset.filter(status=Call.Status.QUEUED).count(),
+                "queued_paused": queryset.filter(
+                    status=Call.Status.QUEUED, is_paused=True
+                ).count(),
             }
         )
 
