@@ -2,7 +2,7 @@ from datetime import date, datetime, time, timedelta
 import logging
 
 from django.conf import settings
-from django.db.models import CharField, Q, Value
+from django.db.models import CharField, Exists, OuterRef, Q, Subquery, Value
 from django.db.models.functions import Cast, Concat
 from django.utils import timezone
 
@@ -55,7 +55,19 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None):
         queryset = queryset.filter(source=source)
     if is_blocked is not None:
         queryset = queryset.filter(is_blocked=is_blocked)
-    return queryset
+
+    latest_status = (
+        Call.objects.filter(patient_id=OuterRef("pk"))
+        .order_by("-started_at", "-id")
+        .values("status")[:1]
+    )
+    has_in_progress = Call.objects.filter(
+        patient_id=OuterRef("pk"), status=Call.Status.IN_PROGRESS
+    )
+    return queryset.annotate(
+        _latest_call_status=Subquery(latest_status),
+        _has_in_progress=Exists(has_in_progress),
+    )
 
 
 def get_call_queryset(
@@ -801,13 +813,18 @@ def update_call_from_retell_payload(payload):
     if not raw_status and event.lower() in {"call_ended", "call_analyzed"}:
         raw_status = "ended"
 
-    call.status = _map_retell_status(
+    mapped_status = _map_retell_status(
         raw_status,
         disconnection_reason=str(
             data.get("disconnection_reason") or data.get("disconnect_reason") or ""
         ),
         event=event,
     )
+    # Keep callback if patient already asked to be called later on this call.
+    if previous_status == Call.Status.CALLBACK:
+        call.status = Call.Status.CALLBACK
+    else:
+        call.status = mapped_status
 
     started_at = _parse_retell_time(
         data.get("start_timestamp") or data.get("started_at") or data.get("start_time")

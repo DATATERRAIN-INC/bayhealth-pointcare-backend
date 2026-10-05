@@ -24,6 +24,7 @@ def _normalize_country_code(value):
 
 class PatientSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
+    call_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Patient
@@ -41,6 +42,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "is_blocked",
             "source",
             "upload_file_key",
+            "call_status",
             "created_at",
             "updated_at",
         )
@@ -49,9 +51,37 @@ class PatientSerializer(serializers.ModelSerializer):
             "full_name",
             "source",
             "upload_file_key",
+            "call_status",
             "created_at",
             "updated_at",
         )
+
+    def get_call_status(self, obj):
+        """
+        Current dial status for this patient:
+        in_progress > latest call status > queued (waiting) > null if blocked with no calls.
+        """
+        if getattr(obj, "_has_in_progress", None):
+            return Call.Status.IN_PROGRESS
+        annotated = getattr(obj, "_latest_call_status", None)
+        if annotated:
+            return annotated
+        if getattr(obj, "_has_in_progress", None) is False and annotated is None:
+            # Annotated queryset: no calls yet.
+            return None if obj.is_blocked else "queued"
+
+        # Fallback when instance was not annotated (create/upload paths).
+        if Call.objects.filter(patient=obj, status=Call.Status.IN_PROGRESS).exists():
+            return Call.Status.IN_PROGRESS
+        latest = (
+            Call.objects.filter(patient=obj)
+            .order_by("-started_at", "-id")
+            .values_list("status", flat=True)
+            .first()
+        )
+        if latest:
+            return latest
+        return None if obj.is_blocked else "queued"
 
     def to_representation(self, instance):
         data = super().to_representation(instance)

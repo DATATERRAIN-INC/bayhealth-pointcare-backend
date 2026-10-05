@@ -120,6 +120,7 @@ class Call(models.Model):
         IN_PROGRESS = "in_progress", "In Progress"
         COMPLETED = "completed", "Completed"
         NOT_ATTENDED = "not_attended", "Not Attended"
+        CALLBACK = "callback", "Callback"
 
     class Flow(models.TextChoices):
         OUTBOUND = "outbound", "Outbound"

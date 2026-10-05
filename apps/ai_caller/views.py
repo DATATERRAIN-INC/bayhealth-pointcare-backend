@@ -182,6 +182,7 @@ class CallViewSet(viewsets.ReadOnlyModelViewSet):
                 "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
+                "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
                 "queued": queued,
             }
         )

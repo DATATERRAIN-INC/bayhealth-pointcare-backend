@@ -197,6 +197,8 @@ def schedule_callback_request(
         scheduled_at=scheduled_at,
         raw_time_text=(raw_time_text or "")[:255],
     )
+    call.status = Call.Status.CALLBACK
+    call.save(update_fields=["status", "updated_at"])
     dialer_logger.info(
         "CALLBACK_SCHEDULED id=%s patient_id=%s scheduled_at=%s raw=%s",
         row.id,
