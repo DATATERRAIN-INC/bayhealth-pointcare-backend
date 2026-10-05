@@ -6,7 +6,20 @@ from django.db.models import CharField, Q, Value
 from django.db.models.functions import Cast, Concat
 from django.utils import timezone
 
-from apps.ai_caller.models import Call, CallerSettings, Patient, PatientSource, UploadedFile
+from apps.ai_caller.models import (
+    Call,
+    CallerSettings,
+    Patient,
+    PatientSource,
+    ScheduledOutreach,
+    UploadedFile,
+)
+from apps.ai_caller.scheduling import (
+    cancel_scheduled_for_patient,
+    due_scheduled_outreaches,
+    mark_outreach_triggered,
+    schedule_reminder_for_missed_call,
+)
 from apps.ai_caller.retell import (
     get_retell_call,
     normalize_phone,
@@ -686,6 +699,7 @@ def update_call_from_retell_payload(payload):
     if not call:
         return None, "Call not found."
 
+    previous_status = call.status
     raw_status = data.get("call_status") or data.get("status") or ""
     if not raw_status and event.lower() in {"call_ended", "call_analyzed"}:
         raw_status = "ended"
@@ -768,6 +782,21 @@ def update_call_from_retell_payload(payload):
         raw_status or "-",
         str(data.get("disconnection_reason") or "")[:80],
     )
+
+    if call.status == Call.Status.COMPLETED:
+        # Keep a callback requested on this same call (busy → call later).
+        # Cancel older reminders/callbacks that this completed outreach replaces.
+        cancel_scheduled_for_patient(
+            call.patient,
+            reason="Patient call completed",
+            exclude_source_call=call,
+        )
+    elif (
+        call.status == Call.Status.NOT_ATTENDED
+        and previous_status != Call.Status.NOT_ATTENDED
+    ):
+        schedule_reminder_for_missed_call(call)
+
     return call, None
 
 
@@ -883,13 +912,14 @@ def _local_day_bounds(settings_obj):
 
 def patients_due_for_outbound(settings_obj=None, limit=None):
     """
-    Eligible patients for auto dial:
+    Eligible patients for first-time / non-queue auto dial:
     - not blocked
     - no completed call (never redial)
     - no in-progress call (leave alone)
     - not_attended attempts under call_trigger_count
     - no in-progress/completed attempt today
-    Retries only apply after not_attended.
+    - no open ScheduledOutreach (callbacks/reminders are drained separately)
+    Retries after not_attended go through the ScheduledOutreach reminder queue.
     """
     settings_obj = settings_obj or None
     if settings_obj is None:
@@ -908,7 +938,7 @@ def patients_due_for_outbound(settings_obj=None, limit=None):
         user=user,
     ).values_list("patient_id", flat=True)
 
-    # Block same-day only for in_progress / completed — not_attended may retry.
+    # Block same-day only for in_progress / completed — not_attended may retry via queue.
     active_today_ids = (
         Call.objects.filter(
             user=user,
@@ -928,12 +958,24 @@ def patients_due_for_outbound(settings_obj=None, limit=None):
         .values_list("patient_id", flat=True)
     )
 
+    queued_ids = ScheduledOutreach.objects.filter(
+        user=user,
+        status=ScheduledOutreach.Status.SCHEDULED,
+    ).values_list("patient_id", flat=True)
+
+    # Patients who already have a not-attended attempt wait for the reminder queue.
+    ever_not_attended_ids = Call.objects.filter(
+        user=user, status=Call.Status.NOT_ATTENDED
+    ).values_list("patient_id", flat=True)
+
     queryset = (
         Patient.objects.filter(user=user, is_blocked=False)
         .exclude(id__in=completed_ids)
         .exclude(id__in=in_progress_ids)
         .exclude(id__in=active_today_ids)
         .exclude(id__in=exhausted_ids)
+        .exclude(id__in=queued_ids)
+        .exclude(id__in=ever_not_attended_ids)
         .order_by("id")
     )
     limit = limit if limit is not None else settings_obj.max_calls_per_run
@@ -981,9 +1023,12 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         )
         return payload
 
-    patients = patients_due_for_outbound(settings_obj)
-    if not patients:
-        # Explain why the dialer found nobody to call.
+    max_per_run = max(1, int(settings_obj.max_calls_per_run or 1))
+    due_queue = due_scheduled_outreaches(settings_obj, limit=max_per_run)
+    remaining = max(0, max_per_run - len(due_queue))
+    patients = patients_due_for_outbound(settings_obj, limit=remaining) if remaining else []
+
+    if not due_queue and not patients:
         total = Patient.objects.filter(user=settings_obj.user).count()
         blocked = Patient.objects.filter(
             user=settings_obj.user, is_blocked=True
@@ -1011,6 +1056,54 @@ def _run_scheduled_outbound_for_settings(settings_obj):
     placed = 0
     failed = 0
     results = []
+
+    for row in due_queue:
+        result = place_outbound_call_for_patient(row.patient_id, user=settings_obj.user)
+        entry = {
+            "patient_id": row.patient_id,
+            "scheduled_outreach_id": row.id,
+            "kind": row.kind,
+            "ok": bool(result.get("ok")),
+            "error": result.get("error") or "",
+            "call_id": result.get("call_id") or "",
+        }
+        results.append(entry)
+        if entry["ok"]:
+            placed += 1
+            triggered_call = None
+            call_pk = result.get("db_call_id") or result.get("call_db_id")
+            if call_pk:
+                triggered_call = Call.objects.filter(pk=call_pk).first()
+            if not triggered_call and entry["call_id"]:
+                triggered_call = Call.objects.filter(
+                    retell_call_id=entry["call_id"]
+                ).first()
+            mark_outreach_triggered(row, triggered_call)
+            dialer_logger.info(
+                "QUEUE_TRIGGERED user_id=%s email=%s patient_id=%s "
+                "scheduled_id=%s kind=%s call_id=%s",
+                user_id,
+                email,
+                row.patient_id,
+                row.id,
+                row.kind,
+                entry["call_id"],
+            )
+        else:
+            failed += 1
+            # Keep scheduled so the next run can retry; record last error.
+            row.error_message = (entry["error"] or "Place failed")[:512]
+            row.save(update_fields=["error_message", "updated_at"])
+            dialer_logger.info(
+                "QUEUE_NOT_TRIGGERED user_id=%s email=%s patient_id=%s "
+                "scheduled_id=%s reason=place_failed error=%s",
+                user_id,
+                email,
+                row.patient_id,
+                row.id,
+                entry["error"],
+            )
+
     for patient in patients:
         result = place_outbound_call_for_patient(patient.id, user=settings_obj.user)
         entry = {
@@ -1044,11 +1137,11 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         "skipped": False,
         "placed": placed,
         "failed": failed,
-        "attempted": len(patients),
+        "attempted": len(due_queue) + len(patients),
         "results": results,
         "user_id": user_id,
     }
-    if patients:
+    if due_queue or patients:
         from apps.notifications.services import notify_outbound_batch
 
         notify_outbound_batch(payload, user=settings_obj.user)

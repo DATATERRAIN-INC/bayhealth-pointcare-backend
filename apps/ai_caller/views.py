@@ -5,12 +5,17 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.ai_caller.models import Call, PatientSource
+from apps.ai_caller.models import Call, PatientSource, ScheduledOutreach
+from apps.ai_caller.scheduling import (
+    get_scheduled_outreach_queryset,
+    schedule_callback_request,
+)
 from apps.ai_caller.serializers import (
     CallSerializer,
     CallerSettingsSerializer,
     PatientSerializer,
     PlaceOutboundCallSerializer,
+    ScheduledOutreachSerializer,
 )
 from apps.ai_caller.services import (
     get_call_queryset,
@@ -192,6 +197,60 @@ class PlaceOutboundCallView(APIView):
         return message_response("Call placed successfully.")
 
 
+class ScheduledOutreachViewSet(viewsets.ReadOnlyModelViewSet):
+    """Separate list for patient callbacks and reminder queue rows."""
+
+    serializer_class = ScheduledOutreachSerializer
+    pagination_class = CommonPagination
+
+    def get_queryset(self):
+        return get_scheduled_outreach_queryset(
+            user=self.request.user,
+            search=self.request.query_params.get("search", ""),
+            kind=self.request.query_params.get("kind", ""),
+            status=self.request.query_params.get("status", ""),
+        )
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        queryset = ScheduledOutreach.objects.filter(user=request.user)
+        return Response(
+            {
+                "all": queryset.count(),
+                "scheduled": queryset.filter(
+                    status=ScheduledOutreach.Status.SCHEDULED
+                ).count(),
+                "callback_requested": queryset.filter(
+                    kind=ScheduledOutreach.Kind.CALLBACK_REQUESTED,
+                    status=ScheduledOutreach.Status.SCHEDULED,
+                ).count(),
+                "reminder": queryset.filter(
+                    kind=ScheduledOutreach.Kind.REMINDER,
+                    status=ScheduledOutreach.Status.SCHEDULED,
+                ).count(),
+                "triggered": queryset.filter(
+                    status=ScheduledOutreach.Status.TRIGGERED
+                ).count(),
+                "cancelled": queryset.filter(
+                    status=ScheduledOutreach.Status.CANCELLED
+                ).count(),
+                "failed": queryset.filter(
+                    status=ScheduledOutreach.Status.FAILED
+                ).count(),
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="cancel")
+    def cancel(self, request, pk=None):
+        row = self.get_object()
+        if row.status != ScheduledOutreach.Status.SCHEDULED:
+            return error_response("Only scheduled items can be cancelled.", 400)
+        row.status = ScheduledOutreach.Status.CANCELLED
+        row.error_message = "Cancelled by user"
+        row.save(update_fields=["status", "error_message", "updated_at"])
+        return message_response("Scheduled outreach cancelled.")
+
+
 class CallerSettingsView(APIView):
     """GET/PATCH controller settings for the automated AI caller."""
 
@@ -238,7 +297,7 @@ class RetellWebhookView(APIView):
 
 
 class RetellToolWebhookView(APIView):
-    """Receive Retell custom function calls (e.g. log_decline_reason). Public."""
+    """Receive Retell custom function calls (decline / callback). Public."""
 
     permission_classes = [AllowAny]
     authentication_classes = []
@@ -265,6 +324,30 @@ class RetellToolWebhookView(APIView):
                 args = json.loads(args)
             except Exception:
                 args = {"reason": args}
+
+        if name == "log_callback_request":
+            callback_time = ""
+            if isinstance(args, dict):
+                callback_time = str(
+                    args.get("callback_time")
+                    or args.get("time")
+                    or args.get("when")
+                    or args.get("reason")
+                    or ""
+                ).strip()
+            if not callback_time:
+                callback_time = str(
+                    data.get("callback_time") or data.get("time") or ""
+                ).strip()
+            call = Call.objects.filter(retell_call_id=call_id).first()
+            if not call:
+                return error_response("Call not found.", 404)
+            _, error = schedule_callback_request(
+                call=call, raw_time_text=callback_time
+            )
+            if error:
+                return error_response(error, 400)
+            return message_response("Callback request saved.")
 
         if name and name != "log_decline_reason":
             return message_response("Tool ignored.")

@@ -5,6 +5,7 @@ from apps.ai_caller.models import (
     CallerSettings,
     LiveAgentNumber,
     Patient,
+    ScheduledOutreach,
     UploadedFile,
 )
 
@@ -102,12 +103,40 @@ class CallerSettingsAdmin(admin.ModelAdmin):
         "timezone",
         "max_calls_per_run",
         "call_trigger_count",
+        "reminder_timeframe_hours",
         "text_sms_enabled",
         "updated_at",
     )
     readonly_fields = ("updated_at",)
     raw_id_fields = ("user", "created_by", "updated_by")
     inlines = [LiveAgentNumberInline]
+
+
+@admin.register(ScheduledOutreach)
+class ScheduledOutreachAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "user",
+        "patient",
+        "kind",
+        "status",
+        "scheduled_at",
+        "raw_time_text",
+        "source_call",
+        "triggered_call",
+        "created_at",
+    )
+    list_filter = ("kind", "status")
+    search_fields = (
+        "patient__first_name",
+        "patient__last_name",
+        "patient__phone_number",
+        "raw_time_text",
+        "user__email",
+    )
+    ordering = ("scheduled_at", "id")
+    raw_id_fields = ("user", "patient", "source_call", "triggered_call")
+    readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(LiveAgentNumber)

@@ -223,6 +223,10 @@ class CallerSettings(models.Model):
     timezone = models.CharField(max_length=64, default="America/New_York")
     max_calls_per_run = models.PositiveIntegerField(default=5)
     call_trigger_count = models.PositiveIntegerField(default=3)
+    reminder_timeframe_hours = models.PositiveIntegerField(
+        default=24,
+        help_text="Hours to wait after a missed call before the next reminder call.",
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -270,6 +274,73 @@ class CallerSettings(models.Model):
     def primary_live_agent_number(self):
         """First active live-agent number for outbound transfer."""
         return self.active_live_agent_numbers().first()
+
+
+class ScheduledOutreach(models.Model):
+    """Separate queue for patient callbacks and system reminder calls."""
+
+    class Kind(models.TextChoices):
+        CALLBACK_REQUESTED = "callback_requested", "Callback requested"
+        REMINDER = "reminder", "Reminder"
+
+    class Status(models.TextChoices):
+        SCHEDULED = "scheduled", "Scheduled"
+        TRIGGERED = "triggered", "Triggered"
+        CANCELLED = "cancelled", "Cancelled"
+        FAILED = "failed", "Failed"
+
+    user = models.ForeignKey(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="scheduled_outreaches",
+        null=True,
+        blank=True,
+    )
+    patient = models.ForeignKey(
+        Patient,
+        on_delete=models.CASCADE,
+        related_name="scheduled_outreaches",
+    )
+    source_call = models.ForeignKey(
+        Call,
+        on_delete=models.SET_NULL,
+        related_name="scheduled_outreaches_created",
+        null=True,
+        blank=True,
+    )
+    triggered_call = models.ForeignKey(
+        Call,
+        on_delete=models.SET_NULL,
+        related_name="scheduled_outreaches_triggered",
+        null=True,
+        blank=True,
+    )
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.SCHEDULED,
+    )
+    scheduled_at = models.DateTimeField()
+    raw_time_text = models.CharField(max_length=255, blank=True, default="")
+    error_message = models.CharField(max_length=512, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["scheduled_at", "id"]
+        verbose_name = "Scheduled outreach"
+        verbose_name_plural = "Scheduled outreaches"
+        indexes = [
+            models.Index(fields=["user", "status", "scheduled_at"]),
+            models.Index(fields=["patient", "status"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"ScheduledOutreach #{self.id} ({self.kind}, {self.status}) "
+            f"at {self.scheduled_at}"
+        )
 
 
 class LiveAgentNumber(models.Model):
