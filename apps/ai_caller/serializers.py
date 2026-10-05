@@ -3,7 +3,13 @@ from datetime import date
 from rest_framework import serializers
 
 from apps.ai_caller.constants import ALLOWED_UPLOAD_EXTENSIONS
-from apps.ai_caller.models import Call, CallerSettings, LiveAgentNumber, Patient
+from apps.ai_caller.models import (
+    Call,
+    CallerSettings,
+    LiveAgentNumber,
+    Patient,
+    ScheduledOutreach,
+)
 from common.s3 import build_s3_url
 
 
@@ -116,6 +122,40 @@ class CallSerializer(serializers.ModelSerializer):
         return len(obj.transcript or [])
 
 
+class ScheduledOutreachSerializer(serializers.ModelSerializer):
+    patient_name = serializers.CharField(source="patient.full_name", read_only=True)
+    patient_phone = serializers.SerializerMethodField()
+    kind_label = serializers.CharField(source="get_kind_display", read_only=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = ScheduledOutreach
+        fields = (
+            "id",
+            "patient",
+            "patient_name",
+            "patient_phone",
+            "source_call",
+            "triggered_call",
+            "kind",
+            "kind_label",
+            "status",
+            "status_label",
+            "scheduled_at",
+            "raw_time_text",
+            "error_message",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_patient_phone(self, obj):
+        patient = obj.patient
+        if not patient:
+            return ""
+        return f"{patient.country_code or ''}{patient.phone_number or ''}".strip()
+
+
 class LiveAgentNumberSerializer(serializers.ModelSerializer):
     class Meta:
         model = LiveAgentNumber
@@ -155,6 +195,7 @@ class CallerSettingsSerializer(serializers.ModelSerializer):
             "timezone",
             "max_calls_per_run",
             "call_trigger_count",
+            "reminder_timeframe_hours",
             "live_agent_numbers",
             "window_summary",
             "updated_at",
@@ -193,6 +234,24 @@ class CallerSettingsSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"call_trigger_count": "Must be at least 1."}
             )
+        timeframe = attrs.get(
+            "reminder_timeframe_hours",
+            getattr(self.instance, "reminder_timeframe_hours", None),
+        )
+        if timeframe is not None:
+            hours = int(timeframe)
+            if hours < 1:
+                raise serializers.ValidationError(
+                    {"reminder_timeframe_hours": "Must be at least 1 hour."}
+                )
+            if hours > 24 * 30:
+                raise serializers.ValidationError(
+                    {
+                        "reminder_timeframe_hours": (
+                            "Must be 720 hours (30 days) or less."
+                        )
+                    }
+                )
         return attrs
 
     def update(self, instance, validated_data):

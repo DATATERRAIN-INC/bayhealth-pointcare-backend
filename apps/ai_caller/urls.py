@@ -8,12 +8,18 @@ from apps.ai_caller.views import (
     PlaceOutboundCallView,
     RetellToolWebhookView,
     RetellWebhookView,
+    ScheduledOutreachViewSet,
 )
 from apps.ai_caller import twiml_views
 
 router = DefaultRouter()
 router.register("patients", PatientViewSet, basename="patients")
 router.register("calls", CallViewSet, basename="calls")
+router.register(
+    "scheduled-outreach",
+    ScheduledOutreachViewSet,
+    basename="scheduled-outreach",
+)
 
 urlpatterns = [
     path(

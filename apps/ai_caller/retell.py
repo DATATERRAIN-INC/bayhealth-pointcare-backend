@@ -271,9 +271,10 @@ def _agent_call_settings() -> Dict[str, Any]:
                 "type": "static_text",
                 "text": (
                     "Hi, this is Kyle calling from Bay Area Community Health "
-                    "for {{patient_name}}. We're reaching out about your "
-                    "{{service_name}} with Dr. {{name}}. Please give us a call back so we can help "
-                    "with scheduling or answer any questions you might have. "
+                    "for {{patient_name}}. Just reaching out about your "
+                    "{{service_name}} with Dr. {{name}} — nothing urgent. "
+                    "Whenever you have a moment, please give us a call back "
+                    "and we can help with scheduling or any questions. "
                     "Thanks so much, take care."
                 ),
             },
@@ -329,12 +330,54 @@ def _decline_reason_tool() -> Dict[str, Any]:
     return tool
 
 
+def _callback_request_tool() -> Dict[str, Any]:
+    tool: Dict[str, Any] = {
+        "type": "custom",
+        "name": "log_callback_request",
+        "description": (
+            "Required when the caller asks to be called back later and gives a time. "
+            "Pass the callback time in their own words (for example: 'tomorrow at 3pm', "
+            "'today at 4:30 PM', or 'in 2 hours') before ending the call."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "callback_time": {
+                    "type": "string",
+                    "description": (
+                        "When they want to be called back, in their own words. "
+                        "Prefer a clear time such as 'tomorrow at 3pm'."
+                    ),
+                }
+            },
+            "required": ["callback_time"],
+        },
+        "speak_during_execution": False,
+        "speak_after_execution": False,
+    }
+    url = _tool_webhook_url()
+    if url:
+        tool["url"] = url
+        tool["method"] = "POST"
+    return tool
+
+
 def _default_care_tools() -> List[Dict[str, Any]]:
-    return [_end_call_tool(), _transfer_tool(), _decline_reason_tool()]
+    return [
+        _end_call_tool(),
+        _transfer_tool(),
+        _decline_reason_tool(),
+        _callback_request_tool(),
+    ]
 
 
 def _default_guardian_tools() -> List[Dict[str, Any]]:
-    return [_end_call_tool(), _minor_transfer_tool(), _decline_reason_tool()]
+    return [
+        _end_call_tool(),
+        _minor_transfer_tool(),
+        _decline_reason_tool(),
+        _callback_request_tool(),
+    ]
 
 
 def _transfer_tool() -> Dict[str, Any]:
