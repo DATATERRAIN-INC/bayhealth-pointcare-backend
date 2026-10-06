@@ -250,10 +250,36 @@ def _allow_india_outbound(from_number: str) -> None:
 
 
 
+def _denoising_mode() -> str:
+    """Retell caller-side denoising. Override with RETELL_DENOISING_MODE."""
+    allowed = {
+        "no-denoise",
+        "noise-cancellation",
+        "noise-and-background-speech-cancellation",
+    }
+    configured = (getattr(settings, "RETELL_DENOISING_MODE", "") or "").strip()
+    if configured in allowed:
+        return configured
+    # Stronger mode: ambient noise + background speech (TV / other voices).
+    return "noise-and-background-speech-cancellation"
+
+
+def _interruption_sensitivity() -> float:
+    """Lower = less likely to treat noise as an interruption. Default 0.8."""
+    raw = getattr(settings, "RETELL_INTERRUPTION_SENSITIVITY", None)
+    try:
+        value = float(raw if raw is not None and str(raw).strip() != "" else 0.8)
+    except (TypeError, ValueError):
+        value = 0.8
+    return max(0.0, min(1.0, value))
+
+
 def _agent_call_settings() -> Dict[str, Any]:
     return {
         "language": "multi",
         "begin_message_delay_ms": 800,
+        "denoising_mode": _denoising_mode(),
+        "interruption_sensitivity": _interruption_sensitivity(),
         "call_screening_option": {
             "agent_identity": "Kyle from Bay Area Community Health",
             "call_purpose": (
