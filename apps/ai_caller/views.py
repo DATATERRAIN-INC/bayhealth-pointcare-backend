@@ -44,12 +44,19 @@ class PatientViewSet(viewsets.ModelViewSet):
         is_blocked = None
         if blocked is not None and str(blocked).strip() != "":
             is_blocked = str(blocked).strip().lower() in ("1", "true", "yes")
+        call_status = self.request.query_params.getlist("call_status")
+        if len(call_status) == 1:
+            call_status = call_status[0]
+        elif not call_status:
+            call_status = self.request.query_params.get("call_status", "")
+
         return get_patient_queryset(
             user=self.request.user,
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
             is_blocked=is_blocked,
             upload_id=self.request.query_params.get("upload_id", ""),
+            call_status=call_status,
         )
 
     def create(self, request, *args, **kwargs):
