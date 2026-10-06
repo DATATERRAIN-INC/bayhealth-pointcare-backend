@@ -1,6 +1,7 @@
 from datetime import date
 
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.ai_caller.constants import ALLOWED_UPLOAD_EXTENSIONS
@@ -26,6 +27,10 @@ def _normalize_country_code(value):
 class PatientSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
     call_status = serializers.SerializerMethodField()
+    call_id = serializers.SerializerMethodField()
+    retell_call_id = serializers.SerializerMethodField()
+    duration_seconds = serializers.SerializerMethodField()
+    patient_tries = serializers.SerializerMethodField()
 
     class Meta:
         model = Patient
@@ -45,6 +50,10 @@ class PatientSerializer(serializers.ModelSerializer):
             "upload",
             "upload_file_key",
             "call_status",
+            "call_id",
+            "retell_call_id",
+            "duration_seconds",
+            "patient_tries",
             "created_at",
             "updated_at",
         )
@@ -55,9 +64,71 @@ class PatientSerializer(serializers.ModelSerializer):
             "upload",
             "upload_file_key",
             "call_status",
+            "call_id",
+            "retell_call_id",
+            "duration_seconds",
+            "patient_tries",
             "created_at",
             "updated_at",
         )
+
+    def get_call_id(self, obj):
+        value = getattr(obj, "_latest_call_id", None)
+        if value is not None:
+            return value
+        latest = (
+            Call.objects.filter(patient=obj)
+            .order_by("-started_at", "-id")
+            .values_list("id", flat=True)
+            .first()
+        )
+        return latest
+
+    def get_retell_call_id(self, obj):
+        value = getattr(obj, "_latest_retell_call_id", None)
+        if value is not None:
+            return value or None
+        latest = (
+            Call.objects.filter(patient=obj)
+            .order_by("-started_at", "-id")
+            .values_list("retell_call_id", flat=True)
+            .first()
+        )
+        return latest or None
+
+    def get_duration_seconds(self, obj):
+        started_at = getattr(obj, "_latest_call_started_at", None)
+        ended_at = getattr(obj, "_latest_call_ended_at", None)
+        status = getattr(obj, "_latest_call_status", None)
+        if started_at is None and not hasattr(obj, "_latest_call_id"):
+            latest = (
+                Call.objects.filter(patient=obj)
+                .order_by("-started_at", "-id")
+                .only("started_at", "ended_at", "status")
+                .first()
+            )
+            if not latest:
+                return None
+            started_at = latest.started_at
+            ended_at = latest.ended_at
+            status = latest.status
+        if not started_at:
+            return None
+        end = ended_at
+        if end is None and status == Call.Status.IN_PROGRESS:
+            end = timezone.now()
+        if end is None:
+            return None
+        return max(0, int((end - started_at).total_seconds()))
+
+    def get_patient_tries(self, obj):
+        """Number of not-attended contact attempts for this patient."""
+        value = getattr(obj, "_patient_tries", None)
+        if value is not None:
+            return int(value)
+        return Call.objects.filter(
+            patient=obj, status=Call.Status.NOT_ATTENDED
+        ).count()
 
     def get_call_status(self, obj):
         """
