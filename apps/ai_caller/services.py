@@ -60,16 +60,18 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
     if upload_id.isdigit():
         queryset = queryset.filter(upload_id=int(upload_id))
 
-    latest_status = (
-        Call.objects.filter(patient_id=OuterRef("pk"))
-        .order_by("-started_at", "-id")
-        .values("status")[:1]
+    latest_call = Call.objects.filter(patient_id=OuterRef("pk")).order_by(
+        "-started_at", "-id"
     )
     has_in_progress = Call.objects.filter(
         patient_id=OuterRef("pk"), status=Call.Status.IN_PROGRESS
     )
     return queryset.annotate(
-        _latest_call_status=Subquery(latest_status),
+        _latest_call_status=Subquery(latest_call.values("status")[:1]),
+        _latest_call_id=Subquery(latest_call.values("id")[:1]),
+        _latest_retell_call_id=Subquery(latest_call.values("retell_call_id")[:1]),
+        _latest_call_started_at=Subquery(latest_call.values("started_at")[:1]),
+        _latest_call_ended_at=Subquery(latest_call.values("ended_at")[:1]),
         _has_in_progress=Exists(has_in_progress),
     )
 
