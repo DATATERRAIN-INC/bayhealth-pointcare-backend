@@ -124,15 +124,23 @@ class CallViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "put", "patch", "head", "options"]
 
     def get_queryset(self):
-        status = self.request.query_params.get("status", "")
-        # Only the list endpoint hides queued by default. Detail/PUT/PATCH must
-        # still resolve queued Call ids (pause/resume).
-        exclude_queued = self.action == "list" and not (status or "").strip()
+        # Support one or many: ?status=queued or ?status=queued,paused
+        # or ?status=queued&status=paused
+        status_values = self.request.query_params.getlist("status")
+        if not status_values:
+            status_values = self.request.query_params.get("status", "")
+        # Only the list endpoint hides queued/paused by default.
+        has_status = bool(
+            status_values
+            if not isinstance(status_values, str)
+            else (status_values or "").strip()
+        )
+        exclude_queued = self.action == "list" and not has_status
         return get_call_queryset(
             user=self.request.user,
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
-            status=status,
+            status=status_values,
             patient_id=self.request.query_params.get("patient_id", ""),
             retell_call_id=self.request.query_params.get("retell_call_id", ""),
             exclude_queued=exclude_queued,
