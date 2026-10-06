@@ -29,6 +29,7 @@ class PatientSerializer(serializers.ModelSerializer):
     call_id = serializers.SerializerMethodField()
     retell_call_id = serializers.SerializerMethodField()
     duration_seconds = serializers.SerializerMethodField()
+    patient_tries = serializers.SerializerMethodField()
 
     class Meta:
         model = Patient
@@ -51,6 +52,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "call_id",
             "retell_call_id",
             "duration_seconds",
+            "patient_tries",
             "created_at",
             "updated_at",
         )
@@ -64,6 +66,7 @@ class PatientSerializer(serializers.ModelSerializer):
             "call_id",
             "retell_call_id",
             "duration_seconds",
+            "patient_tries",
             "created_at",
             "updated_at",
         )
@@ -116,6 +119,15 @@ class PatientSerializer(serializers.ModelSerializer):
         if end is None:
             return None
         return max(0, int((end - started_at).total_seconds()))
+
+    def get_patient_tries(self, obj):
+        """Number of not-attended contact attempts for this patient."""
+        value = getattr(obj, "_patient_tries", None)
+        if value is not None:
+            return int(value)
+        return Call.objects.filter(
+            patient=obj, status=Call.Status.NOT_ATTENDED
+        ).count()
 
     def get_call_status(self, obj):
         """
