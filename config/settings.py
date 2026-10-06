@@ -99,6 +99,12 @@ RETELL_VOICE = os.getenv("RETELL_VOICE", "")
 RETELL_MAX_DURATION_MINUTES = int(os.getenv("RETELL_MAX_DURATION_MINUTES") or 8)
 RETELL_SSL_VERIFY = os.getenv("RETELL_SSL_VERIFY", "true").lower() in ("1", "true", "yes")
 RETELL_TRANSFER_NUMBER = os.getenv("RETELL_TRANSFER_NUMBER", "")
+# noise-cancellation | noise-and-background-speech-cancellation | no-denoise
+RETELL_DENOISING_MODE = os.getenv(
+    "RETELL_DENOISING_MODE",
+    "noise-and-background-speech-cancellation",
+)
+RETELL_INTERRUPTION_SENSITIVITY = os.getenv("RETELL_INTERRUPTION_SENSITIVITY", "0.8")
 AWS_S3_BASE_URL = os.getenv("AWS_S3_BASE_URL", "").rstrip("/")
 AWS_MEDIA_FOLDER = os.getenv("AWS_MEDIA_FOLDER", "bayhealth")
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
