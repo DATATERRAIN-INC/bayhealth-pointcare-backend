@@ -8,6 +8,7 @@ from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.ai_sms.models import SmsConversation
 from apps.ai_sms.serializers import (
     PlaceMinorSmsConversationSerializer,
     PlaceSmsConversationSerializer,
@@ -22,11 +23,67 @@ from apps.ai_sms.services import (
 from apps.ai_sms.agent_dial import (
     agent_answer_twiml,
     conversation_by_chat_id,
+    handle_bridge_status,
     maybe_failover_on_agent_status,
 )
 from common.responses import error_response
 
 _EMPTY_TWIML = "<Response></Response>"
+
+
+def _sms_transcript_items(raw: str) -> list:
+    """Convert stored Agent/Patient text into voice-style transcript objects."""
+    speaker_map = {
+        "agent": "agent",
+        "patient": "patient",
+        "guardian": "patient",
+    }
+    items = []
+    for line in (raw or "").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        speaker = "unknown"
+        body = text
+        if ":" in text:
+            label, rest = text.split(":", 1)
+            mapped = speaker_map.get(label.strip().lower())
+            if mapped:
+                speaker = mapped
+                body = rest.strip()
+        if not body:
+            continue
+        items.append(
+            {
+                "at": None,
+                "text": body,
+                "segment": "ai",
+                "speaker": speaker,
+            }
+        )
+    return items
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SmsConversationDetailView(APIView):
+    """GET transcript only by chat_id or numeric id (voice-compatible shape)."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    renderer_classes = [JSONRenderer]
+
+    def get(self, request, lookup: str):
+        conversation = None
+        if lookup.isdigit():
+            conversation = SmsConversation.objects.filter(pk=int(lookup)).first()
+        if conversation is None:
+            conversation = conversation_by_chat_id(lookup)
+        if conversation is None:
+            return error_response("SMS conversation not found.", status.HTTP_404_NOT_FOUND)
+        return Response(
+            {"transcript": _sms_transcript_items(conversation.transcript or "")},
+            status=status.HTTP_200_OK,
+        )
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -91,9 +148,6 @@ class StartMinorSmsConversationView(APIView):
         data = serializer.validated_data
         result = start_minor_sms_conversation_for_patient(
             data["id"],
-            guardian_name=data.get("guardian_name") or "",
-            appointment_date=data.get("appointment_date") or "",
-            appointment_time=data.get("appointment_time") or "",
             webhook_url=sms_webhook_url()
             or request.build_absolute_uri("/api/ai-sms/webhook/"),
         )
@@ -147,7 +201,7 @@ class SmsWebhookView(APIView):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class SmsAgentDialAnswerView(APIView):
-    """TwiML when a live agent answers an SMS-transfer dial."""
+    """TwiML when a live agent answers an SMS-transfer dial — then bridge to patient."""
 
     authentication_classes = []
     permission_classes = [AllowAny]
@@ -156,12 +210,32 @@ class SmsAgentDialAnswerView(APIView):
         conversation = conversation_by_chat_id(chat_id)
         if conversation is None:
             return HttpResponse(_EMPTY_TWIML, content_type="text/xml")
-        conversation.transfer_status = "connected"
+        conversation.transfer_status = "bridging"
         conversation.save(update_fields=["transfer_status"])
         return HttpResponse(
             agent_answer_twiml(conversation),
             content_type="text/xml",
         )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SmsAgentDialBridgeStatusView(APIView):
+    """Twilio Dial action: patient bridge result after agent answered."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request, chat_id: str):
+        conversation = conversation_by_chat_id(chat_id)
+        if conversation is None:
+            return HttpResponse(_EMPTY_TWIML, content_type="text/xml")
+        dial_status = (
+            request.POST.get("DialCallStatus")
+            or request.POST.get("CallStatus")
+            or ""
+        )
+        handle_bridge_status(conversation, dial_call_status=dial_status)
+        return HttpResponse(_EMPTY_TWIML, content_type="text/xml")
 
 
 @method_decorator(csrf_exempt, name="dispatch")
