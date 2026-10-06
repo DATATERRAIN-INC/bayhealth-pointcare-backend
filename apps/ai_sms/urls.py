@@ -2,7 +2,9 @@ from django.urls import path
 
 from apps.ai_sms.views import (
     SmsAgentDialAnswerView,
+    SmsAgentDialBridgeStatusView,
     SmsAgentDialStatusView,
+    SmsConversationDetailView,
     SmsWebhookView,
     StartMinorSmsConversationView,
     StartSmsConversationView,
@@ -20,6 +22,11 @@ urlpatterns = [
         name="ai-sms-minor-outbound",
     ),
     path(
+        "conversations/<str:lookup>/",
+        SmsConversationDetailView.as_view(),
+        name="ai-sms-conversation-detail",
+    ),
+    path(
         "webhook/",
         SmsWebhookView.as_view(),
         name="ai-sms-webhook",
@@ -28,6 +35,11 @@ urlpatterns = [
         "agent-dial/answer/<str:chat_id>/",
         SmsAgentDialAnswerView.as_view(),
         name="ai-sms-agent-dial-answer",
+    ),
+    path(
+        "agent-dial/bridge-status/<str:chat_id>/",
+        SmsAgentDialBridgeStatusView.as_view(),
+        name="ai-sms-agent-dial-bridge-status",
     ),
     path(
         "agent-dial/status/<str:chat_id>/",
