@@ -3,7 +3,7 @@ import json
 import logging
 
 from django.conf import settings
-from django.db.models import CharField, Count, Exists, OuterRef, Prefetch, Q, Subquery, Value
+from django.db.models import CharField, Case, F, Count, Exists, OuterRef, Prefetch, When, Q, Subquery, Value
 from django.db.models.functions import Cast, Concat
 from django.utils import timezone
 
@@ -201,6 +201,7 @@ def get_call_queryset(
     patient_id="",
     retell_call_id="",
     exclude_queued=False,
+    ordering="",
 ):
     queryset = Call.objects.select_related("patient").all()
     if user is not None:
@@ -210,6 +211,7 @@ def get_call_queryset(
     statuses = _parse_status_list(status)
     patient_id = (patient_id or "").strip()
     retell_call_id = (retell_call_id or "").strip()
+    ordering = (ordering or "").strip().lower()
 
     if search:
         queryset = queryset.annotate(
@@ -256,6 +258,24 @@ def get_call_queryset(
         _schedule_kind=Subquery(open_outreach.values("kind")[:1]),
         _schedule_raw_time=Subquery(open_outreach.values("raw_time_text")[:1]),
     )
+
+    # Dial-queue UI order: scheduled (soonest) → paused → queued (oldest first).
+    if ordering in {"dial_queue", "queue", "scheduled_first"}:
+        queryset = queryset.annotate(
+            _dial_group=Case(
+                When(status=Call.Status.SCHEDULED, then=Value(0)),
+                When(status=Call.Status.PAUSED, then=Value(1)),
+                When(status=Call.Status.QUEUED, then=Value(2)),
+                default=Value(3),
+                output_field=IntegerField(),
+            ),
+        ).order_by(
+            "_dial_group",
+            F("_scheduled_at").asc(nulls_last=True),
+            "created_at",
+            "id",
+        )
+
     return queryset
 
 
@@ -767,6 +787,12 @@ def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
                 "ok": False,
                 "error": "Queued call not found.",
                 "status_code": 404,
+            }
+        if existing_call.status == Call.Status.CANCEL:
+            return {
+                "ok": False,
+                "error": "Call is cancelled.",
+                "status_code": 400,
             }
         if existing_call.status == Call.Status.PAUSED or existing_call.is_paused:
             return {

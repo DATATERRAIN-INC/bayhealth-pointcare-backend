@@ -124,6 +124,7 @@ class Call(models.Model):
         COMPLETED = "completed", "Completed"
         NOT_ATTENDED = "not_attended", "Not Attended"
         CALLBACK = "callback", "Callback"
+        CANCEL = "cancel", "Cancel"
 
     class Flow(models.TextChoices):
         OUTBOUND = "outbound", "Outbound"
