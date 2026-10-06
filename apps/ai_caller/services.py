@@ -78,9 +78,9 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
     ).prefetch_related(
         Prefetch(
             "calls",
-            queryset=Call.objects.filter(status=Call.Status.NOT_ATTENDED)
-            .order_by("-started_at", "-id")
-            .only("id", "started_at", "flow", "status", "retell_call_id", "patient_id"),
+            queryset=Call.objects.order_by("-started_at", "-id").only(
+                "id", "started_at", "flow", "status", "retell_call_id", "patient_id"
+            ),
             to_attr="_try_calls",
         )
     )
