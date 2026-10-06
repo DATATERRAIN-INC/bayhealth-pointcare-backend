@@ -171,9 +171,13 @@ def get_call_queryset(
     if statuses:
         queryset = queryset.filter(status__in=statuses)
     elif exclude_queued:
-        # List default: hide dial-queue rows (use ?status=queued,paused).
+        # List default: hide dial-queue / scheduled rows.
         queryset = queryset.exclude(
-            status__in=[Call.Status.QUEUED, Call.Status.PAUSED]
+            status__in=[
+                Call.Status.QUEUED,
+                Call.Status.SCHEDULED,
+                Call.Status.PAUSED,
+            ]
         )
     if patient_id:
         queryset = queryset.filter(patient_id=patient_id)
@@ -543,15 +547,15 @@ def _parse_retell_time(value):
 
 def _claim_queued_call(call, *, actor=None):
     """
-    Atomically move queued → in_progress BEFORE Retell dial.
-    Prevents Beat from redialing the same queued row while place is in flight.
+    Atomically move queued/scheduled → in_progress BEFORE Retell dial.
+    Prevents Beat from redialing the same row while place is in flight.
     Returns True if this worker claimed it.
     """
     if call is None:
         return False
     updated = Call.objects.filter(
         pk=call.pk,
-        status=Call.Status.QUEUED,
+        status__in=[Call.Status.QUEUED, Call.Status.SCHEDULED],
         is_paused=False,
     ).update(
         status=Call.Status.IN_PROGRESS,
@@ -566,14 +570,26 @@ def _claim_queued_call(call, *, actor=None):
     return False
 
 
+def _release_status_for_call(call) -> str:
+    """Restore queued vs scheduled after a failed claim."""
+    if call is None:
+        return Call.Status.QUEUED
+    has_outreach = ScheduledOutreach.objects.filter(
+        queued_call_id=call.pk,
+        status=ScheduledOutreach.Status.SCHEDULED,
+    ).exists()
+    return Call.Status.SCHEDULED if has_outreach else Call.Status.QUEUED
+
+
 def _release_claimed_call(call):
-    """Return a claimed call to queued if Retell place failed."""
+    """Return a claimed call to queued/scheduled if Retell place failed."""
     if call is None:
         return
+    restore = _release_status_for_call(call)
     Call.objects.filter(pk=call.pk, status=Call.Status.IN_PROGRESS).filter(
         Q(retell_call_id__isnull=True) | Q(retell_call_id="")
     ).update(
-        status=Call.Status.QUEUED,
+        status=restore,
         started_at=None,
         updated_at=timezone.now(),
     )
@@ -699,10 +715,13 @@ def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
                 "error": "Call is paused.",
                 "status_code": 400,
             }
-        if existing_call.status != Call.Status.QUEUED:
+        if existing_call.status not in {
+            Call.Status.QUEUED,
+            Call.Status.SCHEDULED,
+        }:
             return {
                 "ok": False,
-                "error": "Only queued calls can be dialed from the queue.",
+                "error": "Only queued or scheduled calls can be dialed.",
                 "status_code": 400,
             }
     else:

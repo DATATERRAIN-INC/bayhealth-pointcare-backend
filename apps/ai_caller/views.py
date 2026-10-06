@@ -124,8 +124,8 @@ class CallViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "put", "patch", "head", "options"]
 
     def get_queryset(self):
-        # Support one or many: ?status=queued or ?status=queued,paused
-        # or ?status=queued&status=paused
+        # Support one or many: ?status=queued|scheduled|paused
+        # e.g. ?status=queued,scheduled or ?status=queued&status=paused
         status_values = self.request.query_params.getlist("status")
         if not status_values:
             status_values = self.request.query_params.get("status", "")
@@ -164,15 +164,30 @@ class CallViewSet(viewsets.ModelViewSet):
         call = Call.objects.filter(pk=kwargs.get("pk"), user=request.user).first()
         if not call:
             return error_response("Call not found.", 404)
-        if call.status not in {Call.Status.QUEUED, Call.Status.PAUSED}:
+        if call.status not in {
+            Call.Status.QUEUED,
+            Call.Status.SCHEDULED,
+            Call.Status.PAUSED,
+        }:
             return error_response(
-                "Only queued or paused calls can be paused or resumed.", 400
+                "Only queued, scheduled, or paused calls can be paused or resumed.",
+                400,
             )
 
         serializer = CallPauseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         paused = bool(serializer.validated_data["paused"])
-        call.status = Call.Status.PAUSED if paused else Call.Status.QUEUED
+        if paused:
+            call.status = Call.Status.PAUSED
+        else:
+            # Resume to scheduled if linked to an open outreach, else ready-now queued.
+            has_outreach = ScheduledOutreach.objects.filter(
+                queued_call_id=call.pk,
+                status=ScheduledOutreach.Status.SCHEDULED,
+            ).exists()
+            call.status = (
+                Call.Status.SCHEDULED if has_outreach else Call.Status.QUEUED
+            )
         call.is_paused = paused
         call.updated_by = request.user
         call.save(update_fields=["status", "is_paused", "updated_by", "updated_at"])
@@ -188,13 +203,18 @@ class CallViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 "all": queryset.exclude(
-                    status__in=[Call.Status.QUEUED, Call.Status.PAUSED]
+                    status__in=[
+                        Call.Status.QUEUED,
+                        Call.Status.SCHEDULED,
+                        Call.Status.PAUSED,
+                    ]
                 ).count(),
                 "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
                 "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
                 "queued": queryset.filter(status=Call.Status.QUEUED).count(),
+                "scheduled": queryset.filter(status=Call.Status.SCHEDULED).count(),
                 "paused": queryset.filter(status=Call.Status.PAUSED).count(),
             }
         )

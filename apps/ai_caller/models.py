@@ -118,6 +118,7 @@ class Patient(models.Model):
 class Call(models.Model):
     class Status(models.TextChoices):
         QUEUED = "queued", "Queued"
+        SCHEDULED = "scheduled", "Scheduled"
         PAUSED = "paused", "Paused"
         IN_PROGRESS = "in_progress", "In Progress"
         COMPLETED = "completed", "Completed"

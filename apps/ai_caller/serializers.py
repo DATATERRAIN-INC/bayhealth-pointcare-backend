@@ -150,8 +150,7 @@ class PatientSerializer(serializers.ModelSerializer):
     def get_call_status(self, obj):
         """
         Current dial status for this patient:
-        in_progress > paused > queued > latest call status.
-        Queued only when a real Call with status=queued exists.
+        in_progress > paused > scheduled > queued > latest call status.
         """
         if getattr(obj, "_has_in_progress", None) or Call.objects.filter(
             patient=obj, status=Call.Status.IN_PROGRESS
@@ -159,6 +158,8 @@ class PatientSerializer(serializers.ModelSerializer):
             return Call.Status.IN_PROGRESS
         if Call.objects.filter(patient=obj, status=Call.Status.PAUSED).exists():
             return Call.Status.PAUSED
+        if Call.objects.filter(patient=obj, status=Call.Status.SCHEDULED).exists():
+            return Call.Status.SCHEDULED
         if Call.objects.filter(patient=obj, status=Call.Status.QUEUED).exists():
             return Call.Status.QUEUED
 
@@ -231,6 +232,7 @@ class PlaceOutboundCallSerializer(serializers.Serializer):
 
 class CallSerializer(serializers.ModelSerializer):
     patient_name = serializers.CharField(source="patient.full_name", read_only=True)
+    doctor = serializers.CharField(source="patient.doctor", read_only=True)
     # Same value set on patient create as service_name (why we are calling).
     reason = serializers.CharField(source="patient.service_name", read_only=True)
     duration_seconds = serializers.IntegerField(read_only=True)
@@ -246,6 +248,7 @@ class CallSerializer(serializers.ModelSerializer):
             "id",
             "patient",
             "patient_name",
+            "doctor",
             "reason",
             "retell_call_id",
             "flow",
