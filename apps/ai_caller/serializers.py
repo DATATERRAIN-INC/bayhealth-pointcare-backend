@@ -122,11 +122,11 @@ class PatientSerializer(serializers.ModelSerializer):
         return max(0, int((end - started_at).total_seconds()))
 
     def get_patient_tries(self, obj):
-        """Not-attended contact attempts: count + detail for each try."""
+        """All contact attempts for this patient: count + detail for each try."""
         calls = getattr(obj, "_try_calls", None)
         if calls is None:
             calls = (
-                Call.objects.filter(patient=obj, status=Call.Status.NOT_ATTENDED)
+                Call.objects.filter(patient=obj)
                 .order_by("-started_at", "-id")
                 .only("id", "started_at", "flow", "status", "retell_call_id")
             )
