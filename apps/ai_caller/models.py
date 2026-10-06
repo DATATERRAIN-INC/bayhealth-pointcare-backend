@@ -115,18 +115,6 @@ class Patient(models.Model):
         return f"{self.full_name} ({self.phone_number})"
 
 
-class CallQuerySet(models.QuerySet):
-    def delete(self):
-        """Soft-delete matching rows."""
-        updated = self.update(is_deleted=True)
-        return updated, {self.model._meta.label: updated}
-
-
-class AliveCallManager(models.Manager):
-    def get_queryset(self):
-        return CallQuerySet(self.model, using=self._db).filter(is_deleted=False)
-
-
 class Call(models.Model):
     class Status(models.TextChoices):
         QUEUED = "queued", "Queued"
@@ -136,6 +124,7 @@ class Call(models.Model):
         COMPLETED = "completed", "Completed"
         NOT_ATTENDED = "not_attended", "Not Attended"
         CALLBACK = "callback", "Callback"
+        CANCEL = "cancel", "Cancel"
 
     class Flow(models.TextChoices):
         OUTBOUND = "outbound", "Outbound"
@@ -179,10 +168,6 @@ class Call(models.Model):
         default=False,
         help_text="When true, Celery will not dial this queued call until resumed.",
     )
-    is_deleted = models.BooleanField(
-        default=False,
-        help_text="Soft delete. Hidden from API lists and dialer when true.",
-    )
     from_number = models.CharField(max_length=32, blank=True, default="")
     to_number = models.CharField(max_length=32, blank=True, default="")
     agent_id = models.CharField(max_length=120, blank=True, default="")
@@ -198,37 +183,11 @@ class Call(models.Model):
     created_at = models.DateTimeField(default=timezone.now, editable=False)
     updated_at = models.DateTimeField(auto_now=True)
 
-    objects = AliveCallManager()
-    all_objects = models.Manager()
-
     class Meta:
         ordering = ["-started_at", "-id"]
-        base_manager_name = "all_objects"
 
     def __str__(self):
         return f"Call #{self.id} ({self.status})"
-
-    def soft_delete(self, *, actor=None):
-        """Mark call deleted and cancel any open outreach that targets it."""
-        if self.is_deleted:
-            return
-        self.is_deleted = True
-        if actor is not None:
-            self.updated_by = actor
-            self.save(update_fields=["is_deleted", "updated_by", "updated_at"])
-        else:
-            self.save(update_fields=["is_deleted", "updated_at"])
-        ScheduledOutreach.objects.filter(
-            queued_call_id=self.pk,
-            status=ScheduledOutreach.Status.SCHEDULED,
-        ).update(
-            status=ScheduledOutreach.Status.CANCELLED,
-            error_message="Call soft-deleted",
-            updated_at=timezone.now(),
-        )
-
-    def delete(self, using=None, keep_parents=False):
-        self.soft_delete()
 
     @property
     def duration_seconds(self):

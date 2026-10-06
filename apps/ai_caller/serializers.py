@@ -245,7 +245,6 @@ class CallSerializer(serializers.ModelSerializer):
             "flow",
             "status",
             "is_paused",
-            "is_deleted",
             "from_number",
             "to_number",
             "agent_id",
@@ -300,7 +299,27 @@ class CallSerializer(serializers.ModelSerializer):
 
 
 class CallPauseSerializer(serializers.Serializer):
-    paused = serializers.BooleanField(required=True)
+    """
+    PUT body:
+      {"status": "paused"|"cancel"|"queued"|"scheduled"}
+    Also accepts legacy {"paused": true|false}.
+    """
+
+    status = serializers.ChoiceField(
+        choices=[
+            Call.Status.CANCEL,
+            Call.Status.PAUSED,
+            Call.Status.QUEUED,
+            Call.Status.SCHEDULED,
+        ],
+        required=False,
+    )
+    paused = serializers.BooleanField(required=False)
+
+    def validate(self, attrs):
+        if "status" not in attrs and "paused" not in attrs:
+            raise serializers.ValidationError("Provide status (or paused).")
+        return attrs
 
 
 class ScheduledOutreachSerializer(serializers.ModelSerializer):

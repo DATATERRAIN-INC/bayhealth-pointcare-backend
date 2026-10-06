@@ -1,4 +1,5 @@
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
@@ -121,10 +122,10 @@ class PatientViewSet(viewsets.ModelViewSet):
 class CallViewSet(viewsets.ModelViewSet):
     serializer_class = CallSerializer
     pagination_class = CommonPagination
-    http_method_names = ["get", "put", "patch", "delete", "head", "options"]
+    http_method_names = ["get", "put", "patch", "head", "options"]
 
     def get_queryset(self):
-        # Support one or many: ?status=queued|scheduled|paused
+        # Support one or many: ?status=queued|scheduled|paused|cancel
         # e.g. ?status=queued,scheduled or ?status=queued&status=paused
         status_values = self.request.query_params.getlist("status")
         if not status_values:
@@ -144,6 +145,7 @@ class CallViewSet(viewsets.ModelViewSet):
             patient_id=self.request.query_params.get("patient_id", ""),
             retell_call_id=self.request.query_params.get("retell_call_id", ""),
             exclude_queued=exclude_queued,
+            ordering=self.request.query_params.get("ordering", ""),
         )
 
     def list(self, request, *args, **kwargs):
@@ -158,9 +160,7 @@ class CallViewSet(viewsets.ModelViewSet):
         return super().list(request, *args, **kwargs)
 
     def update(self, request, *args, **kwargs):
-        """Pause / resume a dial-queue call (queued <-> paused)."""
-        # Look up by pk + user directly (do not use list queryset, which can
-        # exclude queue statuses and cause "No Call matches the given query.").
+        """Update dial-queue call status: paused / cancel / queued / scheduled."""
         call = Call.objects.filter(pk=kwargs.get("pk"), user=request.user).first()
         if not call:
             return error_response("Call not found.", 404)
@@ -170,25 +170,50 @@ class CallViewSet(viewsets.ModelViewSet):
             Call.Status.PAUSED,
         }:
             return error_response(
-                "Only queued, scheduled, or paused calls can be paused or resumed.",
+                "Only queued, scheduled, or paused calls can be updated.",
                 400,
             )
 
         serializer = CallPauseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        paused = bool(serializer.validated_data["paused"])
-        if paused:
+        data = serializer.validated_data
+        new_status = (data.get("status") or "").strip().lower()
+
+        # Legacy body: {"paused": true|false} → map to status.
+        if not new_status and "paused" in data:
+            new_status = (
+                Call.Status.PAUSED if data["paused"] else Call.Status.QUEUED
+            )
+
+        if new_status == Call.Status.CANCEL:
+            ScheduledOutreach.objects.filter(
+                queued_call_id=call.pk,
+                status=ScheduledOutreach.Status.SCHEDULED,
+            ).update(
+                status=ScheduledOutreach.Status.CANCELLED,
+                error_message="Call cancelled",
+                updated_at=timezone.now(),
+            )
+            call.status = Call.Status.CANCEL
+            call.is_paused = False
+        elif new_status == Call.Status.PAUSED:
             call.status = Call.Status.PAUSED
-        else:
-            # Resume to scheduled if linked to an open outreach, else ready-now queued.
+            call.is_paused = True
+        elif new_status in {Call.Status.QUEUED, Call.Status.SCHEDULED}:
+            # Resume. Prefer explicit status; if outreach is open and client
+            # sends queued, still keep scheduled so Celery waits for scheduled_at.
             has_outreach = ScheduledOutreach.objects.filter(
                 queued_call_id=call.pk,
                 status=ScheduledOutreach.Status.SCHEDULED,
             ).exists()
-            call.status = (
-                Call.Status.SCHEDULED if has_outreach else Call.Status.QUEUED
-            )
-        call.is_paused = paused
+            if has_outreach:
+                call.status = Call.Status.SCHEDULED
+            else:
+                call.status = Call.Status.QUEUED
+            call.is_paused = False
+        else:
+            return error_response("Invalid status.", 400)
+
         call.updated_by = request.user
         call.save(update_fields=["status", "is_paused", "updated_by", "updated_at"])
         return Response(CallSerializer(call).data)
@@ -196,18 +221,10 @@ class CallViewSet(viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         return self.update(request, *args, **kwargs)
 
-    def destroy(self, request, *args, **kwargs):
-        """Soft-delete a call (sets is_deleted=true)."""
-        call = Call.objects.filter(pk=kwargs.get("pk"), user=request.user).first()
-        if not call:
-            return error_response("Call not found.", 404)
-        call.soft_delete(actor=request.user)
-        return message_response("Call deleted successfully.")
-
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
         sync_in_progress_calls_from_retell(user=request.user, limit=25)
-        queryset = Call.objects.filter(user=request.user, is_deleted=False)
+        queryset = Call.objects.filter(user=request.user)
         return Response(
             {
                 "all": queryset.exclude(
@@ -224,6 +241,7 @@ class CallViewSet(viewsets.ModelViewSet):
                 "queued": queryset.filter(status=Call.Status.QUEUED).count(),
                 "scheduled": queryset.filter(status=Call.Status.SCHEDULED).count(),
                 "paused": queryset.filter(status=Call.Status.PAUSED).count(),
+                "cancel": queryset.filter(status=Call.Status.CANCEL).count(),
             }
         )
 
@@ -396,7 +414,7 @@ class RetellToolWebhookView(APIView):
                 callback_time = str(
                     data.get("callback_time") or data.get("time") or ""
                 ).strip()
-            call = Call.all_objects.filter(retell_call_id=call_id).first()
+            call = Call.objects.filter(retell_call_id=call_id).first()
             if not call:
                 return error_response("Call not found.", 404)
             _, error = schedule_callback_request(

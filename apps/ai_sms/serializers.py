@@ -19,17 +19,19 @@ class PlaceMinorSmsConversationSerializer(serializers.Serializer):
 
 
 class SmsConversationSerializer(serializers.ModelSerializer):
+    patient_id = serializers.IntegerField(source="patient.id", read_only=True, allow_null=True)
+
     class Meta:
         model = SmsConversation
         fields = [
-            "id",
             "chat_id",
+            "patient_id",
             "to_number",
             "from_number",
-            "name",
             "patient_name",
             "guardian_name",
             "clinic_name",
+            "provider_name",
             "service_name",
             "flow",
             "status",

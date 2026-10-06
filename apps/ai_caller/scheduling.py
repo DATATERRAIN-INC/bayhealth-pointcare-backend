@@ -510,6 +510,7 @@ def due_scheduled_outreaches(settings_obj, *, limit: int):
         )
         # Paused future dials stay scheduled but are not placed.
         .exclude(queued_call__status=Call.Status.PAUSED)
+        .exclude(queued_call__status=Call.Status.CANCEL)
         .exclude(queued_call__is_paused=True)
         .filter(
             Q(queued_call__isnull=True)
