@@ -104,6 +104,11 @@ RETELL_TRANSFER_NUMBER = os.getenv("RETELL_TRANSFER_NUMBER", "")
 RETELL_DENOISING_MODE = os.getenv("RETELL_DENOISING_MODE", "noise-cancellation")
 RETELL_INTERRUPTION_SENSITIVITY = os.getenv("RETELL_INTERRUPTION_SENSITIVITY", "0.6")
 RETELL_RESPONSIVENESS = os.getenv("RETELL_RESPONSIVENESS", "0.85")
+# Comma-separated Retell locales (do not use legacy "multi").
+RETELL_LANGUAGES = os.getenv(
+    "RETELL_LANGUAGES",
+    "en-US,es-ES,hi-IN,zh-CN,vi-VN",
+)
 AWS_S3_BASE_URL = os.getenv("AWS_S3_BASE_URL", "").rstrip("/")
 AWS_MEDIA_FOLDER = os.getenv("AWS_MEDIA_FOLDER", "bayhealth")
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
