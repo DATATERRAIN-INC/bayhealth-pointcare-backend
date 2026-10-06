@@ -245,7 +245,14 @@ class CallViewSet(viewsets.ModelViewSet):
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
                 "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
-                "queued": queryset.filter(status=Call.Status.QUEUED).count(),
+                # Waiting dial pool (ready-now + future scheduled + paused).
+                "queued": queryset.filter(
+                    status__in=[
+                        Call.Status.QUEUED,
+                        Call.Status.SCHEDULED,
+                        Call.Status.PAUSED,
+                    ]
+                ).count(),
                 "scheduled": queryset.filter(status=Call.Status.SCHEDULED).count(),
                 "paused": queryset.filter(status=Call.Status.PAUSED).count(),
                 "cancel": queryset.filter(status=Call.Status.CANCEL).count(),

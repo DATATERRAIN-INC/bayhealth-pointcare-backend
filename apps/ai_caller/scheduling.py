@@ -114,9 +114,11 @@ def _normalize_callback_time_text(raw: str) -> str:
     text = re.sub(r"\s+", " ", (raw or "").strip().lower())
     # Prefer the day+time clause if the tool passed a full sentence.
     m = re.search(
-        r"\b((?:today|tomorrow)\b.*|\bin\s+\d+\s*(?:hours?|hrs?|minutes?|mins?)\b.*|"
-        r"\d{1,2}(?::\d{2})?\s*[ap]\.?\s*m\.?\b.*|"
-        r"\d{4}-\d{2}-\d{2}[ t]\d{1,2}:\d{2}(?::\d{2})?)",
+        r"\b("
+        r"tomorrow\b.*|today\b.*|"
+        r"(?:in|after)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*days?\b.*|"
+        r"in\s+\d+\s*(?:hours?|hrs?|minutes?|mins?)\b.*"
+        r")",
         text,
     )
     if m:
@@ -171,6 +173,21 @@ def parse_callback_datetime(
             else timedelta(minutes=amount)
         )
         when = local_now + delta
+        return when.astimezone(dt_timezone.utc), ""
+
+    # Relative days: "in 2 days" / "2 days" (after "after" was stripped)
+    rel_days = re.match(r"^(?:in\s+)?(\d+)\s*days?$", lowered)
+    if rel_days:
+        amount = int(rel_days.group(1))
+        target_date = (local_now + timedelta(days=amount)).date()
+        when = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            10,
+            0,
+            tzinfo=tz,
+        )
         return when.astimezone(dt_timezone.utc), ""
 
     # tomorrow / today + optional clock
@@ -296,6 +313,7 @@ def extract_callback_time_from_transcript(transcript) -> str:
         m = re.search(
             r"\b("
             r"tomorrow\b.*|today\b.*|"
+            r"(?:in|after)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*days?\b.*|"
             r"in\s+\d+\s*(?:hours?|hrs?|minutes?|mins?)\b.*"
             r")",
             lowered,
@@ -309,7 +327,7 @@ def extract_callback_time_from_transcript(transcript) -> str:
 def maybe_schedule_callback_from_transcript(call: Call) -> Optional[ScheduledOutreach]:
     """
     Fallback when the Retell agent confirms a callback verbally but never
-    invokes log_callback_request.
+    invokes log_callback_request. Uses regex first, then OpenAI.
     """
     if not call or not call.patient_id:
         return None
@@ -322,26 +340,60 @@ def maybe_schedule_callback_from_transcript(call: Call) -> Optional[ScheduledOut
     ).exists():
         return None
 
-    raw = extract_callback_time_from_transcript(call.transcript or [])
+    transcript = call.transcript or call.retell_transcript or []
+    raw = extract_callback_time_from_transcript(transcript)
     if not raw:
         raw = extract_callback_time_from_transcript(call.retell_transcript or [])
-    if not raw:
-        return None
 
-    row, err = schedule_callback_request(call=call, raw_time_text=raw)
-    if err:
+    user = call.user or getattr(call.patient, "user", None)
+    settings_obj = CallerSettings.load(user) if user else None
+    tz_name = settings_obj.timezone if settings_obj else "America/New_York"
+
+    scheduled_at = None
+    err = ""
+    if raw:
+        scheduled_at, err = parse_callback_datetime(raw, timezone_name=tz_name)
+
+    if not scheduled_at:
+        from apps.ai_caller.callback_ai import openai_resolve_callback_datetime
+
+        scheduled_at, ai_raw, ai_err = openai_resolve_callback_datetime(
+            timezone_name=tz_name,
+            raw_text=raw,
+            transcript=transcript,
+        )
+        if scheduled_at:
+            raw = ai_raw or raw or "callback requested"
+            err = ""
+        else:
+            dialer_logger.warning(
+                "CALLBACK_TRANSCRIPT_FALLBACK_FAILED call_id=%s raw=%s err=%s ai_err=%s",
+                call.id,
+                (raw or "")[:120],
+                err,
+                ai_err,
+            )
+            return None
+
+    row, schedule_err = schedule_callback_request(
+        call=call,
+        raw_time_text=raw,
+        scheduled_at=scheduled_at,
+    )
+    if schedule_err:
         dialer_logger.warning(
             "CALLBACK_TRANSCRIPT_FALLBACK_FAILED call_id=%s raw=%s err=%s",
             call.id,
-            raw[:120],
-            err,
+            (raw or "")[:120],
+            schedule_err,
         )
         return None
     dialer_logger.info(
-        "CALLBACK_TRANSCRIPT_FALLBACK call_id=%s outreach_id=%s raw=%s",
+        "CALLBACK_TRANSCRIPT_FALLBACK call_id=%s outreach_id=%s raw=%s scheduled_at=%s",
         call.id,
         getattr(row, "id", None),
-        raw[:120],
+        (raw or "")[:120],
+        scheduled_at.isoformat() if scheduled_at else "",
     )
     return row
 
@@ -350,8 +402,9 @@ def schedule_callback_request(
     *,
     call: Call,
     raw_time_text: str,
+    scheduled_at: Optional[datetime] = None,
 ) -> Tuple[Optional[ScheduledOutreach], Optional[str]]:
-    """Create a patient-requested callback row from a Retell tool call."""
+    """Create a patient-requested callback row from a Retell tool call or AI parse."""
     patient = call.patient
     if not patient:
         return None, "Call has no patient."
@@ -360,11 +413,21 @@ def schedule_callback_request(
     settings_obj = CallerSettings.load(user) if user else None
     tz_name = settings_obj.timezone if settings_obj else "America/New_York"
 
-    scheduled_at, err = parse_callback_datetime(
-        raw_time_text, timezone_name=tz_name
-    )
-    if err or not scheduled_at:
-        return None, err or "Invalid callback time."
+    if scheduled_at is None:
+        scheduled_at, err = parse_callback_datetime(
+            raw_time_text, timezone_name=tz_name
+        )
+        if err or not scheduled_at:
+            from apps.ai_caller.callback_ai import openai_resolve_callback_datetime
+
+            scheduled_at, ai_raw, ai_err = openai_resolve_callback_datetime(
+                timezone_name=tz_name,
+                raw_text=raw_time_text,
+            )
+            if scheduled_at:
+                raw_time_text = ai_raw or raw_time_text
+            else:
+                return None, err or ai_err or "Invalid callback time."
 
     # Patient callback wins over system reminders.
     cancel_scheduled_for_patient(
