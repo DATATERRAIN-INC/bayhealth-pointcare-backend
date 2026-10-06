@@ -25,7 +25,9 @@ from django.conf import settings
 from apps.ai_caller.retell import _digits, normalize_phone
 from apps.ai_caller.transcript_merge import (
     save_humans_transcript_for_call,
+    transcribe_mix_with_diarization,
     transcribe_recording_bytes,
+    transcribe_recording_detailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -415,6 +417,8 @@ def start_leg_recording(session: Dict[str, Any], call_sid: str, leg: str) -> Non
     if client is None:
         return
     session[f"{leg}_recording_started"] = True
+    # Wall-clock anchor so patient/provider segment times can be interleaved.
+    session[f"{leg}_recording_started_at"] = time.time()
     save_session(session)
     try:
         rec = client.calls(call_sid).recordings.create(
@@ -589,6 +593,15 @@ def _combined_speaker_transcript(patient: str, provider: str) -> str:
     return "\n\n".join(parts)
 
 
+def _recording_offset(session: Dict[str, Any], leg: str) -> float:
+    """Seconds since epoch when that leg's inbound recording started."""
+    raw = session.get(f"{leg}_recording_started_at")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _persist_to_db(session: Dict[str, Any]) -> None:
     """Write humans STT into Call and merge with AI transcript."""
     session = dict(session or {})
@@ -598,13 +611,20 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
     patient = str(session.get("patient_transcript") or "")
     provider = str(session.get("provider_transcript") or "")
     mix = ""
-    if not patient and not provider:
+    mix_items = session.get("mix_diarized_items") or None
+    if not patient and not provider and not mix_items:
         mix = str(session.get("humans_transcript") or "")
     recording_url = (
         str(session.get("patient_recording_url") or "")
         or str(session.get("provider_recording_url") or "")
         or str(session.get("mix_recording_url") or "")
     )
+    patient_offset = _recording_offset(session, "patient")
+    provider_offset = _recording_offset(session, "provider")
+    # If one leg has no wall-clock, keep relative-only merge (both 0).
+    if not patient_offset or not provider_offset:
+        patient_offset = 0.0
+        provider_offset = 0.0
     try:
         save_humans_transcript_for_call(
             retell_call_id=retell_call_id,
@@ -613,6 +633,11 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
             mix_text=mix,
             recording_url=recording_url,
             session_id=str(session.get("session_id") or ""),
+            patient_segments=session.get("patient_segments") or [],
+            provider_segments=session.get("provider_segments") or [],
+            patient_offset=patient_offset,
+            provider_offset=provider_offset,
+            mix_items=mix_items if isinstance(mix_items, list) else None,
         )
     except Exception:
         logger.exception(
@@ -636,21 +661,34 @@ def _persist_mix_transcript(
         return session
     time.sleep(4)
     audio = _download_twilio_recording(recording_url)
-    text = transcribe_recording_bytes(audio, filename="mix.wav") if audio else ""
+    diarized_items = (
+        transcribe_mix_with_diarization(audio, filename="mix.wav") if audio else []
+    )
+    text = ""
+    if diarized_items:
+        session["mix_diarized_items"] = diarized_items
+        text = " ".join(
+            str(item.get("text") or "").strip()
+            for item in diarized_items
+            if str(item.get("text") or "").strip()
+        )
+    elif audio:
+        text = transcribe_recording_bytes(audio, filename="mix.wav")
     session["humans_transcript"] = text
     session["mix_recording_url"] = recording_url
     session["mix_recording_sid"] = recording_sid
     session["mix_saved"] = True
-    session["humans_saved"] = bool((text or "").strip())
+    session["humans_saved"] = bool(diarized_items or (text or "").strip())
     session["call_status"] = "ended"
     save_session(session)
     if session["humans_saved"]:
         _persist_to_db(session)
         restore_inbound_voice_url(session)
     logger.info(
-        "Saved mixed humans transcript session=%s chars=%s",
+        "Saved mixed humans transcript session=%s chars=%s diarized_turns=%s",
         session_id,
         len(text or ""),
+        len(diarized_items or []),
     )
     return session
 
@@ -676,38 +714,52 @@ def persist_humans_transcript(
         logger.info("Skipping unlabeled warm-transfer recording session=%s", session_id)
         return session
     if session.get(f"{speaker}_stt_started") or session.get(f"{speaker}_transcript"):
-        if session.get("patient_transcript") and session.get("provider_transcript"):
-            session["humans_saved"] = True
+        patient = str(session.get("patient_transcript") or "")
+        provider = str(session.get("provider_transcript") or "")
+        if patient or provider:
+            session["humans_saved"] = bool(patient and provider)
             save_session(session)
             _persist_to_db(session)
-            restore_inbound_voice_url(session)
+            if patient and provider:
+                restore_inbound_voice_url(session)
         return session
     session[f"{speaker}_stt_started"] = True
     save_session(session)
     time.sleep(4)
     audio = _download_twilio_recording(recording_url)
-    text = transcribe_recording_bytes(audio, filename=f"{speaker}.wav") if audio else ""
+    detailed = (
+        transcribe_recording_detailed(audio, filename=f"{speaker}.wav")
+        if audio
+        else {"text": "", "segments": []}
+    )
+    text = str(detailed.get("text") or "")
+    segments = detailed.get("segments") or []
     session[f"{speaker}_transcript"] = text
+    session[f"{speaker}_segments"] = segments
     session[f"{speaker}_recording_url"] = recording_url
     session[f"{speaker}_recording_sid"] = recording_sid
     session[f"{speaker}_saved"] = True
     patient = str(session.get("patient_transcript") or "")
     provider = str(session.get("provider_transcript") or "")
     session["humans_transcript"] = _combined_speaker_transcript(patient, provider)
-    session["humans_saved"] = bool(patient and provider)
-    session["call_status"] = (
-        "ended" if session["humans_saved"] else session.get("call_status") or "ended"
+    both_ready = bool(patient and provider)
+    # Persist as soon as any leg has text; refresh again when the second arrives.
+    session["humans_saved"] = both_ready
+    session["call_status"] = "ended" if both_ready else (
+        session.get("call_status") or "ended"
     )
     save_session(session)
-    if session["humans_saved"]:
+    if patient or provider:
         _persist_to_db(session)
+    if both_ready:
         restore_inbound_voice_url(session)
     logger.info(
-        "Saved %s transcript session=%s chars=%s both=%s",
+        "Saved %s transcript session=%s chars=%s segments=%s both=%s",
         speaker,
         session_id,
         len(text),
-        session["humans_saved"],
+        len(segments),
+        both_ready,
     )
     return session
 
