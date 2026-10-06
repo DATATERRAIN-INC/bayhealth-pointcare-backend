@@ -76,7 +76,7 @@ def _is_transfer_reply(reply: str) -> bool:
 def agent_answer_twiml(conversation: SmsConversation) -> str:
     """When the live agent answers: whisper context, then dial/bridge the patient."""
     patient = (
-        (conversation.patient_name or conversation.name or "").strip() or "a patient"
+        (conversation.patient_name or "").strip() or "a patient"
     )
     service = (conversation.service_name or "").strip() or "care"
     patient_phone = (conversation.to_number or "").strip()

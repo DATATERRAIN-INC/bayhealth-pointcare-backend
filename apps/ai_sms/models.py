@@ -3,9 +3,15 @@ from django.db import models
 
 class SmsConversation(models.Model):
     chat_id = models.CharField(max_length=128, unique=True)
+    patient = models.ForeignKey(
+        "ai_caller.Patient",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="sms_conversations",
+    )
     to_number = models.CharField(max_length=32, db_index=True)
     from_number = models.CharField(max_length=32)
-    name = models.CharField(max_length=120, blank=True)
     patient_name = models.CharField(max_length=120, blank=True)
     guardian_name = models.CharField(max_length=120, blank=True)
     clinic_name = models.CharField(max_length=200, blank=True)

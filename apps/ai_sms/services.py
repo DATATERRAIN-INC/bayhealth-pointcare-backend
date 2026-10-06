@@ -1033,7 +1033,7 @@ def _openai_conversational_reply(conversation, text: str) -> str:
         service = variables.get("measure") or ""
         clinic = variables.get("clinic") or _CLINIC_NAME
     else:
-        patient = (conversation.patient_name or conversation.name or "").strip()
+        patient = (conversation.patient_name or "").strip()
         service = (conversation.service_name or "").strip()
         clinic = _CLINIC_NAME
 
@@ -1367,15 +1367,17 @@ def start_sms_conversation_for_patient(
 
     full_name = patient.full_name
     service = (patient.service_name or "").strip() or "care"
+    provider = (patient.doctor or "").strip()
     result = start_sms_conversation(
         phone_number=dial_number,
-        name=full_name,
         patient_name=full_name,
         service_name=service,
+        provider_name=provider,
         agent_id=agent_id,
         transfer_number=numbers[0],
         transfer_numbers=numbers,
         webhook_url=webhook_url,
+        patient=patient,
     )
     if result.get("ok"):
         result["patient_id"] = patient.id
@@ -1408,16 +1410,18 @@ def start_minor_sms_conversation_for_patient(
 
     full_name = patient.full_name
     service = (patient.service_name or "").strip() or "care"
+    provider = (patient.doctor or "").strip()
     result = start_minor_sms_conversation(
         phone_number=dial_number,
         patient_name=full_name,
         measure_name=service,
         service_name=service,
         clinic_name=_CLINIC_NAME,
-        provider_name=(patient.doctor or "").strip(),
+        provider_name=provider,
         transfer_number=numbers[0],
         transfer_numbers=numbers,
         webhook_url=webhook_url,
+        patient=patient,
     )
     if result.get("ok"):
         result["patient_id"] = patient.id
@@ -1429,14 +1433,15 @@ def start_minor_sms_conversation_for_patient(
 def start_sms_conversation(
     *,
     phone_number: str,
-    name: str = "",
     patient_name: str = "",
     service_name: str = "",
+    provider_name: str = "",
     agent_id: str = "",
     transfer_number: str = "",
     transfer_numbers: Optional[List[str]] = None,
     webhook_url: str = "",
     require_transfer: bool = True,
+    patient: Optional[Patient] = None,
 ) -> Dict[str, Any]:
     _sid, _token, from_number, twilio_err = _twilio_ready()
     if twilio_err:
@@ -1469,9 +1474,16 @@ def start_sms_conversation(
     if not chat_agent_id:
         return {"ok": False, "error": chat_err, "status_code": 502}
 
+    provider = (provider_name or "").strip()
     variables = _dynamic_variables(
-        name, patient_name, service_name, transfer_number=transfer
+        provider,
+        patient_name,
+        service_name,
+        transfer_number=transfer,
     )
+    # Keep Retell {{name}} as patient first name for greeting templates.
+    variables["name"] = variables["patient_name"]
+    variables["provider_name"] = provider or variables.get("provider_name") or _PROVIDER_NAME
     status_code, parsed, err = _retell_request(
         "POST",
         "/create-chat",
@@ -1490,7 +1502,7 @@ def start_sms_conversation(
 
     greeting = _fill(
         _sms_greeting(),
-        variables["name"],
+        variables["patient_name"],
         variables["patient_name"],
         variables["service_name"],
     )
@@ -1501,10 +1513,11 @@ def start_sms_conversation(
     SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
     SmsConversation.objects.create(
         chat_id=chat_id,
+        patient=patient,
         to_number=phone,
         from_number=from_number,
-        name=variables["name"],
         patient_name=variables["patient_name"],
+        provider_name=provider,
         service_name=variables["service_name"],
         transfer_number=transfer,
         transfer_numbers=numbers,
@@ -1540,6 +1553,7 @@ def start_minor_sms_conversation(
     transfer_number: str = "",
     transfer_numbers: Optional[List[str]] = None,
     webhook_url: str = "",
+    patient: Optional[Patient] = None,
 ) -> Dict[str, Any]:
     _sid, _token, _adult_from, twilio_err = _twilio_ready()
     if twilio_err:
@@ -1566,16 +1580,17 @@ def start_minor_sms_conversation(
         numbers = [transfer] if transfer else []
 
     measure = (measure_name or "").strip() or (service_name or "").strip() or "care"
-    patient = (patient_name or "").strip()
-    conversation = SmsConversation(
-        patient_name=patient,
+    patient_label = (patient_name or "").strip()
+    provider = (provider_name or "").strip()
+    draft = SmsConversation(
+        patient_name=patient_label,
         service_name=measure,
         clinic_name=_CLINIC_NAME,
-        provider_name=(provider_name or "").strip(),
+        provider_name=provider,
         transfer_number=transfer,
         transfer_numbers=numbers,
     )
-    greeting = _minor_greeting(_minor_variables(conversation))
+    greeting = _minor_greeting(_minor_variables(draft))
     message_sid, sms_err = send_twilio_sms(phone, greeting, from_number)
     if sms_err:
         return {"ok": False, "error": sms_err, "status_code": 502}
@@ -1584,16 +1599,16 @@ def start_minor_sms_conversation(
     SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
     SmsConversation.objects.create(
         chat_id=chat_id,
+        patient=patient,
         to_number=phone,
         from_number=from_number,
-        name="",
-        patient_name=patient,
+        patient_name=patient_label,
         guardian_name="",
         service_name=measure,
         clinic_name=_CLINIC_NAME,
         appointment_date="",
         appointment_time="",
-        provider_name=(provider_name or "").strip(),
+        provider_name=provider,
         transfer_number=transfer,
         transfer_numbers=numbers,
         transfer_number_index=0,
@@ -1630,7 +1645,6 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
     if conversation is None:
         started = start_sms_conversation(
             phone_number=phone,
-            name="",
             patient_name="",
             service_name="",
             require_transfer=False,
@@ -1649,12 +1663,14 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
         scripted = _minor_scripted_reply(conversation, text)
     else:
         variables = _dynamic_variables(
-            conversation.name,
+            conversation.patient_name,
             conversation.patient_name,
             conversation.service_name,
             conversation.transcript,
             conversation.transfer_number,
         )
+        if conversation.provider_name:
+            variables["provider_name"] = conversation.provider_name
         scripted = _scripted_reply(conversation, text, variables)
     if scripted is not None:
         if message_sid:
@@ -1674,12 +1690,14 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
     reply = _openai_conversational_reply(conversation, text)
     if not reply and not str(conversation.chat_id or "").startswith("minor-"):
         variables = _dynamic_variables(
-            conversation.name,
+            conversation.patient_name,
             conversation.patient_name,
             conversation.service_name,
             conversation.transcript,
             conversation.transfer_number,
         )
+        if conversation.provider_name:
+            variables["provider_name"] = conversation.provider_name
         _retell_request(
             "PATCH",
             f"/update-chat/{conversation.chat_id}",
