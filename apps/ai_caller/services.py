@@ -1124,7 +1124,17 @@ def update_call_from_retell_payload(payload):
         call.started_at = started_at
     if ended_at:
         call.ended_at = ended_at
-    elif call.status in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED} and not call.ended_at:
+    elif not call.ended_at and (
+        call.status in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED}
+        or (
+            call.status == Call.Status.CALLBACK
+            and (
+                event.lower() in {"call_ended", "call_analyzed"}
+                or mapped_status
+                in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED}
+            )
+        )
+    ):
         call.ended_at = timezone.now()
 
     transcript = (
@@ -1225,11 +1235,46 @@ def sync_call_transcript(call):
 def sync_in_progress_calls_from_retell(*, user=None, limit=25):
     """
     Fallback when Retell webhooks are missing/misconfigured:
-    pull latest status for recent in_progress rows from Retell get-call.
+    - refresh in_progress rows from Retell get-call
+    - backfill transcript for callback/completed/not_attended rows that still
+      have none (callback is set mid-call via tool, so webhook sync used to skip them)
     """
-    qs = Call.objects.filter(status=Call.Status.IN_PROGRESS).order_by("-started_at")
+    from datetime import timedelta
+
+    from django.db.models import Case, IntegerField, Q, When
+
+    base = Call.objects.filter(retell_call_id__isnull=False).exclude(retell_call_id="")
     if user is not None:
-        qs = qs.filter(user=user)
+        base = base.filter(user=user)
+
+    # Avoid endlessly re-polling ancient empty rows.
+    recent_cutoff = timezone.now() - timedelta(days=7)
+    missing_transcript = Q(transcript=[]) | Q(transcript__isnull=True)
+    qs = (
+        base.filter(
+            Q(status=Call.Status.IN_PROGRESS)
+            | (
+                Q(
+                    status__in=[
+                        Call.Status.CALLBACK,
+                        Call.Status.COMPLETED,
+                        Call.Status.NOT_ATTENDED,
+                    ]
+                )
+                & missing_transcript
+                & Q(started_at__gte=recent_cutoff)
+            )
+        )
+        .annotate(
+            _sync_priority=Case(
+                When(status=Call.Status.IN_PROGRESS, then=0),
+                When(status=Call.Status.CALLBACK, then=1),
+                default=2,
+                output_field=IntegerField(),
+            )
+        )
+        .order_by("_sync_priority", "-started_at", "-id")
+    )
     synced = 0
     for call in qs[: max(1, int(limit))]:
         try:
@@ -1238,8 +1283,9 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
                 synced += 1
         except Exception:
             dialer_logger.exception(
-                "Failed syncing in_progress call id=%s retell=%s",
+                "Failed syncing call id=%s status=%s retell=%s",
                 call.id,
+                call.status,
                 call.retell_call_id,
             )
     return synced
