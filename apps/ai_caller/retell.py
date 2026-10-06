@@ -288,9 +288,27 @@ def _responsiveness() -> float:
     return max(0.0, min(1.0, value))
 
 
+def _agent_languages():
+    """
+    Explicit Retell locale list (preferred over legacy language="multi").
+
+    Set RETELL_LANGUAGES as comma-separated locales, e.g.:
+      en-US,es-ES,hi-IN,vi-VN,zh-CN,yue-CN,fil-PH,ko-KR,ar-SA,pt-PT
+    """
+    # Required BayHealth languages only (ASR-compatible on Retell).
+    default = "en-US,es-ES,hi-IN,zh-CN,vi-VN"
+    raw = (getattr(settings, "RETELL_LANGUAGES", "") or "").strip() or default
+    languages = []
+    for part in raw.split(","):
+        code = part.strip()
+        if code and code not in languages and code != "multi":
+            languages.append(code)
+    return languages or ["en-US"]
+
+
 def _agent_call_settings() -> Dict[str, Any]:
     return {
-        "language": "multi",
+        "language": _agent_languages(),
         "begin_message_delay_ms": 1000,
         "denoising_mode": _denoising_mode(),
         "interruption_sensitivity": _interruption_sensitivity(),
