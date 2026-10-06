@@ -82,6 +82,7 @@ def get_call_queryset(
     status="",
     patient_id="",
     retell_call_id="",
+    exclude_queued=False,
 ):
     queryset = Call.objects.select_related("patient").all()
     if user is not None:
@@ -110,10 +111,11 @@ def get_call_queryset(
         queryset = queryset.filter(patient__source=source)
     if status and status != "all":
         queryset = queryset.filter(status=status)
-    else:
-        # Default list excludes queued (use ?status=queued for the dial queue).
-        if not status:
-            queryset = queryset.exclude(status=Call.Status.QUEUED)
+    elif exclude_queued:
+        # List default: hide dial-queue rows (use ?status=queued|paused).
+        queryset = queryset.exclude(
+            status__in=[Call.Status.QUEUED, Call.Status.PAUSED]
+        )
     if patient_id:
         queryset = queryset.filter(patient_id=patient_id)
     if retell_call_id:
@@ -618,16 +620,16 @@ def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
                 "error": "Queued call not found.",
                 "status_code": 404,
             }
+        if existing_call.status == Call.Status.PAUSED or existing_call.is_paused:
+            return {
+                "ok": False,
+                "error": "Call is paused.",
+                "status_code": 400,
+            }
         if existing_call.status != Call.Status.QUEUED:
             return {
                 "ok": False,
                 "error": "Only queued calls can be dialed from the queue.",
-                "status_code": 400,
-            }
-        if existing_call.is_paused:
-            return {
-                "ok": False,
-                "error": "Call is paused.",
                 "status_code": 400,
             }
     else:

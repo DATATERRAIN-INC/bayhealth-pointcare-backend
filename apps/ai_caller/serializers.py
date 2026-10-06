@@ -61,18 +61,37 @@ class PatientSerializer(serializers.ModelSerializer):
     def get_call_status(self, obj):
         """
         Current dial status for this patient:
-        in_progress > latest call status > queued if open queued call > null if blocked.
+        in_progress > paused > queued > latest call status > null if blocked.
         """
         if getattr(obj, "_has_in_progress", None):
             return Call.Status.IN_PROGRESS
         annotated = getattr(obj, "_latest_call_status", None)
+        if annotated in {
+            Call.Status.IN_PROGRESS,
+            Call.Status.PAUSED,
+            Call.Status.QUEUED,
+        }:
+            return annotated
         if annotated:
+            # Prefer open dial-queue rows over older completed/not_attended.
+            if Call.objects.filter(
+                patient=obj, status=Call.Status.PAUSED
+            ).exists():
+                return Call.Status.PAUSED
+            if Call.objects.filter(
+                patient=obj, status=Call.Status.QUEUED
+            ).exists():
+                return Call.Status.QUEUED
             return annotated
         if getattr(obj, "_has_in_progress", None) is False and annotated is None:
             return None if obj.is_blocked else Call.Status.QUEUED
 
         if Call.objects.filter(patient=obj, status=Call.Status.IN_PROGRESS).exists():
             return Call.Status.IN_PROGRESS
+        if Call.objects.filter(patient=obj, status=Call.Status.PAUSED).exists():
+            return Call.Status.PAUSED
+        if Call.objects.filter(patient=obj, status=Call.Status.QUEUED).exists():
+            return Call.Status.QUEUED
         latest = (
             Call.objects.filter(patient=obj)
             .order_by("-started_at", "-id")
@@ -81,8 +100,6 @@ class PatientSerializer(serializers.ModelSerializer):
         )
         if latest:
             return latest
-        if Call.objects.filter(patient=obj, status=Call.Status.QUEUED).exists():
-            return Call.Status.QUEUED
         return None if obj.is_blocked else Call.Status.QUEUED
 
     def to_representation(self, instance):
