@@ -2,8 +2,17 @@ from datetime import date, datetime, time, timedelta
 import logging
 
 from django.conf import settings
-from django.db.models import CharField, Exists, OuterRef, Q, Subquery, Value
-from django.db.models.functions import Cast, Concat
+from django.db.models import (
+    CharField,
+    Count,
+    Exists,
+    IntegerField,
+    OuterRef,
+    Q,
+    Subquery,
+    Value,
+)
+from django.db.models.functions import Cast, Coalesce, Concat
 from django.utils import timezone
 
 from apps.ai_caller.models import (
@@ -66,6 +75,16 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
     has_in_progress = Call.objects.filter(
         patient_id=OuterRef("pk"), status=Call.Status.IN_PROGRESS
     )
+    not_attended_tries = (
+        Call.objects.filter(
+            patient_id=OuterRef("pk"),
+            status=Call.Status.NOT_ATTENDED,
+        )
+        .order_by()
+        .values("patient_id")
+        .annotate(c=Count("id"))
+        .values("c")[:1]
+    )
     return queryset.annotate(
         _latest_call_status=Subquery(latest_call.values("status")[:1]),
         _latest_call_id=Subquery(latest_call.values("id")[:1]),
@@ -73,6 +92,10 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
         _latest_call_started_at=Subquery(latest_call.values("started_at")[:1]),
         _latest_call_ended_at=Subquery(latest_call.values("ended_at")[:1]),
         _has_in_progress=Exists(has_in_progress),
+        _patient_tries=Coalesce(
+            Subquery(not_attended_tries, output_field=IntegerField()),
+            Value(0),
+        ),
     )
 
 
