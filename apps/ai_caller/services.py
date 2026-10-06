@@ -3,7 +3,20 @@ import json
 import logging
 
 from django.conf import settings
-from django.db.models import CharField, Case, F, Count, Exists, OuterRef, Prefetch, When, Q, Subquery, Value
+from django.db.models import (
+    Case,
+    CharField,
+    Count,
+    Exists,
+    F,
+    IntegerField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Value,
+    When,
+)
 from django.db.models.functions import Cast, Concat
 from django.utils import timezone
 
@@ -1374,9 +1387,36 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         )
         return payload
 
-    max_per_run = max(1, int(settings_obj.max_calls_per_run or 1))
-    due_queue = due_scheduled_outreaches(settings_obj, limit=max_per_run)
-    remaining = max(0, max_per_run - len(due_queue))
+    max_concurrent = max(1, int(settings_obj.max_calls_per_run or 1))
+    in_progress_count = Call.objects.filter(
+        user=settings_obj.user,
+        status=Call.Status.IN_PROGRESS,
+    ).count()
+    slots_free = max(0, max_concurrent - in_progress_count)
+
+    if slots_free <= 0:
+        dialer_logger.info(
+            "NOT_TRIGGERED user_id=%s email=%s reason=concurrent_slots_full "
+            "in_progress=%s max_calls_per_run=%s",
+            user_id,
+            email,
+            in_progress_count,
+            max_concurrent,
+        )
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "concurrent_slots_full",
+            "placed": 0,
+            "failed": 0,
+            "user_id": user_id,
+            "in_progress": in_progress_count,
+            "max_calls_per_run": max_concurrent,
+            "slots_free": 0,
+        }
+
+    due_queue = due_scheduled_outreaches(settings_obj, limit=slots_free)
+    remaining = max(0, slots_free - len(due_queue))
     queued_calls = (
         queued_calls_due_for_outbound(settings_obj, limit=remaining) if remaining else []
     )
@@ -1388,12 +1428,15 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         ).count()
         dialer_logger.info(
             "NOT_TRIGGERED user_id=%s email=%s reason=no_eligible_patients "
-            "total_patients=%s blocked=%s max_calls_per_run=%s",
+            "total_patients=%s blocked=%s max_calls_per_run=%s "
+            "in_progress=%s slots_free=%s",
             user_id,
             email,
             total,
             blocked,
-            settings_obj.max_calls_per_run,
+            max_concurrent,
+            in_progress_count,
+            slots_free,
         )
         return {
             "ok": True,
@@ -1404,6 +1447,8 @@ def _run_scheduled_outbound_for_settings(settings_obj):
             "results": [],
             "user_id": user_id,
             "reason": "no_eligible_patients",
+            "in_progress": in_progress_count,
+            "slots_free": slots_free,
         }
 
     placed = 0
@@ -1501,6 +1546,9 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         "attempted": len(due_queue) + len(queued_calls),
         "results": results,
         "user_id": user_id,
+        "in_progress": in_progress_count,
+        "slots_free": slots_free,
+        "max_calls_per_run": max_concurrent,
     }
     if due_queue or queued_calls:
         from apps.notifications.services import notify_outbound_batch
