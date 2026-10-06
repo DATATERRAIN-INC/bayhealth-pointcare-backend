@@ -37,7 +37,65 @@ from common.s3 import upload_bytes
 dialer_logger = logging.getLogger("ai_caller.dialer")
 
 
-def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, upload_id=""):
+def _patient_has_call_status(*statuses):
+    return Exists(
+        Call.objects.filter(patient_id=OuterRef("pk"), status__in=list(statuses))
+    )
+
+
+def _filter_patients_by_call_status(queryset, call_status):
+    """
+    Filter patients by effective call_status (same priority as PatientSerializer):
+    in_progress > paused > scheduled > queued > latest call status.
+    """
+    statuses = _parse_status_list(call_status)
+    if not statuses or "all" in statuses:
+        return queryset
+
+    allowed = {choice for choice, _label in Call.Status.choices}
+    statuses = [s for s in statuses if s in allowed]
+    if not statuses:
+        return queryset.none()
+
+    has_in_progress = _patient_has_call_status(Call.Status.IN_PROGRESS)
+    has_paused = _patient_has_call_status(Call.Status.PAUSED)
+    has_scheduled = _patient_has_call_status(Call.Status.SCHEDULED)
+    has_queued = _patient_has_call_status(Call.Status.QUEUED)
+    has_open_dial = _patient_has_call_status(
+        Call.Status.IN_PROGRESS,
+        Call.Status.PAUSED,
+        Call.Status.SCHEDULED,
+        Call.Status.QUEUED,
+    )
+
+    match = Q()
+    for status in statuses:
+        if status == Call.Status.IN_PROGRESS:
+            match |= Q(_has_in_progress=True) | has_in_progress
+        elif status == Call.Status.PAUSED:
+            match |= has_paused & ~has_in_progress
+        elif status == Call.Status.SCHEDULED:
+            match |= has_scheduled & ~has_in_progress & ~has_paused
+        elif status == Call.Status.QUEUED:
+            match |= has_queued & ~has_in_progress & ~has_paused & ~has_scheduled
+        else:
+            # completed / not_attended / callback — latest status, no open dial row
+            match |= (
+                Q(_latest_call_status=status)
+                & ~has_open_dial
+            )
+    return queryset.filter(match)
+
+
+def get_patient_queryset(
+    *,
+    user=None,
+    search="",
+    source="",
+    is_blocked=None,
+    upload_id="",
+    call_status="",
+):
     queryset = Patient.objects.all()
     if user is not None:
         queryset = queryset.filter(user=user)
@@ -68,7 +126,7 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
     has_in_progress = Call.objects.filter(
         patient_id=OuterRef("pk"), status=Call.Status.IN_PROGRESS
     )
-    return queryset.annotate(
+    queryset = queryset.annotate(
         _latest_call_status=Subquery(latest_call.values("status")[:1]),
         _latest_call_id=Subquery(latest_call.values("id")[:1]),
         _latest_retell_call_id=Subquery(latest_call.values("retell_call_id")[:1]),
@@ -84,6 +142,7 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
             to_attr="_try_calls",
         )
     )
+    return _filter_patients_by_call_status(queryset, call_status)
 
 
 def _parse_status_list(status):
