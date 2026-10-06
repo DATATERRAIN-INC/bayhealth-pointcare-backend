@@ -1,5 +1,6 @@
 from datetime import date
 
+from django.db.models import Q
 from rest_framework import serializers
 
 from apps.ai_caller.constants import ALLOWED_UPLOAD_EXTENSIONS
@@ -61,46 +62,28 @@ class PatientSerializer(serializers.ModelSerializer):
     def get_call_status(self, obj):
         """
         Current dial status for this patient:
-        in_progress > paused > queued > latest call status > null if blocked.
+        in_progress > paused > queued > latest call status.
+        Queued only when a real Call with status=queued exists.
         """
-        if getattr(obj, "_has_in_progress", None):
-            return Call.Status.IN_PROGRESS
-        annotated = getattr(obj, "_latest_call_status", None)
-        if annotated in {
-            Call.Status.IN_PROGRESS,
-            Call.Status.PAUSED,
-            Call.Status.QUEUED,
-        }:
-            return annotated
-        if annotated:
-            # Prefer open dial-queue rows over older completed/not_attended.
-            if Call.objects.filter(
-                patient=obj, status=Call.Status.PAUSED
-            ).exists():
-                return Call.Status.PAUSED
-            if Call.objects.filter(
-                patient=obj, status=Call.Status.QUEUED
-            ).exists():
-                return Call.Status.QUEUED
-            return annotated
-        if getattr(obj, "_has_in_progress", None) is False and annotated is None:
-            return None if obj.is_blocked else Call.Status.QUEUED
-
-        if Call.objects.filter(patient=obj, status=Call.Status.IN_PROGRESS).exists():
+        if getattr(obj, "_has_in_progress", None) or Call.objects.filter(
+            patient=obj, status=Call.Status.IN_PROGRESS
+        ).exists():
             return Call.Status.IN_PROGRESS
         if Call.objects.filter(patient=obj, status=Call.Status.PAUSED).exists():
             return Call.Status.PAUSED
         if Call.objects.filter(patient=obj, status=Call.Status.QUEUED).exists():
             return Call.Status.QUEUED
+
+        annotated = getattr(obj, "_latest_call_status", None)
+        if annotated:
+            return annotated
         latest = (
             Call.objects.filter(patient=obj)
             .order_by("-started_at", "-id")
             .values_list("status", flat=True)
             .first()
         )
-        if latest:
-            return latest
-        return None if obj.is_blocked else Call.Status.QUEUED
+        return latest or None
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -165,6 +148,9 @@ class CallSerializer(serializers.ModelSerializer):
     duration_seconds = serializers.IntegerField(read_only=True)
     has_transcript = serializers.BooleanField(read_only=True)
     message_count = serializers.SerializerMethodField()
+    scheduled_at = serializers.SerializerMethodField()
+    schedule_kind = serializers.SerializerMethodField()
+    schedule_raw_time = serializers.SerializerMethodField()
 
     class Meta:
         model = Call
@@ -187,6 +173,9 @@ class CallSerializer(serializers.ModelSerializer):
             "duration_seconds",
             "has_transcript",
             "message_count",
+            "scheduled_at",
+            "schedule_kind",
+            "schedule_raw_time",
             "created_at",
             "updated_at",
         )
@@ -194,6 +183,37 @@ class CallSerializer(serializers.ModelSerializer):
 
     def get_message_count(self, obj):
         return len(obj.transcript or [])
+
+    def _open_outreach(self, obj):
+        return (
+            ScheduledOutreach.objects.filter(
+                status=ScheduledOutreach.Status.SCHEDULED,
+            )
+            .filter(Q(queued_call_id=obj.pk) | Q(source_call_id=obj.pk))
+            .order_by("scheduled_at", "id")
+            .first()
+        )
+
+    def get_scheduled_at(self, obj):
+        if hasattr(obj, "_scheduled_at"):
+            return getattr(obj, "_scheduled_at", None)
+        row = self._open_outreach(obj)
+        return row.scheduled_at if row else None
+
+    def get_schedule_kind(self, obj):
+        if hasattr(obj, "_schedule_kind"):
+            return getattr(obj, "_schedule_kind", None) or None
+        row = self._open_outreach(obj)
+        return row.kind if row else None
+
+    def get_schedule_raw_time(self, obj):
+        if hasattr(obj, "_schedule_raw_time"):
+            value = getattr(obj, "_schedule_raw_time", None) or ""
+            return value or None
+        row = self._open_outreach(obj)
+        if not row:
+            return None
+        return (row.raw_time_text or "") or None
 
 
 class CallPauseSerializer(serializers.Serializer):
