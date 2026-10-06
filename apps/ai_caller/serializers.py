@@ -122,13 +122,30 @@ class PatientSerializer(serializers.ModelSerializer):
         return max(0, int((end - started_at).total_seconds()))
 
     def get_patient_tries(self, obj):
-        """Number of not-attended contact attempts for this patient."""
-        value = getattr(obj, "_patient_tries", None)
-        if value is not None:
-            return int(value)
-        return Call.objects.filter(
-            patient=obj, status=Call.Status.NOT_ATTENDED
-        ).count()
+        """All contact attempts for this patient: count + detail for each try."""
+        calls = getattr(obj, "_try_calls", None)
+        if calls is None:
+            calls = (
+                Call.objects.filter(patient=obj)
+                .order_by("-started_at", "-id")
+                .only("id", "started_at", "flow", "status", "retell_call_id")
+            )
+        attempts = []
+        for call in calls:
+            started = call.started_at
+            attempts.append(
+                {
+                    "id": call.id,
+                    "datetime": started.isoformat() if started else None,
+                    "call_type": call.flow,
+                    "status": call.status,
+                    "retell_call_id": call.retell_call_id or None,
+                }
+            )
+        return {
+            "count": len(attempts),
+            "attempts": attempts,
+        }
 
     def get_call_status(self, obj):
         """

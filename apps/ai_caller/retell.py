@@ -251,7 +251,12 @@ def _allow_india_outbound(from_number: str) -> None:
 
 
 def _denoising_mode() -> str:
-    """Retell caller-side denoising. Override with RETELL_DENOISING_MODE."""
+    """Retell caller-side denoising. Override with RETELL_DENOISING_MODE.
+
+    NOTE: With call screening enabled, do NOT use
+    noise-and-background-speech-cancellation — Retell can lock onto the
+    screening voice and filter out the real caller. Use noise-cancellation.
+    """
     allowed = {
         "no-denoise",
         "noise-cancellation",
@@ -260,26 +265,36 @@ def _denoising_mode() -> str:
     configured = (getattr(settings, "RETELL_DENOISING_MODE", "") or "").strip()
     if configured in allowed:
         return configured
-    # Stronger mode: ambient noise + background speech (TV / other voices).
-    return "noise-and-background-speech-cancellation"
+    return "noise-cancellation"
 
 
 def _interruption_sensitivity() -> float:
-    """Lower = less likely to treat noise as an interruption. Default 0.8."""
+    """Lower = less likely to treat noise as an interruption. Default 0.6."""
     raw = getattr(settings, "RETELL_INTERRUPTION_SENSITIVITY", None)
     try:
-        value = float(raw if raw is not None and str(raw).strip() != "" else 0.8)
+        value = float(raw if raw is not None and str(raw).strip() != "" else 0.6)
     except (TypeError, ValueError):
-        value = 0.8
+        value = 0.6
+    return max(0.0, min(1.0, value))
+
+
+def _responsiveness() -> float:
+    """Lower = wait a bit longer before answering (helps noisy lines). Default 0.85."""
+    raw = getattr(settings, "RETELL_RESPONSIVENESS", None)
+    try:
+        value = float(raw if raw is not None and str(raw).strip() != "" else 0.85)
+    except (TypeError, ValueError):
+        value = 0.85
     return max(0.0, min(1.0, value))
 
 
 def _agent_call_settings() -> Dict[str, Any]:
     return {
         "language": "multi",
-        "begin_message_delay_ms": 800,
+        "begin_message_delay_ms": 1000,
         "denoising_mode": _denoising_mode(),
         "interruption_sensitivity": _interruption_sensitivity(),
+        "responsiveness": _responsiveness(),
         "call_screening_option": {
             "agent_identity": "Kyle from Bay Area Community Health",
             "call_purpose": (
