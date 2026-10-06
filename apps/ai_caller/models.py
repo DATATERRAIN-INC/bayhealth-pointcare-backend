@@ -117,6 +117,8 @@ class Patient(models.Model):
 
 class Call(models.Model):
     class Status(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        PAUSED = "paused", "Paused"
         IN_PROGRESS = "in_progress", "In Progress"
         COMPLETED = "completed", "Completed"
         NOT_ATTENDED = "not_attended", "Not Attended"
@@ -152,12 +154,17 @@ class Call(models.Model):
         on_delete=models.CASCADE,
         related_name="calls",
     )
-    retell_call_id = models.CharField(max_length=120, unique=True)
+    # Null until Retell place-call succeeds (queued rows have no Retell id yet).
+    retell_call_id = models.CharField(max_length=120, unique=True, null=True, blank=True)
     flow = models.CharField(max_length=16, choices=Flow.choices)
     status = models.CharField(
         max_length=16,
         choices=Status.choices,
         default=Status.IN_PROGRESS,
+    )
+    is_paused = models.BooleanField(
+        default=False,
+        help_text="When true, Celery will not dial this queued call until resumed.",
     )
     from_number = models.CharField(max_length=32, blank=True, default="")
     to_number = models.CharField(max_length=32, blank=True, default="")
@@ -169,7 +176,7 @@ class Call(models.Model):
     live_agent_transcript = models.JSONField(default=list, blank=True)
     recording_url = models.CharField(max_length=1024, blank=True, default="")
     warm_transfer_session_id = models.CharField(max_length=64, blank=True, default="")
-    started_at = models.DateTimeField(default=timezone.now)
+    started_at = models.DateTimeField(null=True, blank=True, default=timezone.now)
     ended_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now, editable=False)
     updated_at = models.DateTimeField(auto_now=True)
@@ -308,6 +315,14 @@ class ScheduledOutreach(models.Model):
         related_name="scheduled_outreaches_created",
         null=True,
         blank=True,
+    )
+    queued_call = models.ForeignKey(
+        Call,
+        on_delete=models.SET_NULL,
+        related_name="scheduled_outreaches_queued",
+        null=True,
+        blank=True,
+        help_text="Queued Call row that will be dialed when this outreach is due.",
     )
     triggered_call = models.ForeignKey(
         Call,
