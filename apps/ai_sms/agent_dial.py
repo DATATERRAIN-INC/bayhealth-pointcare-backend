@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Dial live agents for SMS transfers, with failover like voice warm-transfer."""
+"""Dial live agents for SMS transfers, then bridge them to the patient."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 _TWILIO_API = "https://api.twilio.com/2010-04-01"
 _AGENT_FAIL_STATUSES = frozenset(
+    {"busy", "failed", "no-answer", "canceled", "cancelled"}
+)
+_BRIDGE_FAIL_STATUSES = frozenset(
     {"busy", "failed", "no-answer", "canceled", "cancelled"}
 )
 
@@ -62,24 +65,55 @@ def _transfer_list(conversation: SmsConversation) -> List[str]:
 
 def _is_transfer_reply(reply: str) -> bool:
     text = (reply or "").lower()
-    return "please call" in text or "connect you with" in text
+    return (
+        "connect you with" in text
+        or "you'll receive a call shortly" in text
+        or "you will receive a call shortly" in text
+        or "please call" in text
+    )
 
 
 def agent_answer_twiml(conversation: SmsConversation) -> str:
+    """When the live agent answers: whisper context, then dial/bridge the patient."""
     patient = (
         (conversation.patient_name or conversation.name or "").strip() or "a patient"
     )
     service = (conversation.service_name or "").strip() or "care"
-    phone = (conversation.to_number or "").strip() or "unknown"
-    speak = (
-        f"Hello. This is an automated transfer from Bay Area Community Health. "
-        f"{patient} needs help with {service}. Their phone number is {phone}. "
-        f"Please call them back when you can. Goodbye."
+    patient_phone = (conversation.to_number or "").strip()
+    _, _, from_number, _ = _twilio_creds()
+    base = _backend_base()
+
+    if not patient_phone:
+        speak = (
+            f"Hello. This is an automated transfer from Bay Area Community Health. "
+            f"{patient} needs help with {service}, but their phone number is missing. "
+            f"Goodbye."
+        )
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f"<Response><Say voice=\"{_voice()}\">{escape(speak)}</Say>"
+            "<Hangup/></Response>"
+        )
+
+    whisper = (
+        f"Hello. Transfer from Bay Area Community Health. "
+        f"Connecting you now with {patient} about {service}. Please hold."
     )
+    action = ""
+    if base and conversation.chat_id:
+        action = (
+            f' action="{escape(base)}/api/ai-sms/agent-dial/bridge-status/'
+            f'{escape(conversation.chat_id)}/" method="POST"'
+        )
+    caller_id = escape(from_number) if from_number else escape(patient_phone)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        f"<Response><Say voice=\"{_voice()}\">{escape(speak)}</Say>"
-        "<Hangup/></Response>"
+        "<Response>"
+        f'<Say voice="{_voice()}">{escape(whisper)}</Say>'
+        f'<Dial callerId="{caller_id}" timeout="45"{action}>'
+        f"<Number>{escape(patient_phone)}</Number>"
+        "</Dial>"
+        "</Response>"
     )
 
 
@@ -233,13 +267,10 @@ def maybe_failover_on_agent_status(
 ) -> bool:
     status = (call_status or "").strip().lower()
     if status not in _AGENT_FAIL_STATUSES:
-        if status == "completed" and conversation.transfer_status == "dialing":
-            # Completed without prior answered may still be no-answer in some cases;
-            # DialCallStatus is the authoritative fail signal.
-            pass
-        if status == "in-progress" or status == "answered":
-            conversation.transfer_status = "connected"
-            conversation.save(update_fields=["transfer_status"])
+        if status in {"in-progress", "answered", "ringing"}:
+            if conversation.transfer_status in {"dialing", "failover_dialing"}:
+                conversation.transfer_status = "bridging"
+                conversation.save(update_fields=["transfer_status"])
         return False
 
     dial_sid = (conversation.dial_call_sid or "").strip()
@@ -248,9 +279,43 @@ def maybe_failover_on_agent_status(
         return False
     if call_sid and call_sid != dial_sid:
         return False
-    if conversation.transfer_status == "connected":
+    if conversation.transfer_status in {"connected", "bridging"}:
+        # Agent already answered; bridge/patient outcome is handled separately.
         return False
     return failover_to_next_live_agent(conversation, reason=status)
+
+
+def handle_bridge_status(
+    conversation: SmsConversation, *, dial_call_status: str
+) -> None:
+    """Twilio Dial action after agent leg tries to connect the patient."""
+    status = (dial_call_status or "").strip().lower()
+    if status in {"completed", "answered", "in-progress"}:
+        conversation.transfer_status = "connected"
+        conversation.save(update_fields=["transfer_status"])
+        logger.info(
+            "SMS agent bridge connected chat=%s dial_status=%s",
+            conversation.chat_id,
+            status,
+        )
+        return
+
+    if status in _BRIDGE_FAIL_STATUSES:
+        conversation.transfer_status = "patient_unreachable"
+        conversation.save(update_fields=["transfer_status"])
+        logger.info(
+            "SMS agent bridge patient unreachable chat=%s dial_status=%s",
+            conversation.chat_id,
+            status,
+        )
+        _notify_patient_missed_bridge(conversation)
+        return
+
+    logger.info(
+        "SMS agent bridge status chat=%s dial_status=%s",
+        conversation.chat_id,
+        status or "(empty)",
+    )
 
 
 def _notify_patient_unreachable(conversation: SmsConversation) -> None:
@@ -272,13 +337,37 @@ def _notify_patient_unreachable(conversation: SmsConversation) -> None:
         )
 
 
+def _notify_patient_missed_bridge(conversation: SmsConversation) -> None:
+    from apps.ai_sms.services import send_twilio_sms
+
+    phone = (conversation.to_number or "").strip()
+    if not phone:
+        return
+    body = (
+        "We tried to call you to connect you with our team, but couldn't reach you. "
+        "Someone from Bay Area Community Health will follow up soon."
+    )
+    _sid, err = send_twilio_sms(phone, body, conversation.from_number)
+    if err:
+        logger.warning(
+            "Failed to SMS patient after missed bridge chat=%s err=%s",
+            conversation.chat_id,
+            err,
+        )
+
+
 def maybe_start_agent_dial_after_reply(
     conversation: SmsConversation, reply: str
 ) -> None:
-    """When SMS tells the patient we're connecting them, dial live agents with failover."""
+    """When SMS says we're connecting them, dial live agents and bridge to patient."""
     if not _is_transfer_reply(reply):
         return
-    if conversation.transfer_status in {"dialing", "failover_dialing", "connected"}:
+    if conversation.transfer_status in {
+        "dialing",
+        "failover_dialing",
+        "bridging",
+        "connected",
+    }:
         return
     if not _transfer_list(conversation):
         return

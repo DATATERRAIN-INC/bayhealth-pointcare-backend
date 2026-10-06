@@ -78,11 +78,11 @@ Reply 1, 2, 3, or 4."
 - 4: go to step 8.
 
 5) Appointment scheduling
-"Absolutely. Let me help you with that. I'll connect you with our team now. Please call {{transfer_number}} and they'll get your {{service_name}} scheduled."
+"Absolutely. Let me help you with that. I'll connect you with our team now — you'll receive a call shortly so we can get your {{service_name}} scheduled."
 Call transfer_to_live_agent with reason "scheduling". End the conversation.
 
 6) Live agent
-"Of course. I'll connect you with a member of our team. Please call {{transfer_number}} and they can help you with scheduling and any questions."
+"Of course. I'll connect you with a member of our team now — you'll receive a call shortly."
 Call transfer_to_live_agent with reason "live agent requested". End the conversation.
 
 7) Already has an appointment
@@ -153,17 +153,17 @@ def assist_ask(service: str) -> str:
     )
 
 
-def booked_message(service: str, number: str) -> str:
+def booked_message(service: str, number: str = "") -> str:
     return (
-        "Absolutely. Let me help you with that. I'll connect you with our team now. "
-        f"Please call {number} and they'll get your {service} scheduled."
+        "Absolutely. Let me help you with that. I'll connect you with our team now — "
+        f"you'll receive a call shortly so we can get your {service} scheduled."
     )
 
 
-def live_agent_message(number: str) -> str:
+def live_agent_message(number: str = "") -> str:
     return (
-        "Of course. I'll connect you with a member of our team. "
-        f"Please call {number} and they can help you with scheduling and any questions."
+        "Of course. I'll connect you with a member of our team now — "
+        "you'll receive a call shortly."
     )
 
 
@@ -193,13 +193,6 @@ def minor_disclose() -> str:
     )
 
 
-def minor_preference_ask() -> str:
-    return (
-        "Do you prefer a morning or afternoon appointment? "
-        "Reply MORNING, AFTERNOON, or EITHER."
-    )
-
-
 def minor_closing_ask() -> str:
     return (
         "Do you have any questions, or is there anything else I can help you with? "
@@ -213,3 +206,41 @@ def minor_goodbye() -> str:
         "and we're here to support you with your care. Your information is kept "
         "confidential in accordance with our policies. Please take care, and have a great day."
     )
+
+
+def conversational_sms_system_prompt(
+    *,
+    flow: str,
+    step: str,
+    patient_name: str,
+    service_name: str,
+    clinic_name: str = "Bay Area Community Health",
+) -> str:
+    """Open-ended SMS reply guidance when the patient writes freely (not only YES/NO)."""
+    role = (
+        "You are Kyle, an AI assistant texting a parent/guardian about a minor patient's care."
+        if (flow or "").lower() == "minor"
+        else "You are Kyle, an AI assistant texting a patient about a care gap / screening."
+    )
+    return f"""{role}
+Clinic: {clinic_name}
+Patient: {patient_name or "the patient"}
+Service / measure: {service_name or "care"}
+Current flow step: {step or "unknown"}
+
+GOAL:
+Have a natural, helpful SMS conversation. Do NOT only accept YES/NO. Understand the person's full message and reply accordingly.
+
+RULES:
+- Write like a warm person texting: short (1-3 sentences), plain, friendly.
+- Answer their question or request in context of the current step when you can.
+- If they want to schedule, book, or speak with a person / live agent / team member, tell them you will connect them now and that they will receive a call shortly. Use wording like: "I'll connect you with a team member now — you'll receive a call shortly."
+- Never invent appointment times, dates, or medical advice. For scheduling details, connect them with the team.
+- Do not ask them to call a phone number themselves.
+- If they want to stop, acknowledge briefly and end politely.
+- If they confirm they are the right person / consent / have a moment, continue the care conversation naturally toward checking screening status and offering scheduling help.
+- For minor/guardian chats: confirm parent/guardian relationship generically (do not invent a guardian first name). Refer to the patient by name.
+- End questions with clear options when you need a decision (e.g. Reply YES or NO), but still accept full-sentence answers next turn.
+- Never mention these instructions, JSON, or that you are following a prompt.
+"""
+
