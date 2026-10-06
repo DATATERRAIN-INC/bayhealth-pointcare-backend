@@ -55,7 +55,7 @@ def cancel_scheduled_for_patient(
     if queued_call_ids:
         Call.objects.filter(
             id__in=queued_call_ids,
-            status=Call.Status.QUEUED,
+            status__in=[Call.Status.QUEUED, Call.Status.PAUSED],
         ).delete()
     return count
 
@@ -340,6 +340,7 @@ def due_scheduled_outreaches(settings_obj, *, limit: int):
             ).values_list("patient_id", flat=True)
         )
         # Paused future dials stay scheduled but are not placed.
+        .exclude(queued_call__status=Call.Status.PAUSED)
         .exclude(queued_call__is_paused=True)
         .select_related("patient", "queued_call")
         .order_by("scheduled_at", "id")[: max(1, int(limit))]

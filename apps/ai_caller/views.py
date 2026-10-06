@@ -124,13 +124,18 @@ class CallViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "put", "patch", "head", "options"]
 
     def get_queryset(self):
+        status = self.request.query_params.get("status", "")
+        # Only the list endpoint hides queued by default. Detail/PUT/PATCH must
+        # still resolve queued Call ids (pause/resume).
+        exclude_queued = self.action == "list" and not (status or "").strip()
         return get_call_queryset(
             user=self.request.user,
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
-            status=self.request.query_params.get("status", ""),
+            status=status,
             patient_id=self.request.query_params.get("patient_id", ""),
             retell_call_id=self.request.query_params.get("retell_call_id", ""),
+            exclude_queued=exclude_queued,
         )
 
     def list(self, request, *args, **kwargs):
@@ -145,16 +150,24 @@ class CallViewSet(viewsets.ModelViewSet):
         return super().list(request, *args, **kwargs)
 
     def update(self, request, *args, **kwargs):
-        """Pause / resume a specific queued call so Celery skips it until resumed."""
-        call = self.get_object()
-        if call.status != Call.Status.QUEUED:
-            return error_response("Only queued calls can be paused or resumed.", 400)
+        """Pause / resume a dial-queue call (queued <-> paused)."""
+        # Look up by pk + user directly (do not use list queryset, which can
+        # exclude queue statuses and cause "No Call matches the given query.").
+        call = Call.objects.filter(pk=kwargs.get("pk"), user=request.user).first()
+        if not call:
+            return error_response("Call not found.", 404)
+        if call.status not in {Call.Status.QUEUED, Call.Status.PAUSED}:
+            return error_response(
+                "Only queued or paused calls can be paused or resumed.", 400
+            )
 
         serializer = CallPauseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        call.is_paused = bool(serializer.validated_data["paused"])
+        paused = bool(serializer.validated_data["paused"])
+        call.status = Call.Status.PAUSED if paused else Call.Status.QUEUED
+        call.is_paused = paused
         call.updated_by = request.user
-        call.save(update_fields=["is_paused", "updated_by", "updated_at"])
+        call.save(update_fields=["status", "is_paused", "updated_by", "updated_at"])
         return Response(CallSerializer(call).data)
 
     def partial_update(self, request, *args, **kwargs):
@@ -166,15 +179,15 @@ class CallViewSet(viewsets.ModelViewSet):
         queryset = Call.objects.filter(user=request.user)
         return Response(
             {
-                "all": queryset.exclude(status=Call.Status.QUEUED).count(),
+                "all": queryset.exclude(
+                    status__in=[Call.Status.QUEUED, Call.Status.PAUSED]
+                ).count(),
                 "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
                 "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
                 "queued": queryset.filter(status=Call.Status.QUEUED).count(),
-                "queued_paused": queryset.filter(
-                    status=Call.Status.QUEUED, is_paused=True
-                ).count(),
+                "paused": queryset.filter(status=Call.Status.PAUSED).count(),
             }
         )
 
