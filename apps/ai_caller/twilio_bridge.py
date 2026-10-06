@@ -368,7 +368,7 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
         try:
             from apps.ai_caller.models import Call
 
-            Call.objects.filter(retell_call_id=retell_call_id).update(
+            Call.all_objects.filter(retell_call_id=retell_call_id).update(
                 transfer_number=nxt
             )
         except Exception:

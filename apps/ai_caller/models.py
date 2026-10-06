@@ -124,6 +124,7 @@ class Call(models.Model):
         COMPLETED = "completed", "Completed"
         NOT_ATTENDED = "not_attended", "Not Attended"
         CALLBACK = "callback", "Callback"
+        CANCEL = "cancel", "Cancel"
 
     class Flow(models.TextChoices):
         OUTBOUND = "outbound", "Outbound"
@@ -230,7 +231,10 @@ class CallerSettings(models.Model):
     start_time = models.TimeField(default=time(9, 0))
     end_time = models.TimeField(default=time(17, 0))
     timezone = models.CharField(max_length=64, default="America/New_York")
-    max_calls_per_run = models.PositiveIntegerField(default=5)
+    max_calls_per_run = models.PositiveIntegerField(
+        default=5,
+        help_text="Max simultaneous in-progress outbound calls. New dials fill free slots only.",
+    )
     call_trigger_count = models.PositiveIntegerField(default=3)
     reminder_timeframe_hours = models.PositiveIntegerField(
         default=24,

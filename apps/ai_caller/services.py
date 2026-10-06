@@ -3,7 +3,20 @@ import json
 import logging
 
 from django.conf import settings
-from django.db.models import CharField, Count, Exists, OuterRef, Prefetch, Q, Subquery, Value
+from django.db.models import (
+    Case,
+    CharField,
+    Count,
+    Exists,
+    F,
+    IntegerField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Value,
+    When,
+)
 from django.db.models.functions import Cast, Concat
 from django.utils import timezone
 
@@ -201,6 +214,7 @@ def get_call_queryset(
     patient_id="",
     retell_call_id="",
     exclude_queued=False,
+    ordering="",
 ):
     queryset = Call.objects.select_related("patient").all()
     if user is not None:
@@ -210,6 +224,7 @@ def get_call_queryset(
     statuses = _parse_status_list(status)
     patient_id = (patient_id or "").strip()
     retell_call_id = (retell_call_id or "").strip()
+    ordering = (ordering or "").strip().lower()
 
     if search:
         queryset = queryset.annotate(
@@ -256,6 +271,24 @@ def get_call_queryset(
         _schedule_kind=Subquery(open_outreach.values("kind")[:1]),
         _schedule_raw_time=Subquery(open_outreach.values("raw_time_text")[:1]),
     )
+
+    # Dial-queue UI order: scheduled (soonest) → paused → queued (oldest first).
+    if ordering in {"dial_queue", "queue", "scheduled_first"}:
+        queryset = queryset.annotate(
+            _dial_group=Case(
+                When(status=Call.Status.SCHEDULED, then=Value(0)),
+                When(status=Call.Status.PAUSED, then=Value(1)),
+                When(status=Call.Status.QUEUED, then=Value(2)),
+                default=Value(3),
+                output_field=IntegerField(),
+            ),
+        ).order_by(
+            "_dial_group",
+            F("_scheduled_at").asc(nulls_last=True),
+            "created_at",
+            "id",
+        )
+
     return queryset
 
 
@@ -767,6 +800,12 @@ def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
                 "ok": False,
                 "error": "Queued call not found.",
                 "status_code": 404,
+            }
+        if existing_call.status == Call.Status.CANCEL:
+            return {
+                "ok": False,
+                "error": "Call is cancelled.",
+                "status_code": 400,
             }
         if existing_call.status == Call.Status.PAUSED or existing_call.is_paused:
             return {
@@ -1407,9 +1446,36 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         )
         return payload
 
-    max_per_run = max(1, int(settings_obj.max_calls_per_run or 1))
-    due_queue = due_scheduled_outreaches(settings_obj, limit=max_per_run)
-    remaining = max(0, max_per_run - len(due_queue))
+    max_concurrent = max(1, int(settings_obj.max_calls_per_run or 1))
+    in_progress_count = Call.objects.filter(
+        user=settings_obj.user,
+        status=Call.Status.IN_PROGRESS,
+    ).count()
+    slots_free = max(0, max_concurrent - in_progress_count)
+
+    if slots_free <= 0:
+        dialer_logger.info(
+            "NOT_TRIGGERED user_id=%s email=%s reason=concurrent_slots_full "
+            "in_progress=%s max_calls_per_run=%s",
+            user_id,
+            email,
+            in_progress_count,
+            max_concurrent,
+        )
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "concurrent_slots_full",
+            "placed": 0,
+            "failed": 0,
+            "user_id": user_id,
+            "in_progress": in_progress_count,
+            "max_calls_per_run": max_concurrent,
+            "slots_free": 0,
+        }
+
+    due_queue = due_scheduled_outreaches(settings_obj, limit=slots_free)
+    remaining = max(0, slots_free - len(due_queue))
     queued_calls = (
         queued_calls_due_for_outbound(settings_obj, limit=remaining) if remaining else []
     )
@@ -1421,12 +1487,15 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         ).count()
         dialer_logger.info(
             "NOT_TRIGGERED user_id=%s email=%s reason=no_eligible_patients "
-            "total_patients=%s blocked=%s max_calls_per_run=%s",
+            "total_patients=%s blocked=%s max_calls_per_run=%s "
+            "in_progress=%s slots_free=%s",
             user_id,
             email,
             total,
             blocked,
-            settings_obj.max_calls_per_run,
+            max_concurrent,
+            in_progress_count,
+            slots_free,
         )
         return {
             "ok": True,
@@ -1437,6 +1506,8 @@ def _run_scheduled_outbound_for_settings(settings_obj):
             "results": [],
             "user_id": user_id,
             "reason": "no_eligible_patients",
+            "in_progress": in_progress_count,
+            "slots_free": slots_free,
         }
 
     placed = 0
@@ -1534,6 +1605,9 @@ def _run_scheduled_outbound_for_settings(settings_obj):
         "attempted": len(due_queue) + len(queued_calls),
         "results": results,
         "user_id": user_id,
+        "in_progress": in_progress_count,
+        "slots_free": slots_free,
+        "max_calls_per_run": max_concurrent,
     }
     if due_queue or queued_calls:
         from apps.notifications.services import notify_outbound_batch

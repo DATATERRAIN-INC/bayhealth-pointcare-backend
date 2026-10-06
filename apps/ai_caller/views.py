@@ -1,4 +1,5 @@
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
@@ -8,6 +9,7 @@ from rest_framework.views import APIView
 from apps.ai_caller.models import Call, PatientSource, ScheduledOutreach
 from apps.ai_caller.scheduling import (
     get_scheduled_outreach_queryset,
+    mark_outreach_triggered,
     schedule_callback_request,
 )
 from apps.ai_caller.serializers import (
@@ -128,10 +130,10 @@ class PatientViewSet(viewsets.ModelViewSet):
 class CallViewSet(viewsets.ModelViewSet):
     serializer_class = CallSerializer
     pagination_class = CommonPagination
-    http_method_names = ["get", "put", "patch", "head", "options"]
+    http_method_names = ["get", "post", "put", "patch", "head", "options"]
 
     def get_queryset(self):
-        # Support one or many: ?status=queued|scheduled|paused
+        # Support one or many: ?status=queued|scheduled|paused|cancel
         # e.g. ?status=queued,scheduled or ?status=queued&status=paused
         status_values = self.request.query_params.getlist("status")
         if not status_values:
@@ -151,6 +153,7 @@ class CallViewSet(viewsets.ModelViewSet):
             patient_id=self.request.query_params.get("patient_id", ""),
             retell_call_id=self.request.query_params.get("retell_call_id", ""),
             exclude_queued=exclude_queued,
+            ordering=self.request.query_params.get("ordering", ""),
         )
 
     def list(self, request, *args, **kwargs):
@@ -165,9 +168,7 @@ class CallViewSet(viewsets.ModelViewSet):
         return super().list(request, *args, **kwargs)
 
     def update(self, request, *args, **kwargs):
-        """Pause / resume a dial-queue call (queued <-> paused)."""
-        # Look up by pk + user directly (do not use list queryset, which can
-        # exclude queue statuses and cause "No Call matches the given query.").
+        """Update dial-queue call status: paused / cancel / queued / scheduled."""
         call = Call.objects.filter(pk=kwargs.get("pk"), user=request.user).first()
         if not call:
             return error_response("Call not found.", 404)
@@ -177,25 +178,50 @@ class CallViewSet(viewsets.ModelViewSet):
             Call.Status.PAUSED,
         }:
             return error_response(
-                "Only queued, scheduled, or paused calls can be paused or resumed.",
+                "Only queued, scheduled, or paused calls can be updated.",
                 400,
             )
 
         serializer = CallPauseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        paused = bool(serializer.validated_data["paused"])
-        if paused:
+        data = serializer.validated_data
+        new_status = (data.get("status") or "").strip().lower()
+
+        # Legacy body: {"paused": true|false} → map to status.
+        if not new_status and "paused" in data:
+            new_status = (
+                Call.Status.PAUSED if data["paused"] else Call.Status.QUEUED
+            )
+
+        if new_status == Call.Status.CANCEL:
+            ScheduledOutreach.objects.filter(
+                queued_call_id=call.pk,
+                status=ScheduledOutreach.Status.SCHEDULED,
+            ).update(
+                status=ScheduledOutreach.Status.CANCELLED,
+                error_message="Call cancelled",
+                updated_at=timezone.now(),
+            )
+            call.status = Call.Status.CANCEL
+            call.is_paused = False
+        elif new_status == Call.Status.PAUSED:
             call.status = Call.Status.PAUSED
-        else:
-            # Resume to scheduled if linked to an open outreach, else ready-now queued.
+            call.is_paused = True
+        elif new_status in {Call.Status.QUEUED, Call.Status.SCHEDULED}:
+            # Resume. Prefer explicit status; if outreach is open and client
+            # sends queued, still keep scheduled so Celery waits for scheduled_at.
             has_outreach = ScheduledOutreach.objects.filter(
                 queued_call_id=call.pk,
                 status=ScheduledOutreach.Status.SCHEDULED,
             ).exists()
-            call.status = (
-                Call.Status.SCHEDULED if has_outreach else Call.Status.QUEUED
-            )
-        call.is_paused = paused
+            if has_outreach:
+                call.status = Call.Status.SCHEDULED
+            else:
+                call.status = Call.Status.QUEUED
+            call.is_paused = False
+        else:
+            return error_response("Invalid status.", 400)
+
         call.updated_by = request.user
         call.save(update_fields=["status", "is_paused", "updated_by", "updated_at"])
         return Response(CallSerializer(call).data)
@@ -220,18 +246,60 @@ class CallViewSet(viewsets.ModelViewSet):
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
                 "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
-                "queued": queryset.filter(status=Call.Status.QUEUED).count(),
+                # Waiting dial pool (ready-now + future scheduled + paused).
+                "queued": queryset.filter(
+                    status__in=[
+                        Call.Status.QUEUED,
+                        Call.Status.SCHEDULED,
+                        Call.Status.PAUSED,
+                    ]
+                ).count(),
                 "scheduled": queryset.filter(status=Call.Status.SCHEDULED).count(),
                 "paused": queryset.filter(status=Call.Status.PAUSED).count(),
+                "cancel": queryset.filter(status=Call.Status.CANCEL).count(),
             }
         )
 
-    @action(detail=True, methods=["post"], url_path="sync-transcript")
-    def sync_transcript(self, request, pk=None):
-        call, error = sync_call_transcript(self.get_object())
-        if error:
-            return error_response(error)
-        return message_response("Transcript synced successfully.")
+    @action(detail=True, methods=["post"], url_path="trigger")
+    def trigger(self, request, pk=None):
+        """Manually place/dial a queued or scheduled Call by id."""
+        call = Call.objects.filter(pk=pk, user=request.user).select_related(
+            "patient"
+        ).first()
+        if not call:
+            return error_response("Call not found.", 404)
+        if call.status not in {Call.Status.QUEUED, Call.Status.SCHEDULED}:
+            return error_response(
+                "Only queued or scheduled calls can be triggered.",
+                400,
+            )
+        if call.is_paused:
+            return error_response("Call is paused.", 400)
+        if not call.patient_id:
+            return error_response("Call has no patient.", 400)
+
+        result = place_outbound_call_for_patient(
+            call.patient_id,
+            user=request.user,
+            call_id=call.id,
+        )
+        if not result.get("ok"):
+            return error_response(
+                result.get("error") or "Failed to place call.",
+                int(result.get("status_code") or 502),
+            )
+
+        # If this call belonged to an open outreach, mark it triggered.
+        outreach = ScheduledOutreach.objects.filter(
+            queued_call_id=call.id,
+            status=ScheduledOutreach.Status.SCHEDULED,
+        ).first()
+        if outreach:
+            triggered = Call.objects.filter(pk=call.id).first()
+            mark_outreach_triggered(outreach, triggered)
+
+        call.refresh_from_db()
+        return Response(CallSerializer(call).data)
 
 
 class PlaceOutboundCallView(APIView):

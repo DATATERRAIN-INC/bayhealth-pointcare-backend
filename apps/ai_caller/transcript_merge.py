@@ -527,7 +527,7 @@ def save_humans_transcript_for_call(
     if not call_id:
         return None
 
-    call = Call.objects.filter(retell_call_id=call_id).first()
+    call = Call.all_objects.filter(retell_call_id=call_id).first()
     if not call:
         logger.warning("No Call row for retell_call_id=%s (humans transcript)", call_id)
         return None
