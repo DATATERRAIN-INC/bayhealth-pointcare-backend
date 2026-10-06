@@ -1,4 +1,5 @@
 from datetime import date, datetime, time, timedelta
+import json
 import logging
 
 from django.conf import settings
@@ -28,6 +29,7 @@ from apps.ai_caller.scheduling import (
     create_queued_call_for_patient,
     due_scheduled_outreaches,
     mark_outreach_triggered,
+    maybe_schedule_callback_from_transcript,
     schedule_reminder_for_missed_call,
 )
 from apps.ai_caller.retell import (
@@ -104,19 +106,43 @@ def _parse_status_list(status):
     Accept one status or many:
     - "queued"
     - "queued,paused"
-    - ["queued", "paused"]
+    - ["queued", "paused"]  (list or repeated query params)
+    - '["queued","paused"]' (JSON array string from frontends)
     """
     if status is None:
         return []
+
+    raw_parts = []
     if isinstance(status, (list, tuple)):
-        raw_parts = []
-        for item in status:
-            raw_parts.extend(str(item or "").split(","))
+        items = list(status)
     else:
-        raw_parts = str(status).split(",")
+        items = [status]
+
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)):
+            raw_parts.extend(str(x or "") for x in item)
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        # Frontend sometimes sends status=["queued","paused"] as one value.
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    raw_parts.extend(str(x or "") for x in parsed)
+                    continue
+            except Exception:
+                pass
+            # Fallback: strip brackets and split
+            text = text[1:-1]
+        raw_parts.extend(text.split(","))
+
     statuses = []
     for part in raw_parts:
-        value = part.strip().lower()
+        value = str(part or "").strip().strip("\"'").lower()
         if value and value != "all" and value not in statuses:
             statuses.append(value)
     return statuses
@@ -168,6 +194,20 @@ def get_call_queryset(
         queryset = queryset.filter(patient_id=patient_id)
     if retell_call_id:
         queryset = queryset.filter(retell_call_id=retell_call_id)
+
+    # Open outreach linked as the dial to place, or as the source callback call.
+    open_outreach = (
+        ScheduledOutreach.objects.filter(
+            status=ScheduledOutreach.Status.SCHEDULED,
+        )
+        .filter(Q(queued_call_id=OuterRef("pk")) | Q(source_call_id=OuterRef("pk")))
+        .order_by("scheduled_at", "id")
+    )
+    queryset = queryset.annotate(
+        _scheduled_at=Subquery(open_outreach.values("scheduled_at")[:1]),
+        _schedule_kind=Subquery(open_outreach.values("kind")[:1]),
+        _schedule_raw_time=Subquery(open_outreach.values("raw_time_text")[:1]),
+    )
     return queryset
 
 
@@ -1042,6 +1082,15 @@ def update_call_from_retell_payload(payload):
         raw_status or "-",
         str(data.get("disconnection_reason") or "")[:80],
     )
+
+    # If the agent agreed to call back but never invoked the tool, infer from transcript.
+    if call.status in {
+        Call.Status.COMPLETED,
+        Call.Status.NOT_ATTENDED,
+        Call.Status.IN_PROGRESS,
+    }:
+        maybe_schedule_callback_from_transcript(call)
+        call.refresh_from_db(fields=["status"])
 
     if call.status == Call.Status.COMPLETED:
         # Keep a callback requested on this same call (busy → call later).

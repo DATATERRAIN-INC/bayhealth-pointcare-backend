@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Optional, Tuple
 
 from django.db.models import Q
@@ -77,6 +77,48 @@ def create_queued_call_for_patient(patient, *, user=None, actor=None) -> Call:
     )
 
 
+_WORD_HOURS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+
+def _normalize_callback_time_text(raw: str) -> str:
+    """Collapse spoken filler so clock patterns can match."""
+    text = re.sub(r"\s+", " ", (raw or "").strip().lower())
+    # Prefer the day+time clause if the tool passed a full sentence.
+    m = re.search(
+        r"\b((?:today|tomorrow)\b.*|\bin\s+\d+\s*(?:hours?|hrs?|minutes?|mins?)\b.*|"
+        r"\d{1,2}(?::\d{2})?\s*[ap]\.?\s*m\.?\b.*|"
+        r"\d{4}-\d{2}-\d{2}[ t]\d{1,2}:\d{2}(?::\d{2})?)",
+        text,
+    )
+    if m:
+        text = m.group(1)
+    # Word hours first so "one pm" can collapse like "1 pm"
+    for word, num in _WORD_HOURS.items():
+        text = re.sub(rf"\b{word}\b", str(num), text)
+    # "1 p.m." / "1 PM" → "1pm"
+    text = re.sub(r"\b([0-9]{1,2})\s*([ap])\.?\s*m\.?\b", r"\1\2m", text)
+    text = re.sub(r"\b([ap])\.?\s*m\.?\b", r"\1m", text)
+    # Drop filler around the clock: after/around/about/before/by/like/uh
+    text = re.sub(
+        r"\b(after|around|about|before|by|like|uh|um|approx(?:imately)?)\b",
+        " ",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" ,.?!")
+    return text
 def parse_callback_datetime(
     raw_text: str,
     *,
@@ -97,7 +139,7 @@ def parse_callback_datetime(
         tz = _resolve_timezone("America/New_York")
 
     local_now = (now or timezone.now()).astimezone(tz)
-    lowered = text.lower().strip()
+    lowered = _normalize_callback_time_text(text)
 
     # Relative: in N hours / minutes
     rel = re.match(
@@ -113,17 +155,37 @@ def parse_callback_datetime(
             else timedelta(minutes=amount)
         )
         when = local_now + delta
-        return when.astimezone(timezone.utc), ""
+        return when.astimezone(dt_timezone.utc), ""
 
     # tomorrow / today + optional clock
     day_offset = 0
     work = lowered
     if work.startswith("tomorrow"):
         day_offset = 1
-        work = work[len("tomorrow") :].strip(" ,at")
+        work = work[len("tomorrow") :].strip(" ,")
     elif work.startswith("today"):
         day_offset = 0
-        work = work[len("today") :].strip(" ,at")
+        work = work[len("today") :].strip(" ,")
+
+    # Optional leading "at" left after day word
+    work = re.sub(r"^at\s+", "", work).strip()
+
+    # Bare "tomorrow" / "today" (no clock) → 10:00 local that day.
+    if day_offset or work in {"", "morning", "afternoon", "evening"}:
+        if not work or work in {"morning", "afternoon", "evening"}:
+            hour = {"morning": 10, "afternoon": 14, "evening": 18}.get(work, 10)
+            target_date = (local_now + timedelta(days=day_offset)).date()
+            when = datetime(
+                target_date.year,
+                target_date.month,
+                target_date.day,
+                hour,
+                0,
+                tzinfo=tz,
+            )
+            if day_offset == 0 and when <= local_now:
+                when = when + timedelta(days=1)
+            return when.astimezone(dt_timezone.utc), ""
 
     clock = re.match(
         r"^(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?$",
@@ -163,7 +225,7 @@ def parse_callback_datetime(
         # If "3pm" with no day and already past, push to tomorrow.
         if day_offset == 0 and when <= local_now:
             when = when + timedelta(days=1)
-        return when.astimezone(timezone.utc), ""
+        return when.astimezone(dt_timezone.utc), ""
 
     # ISO-ish: 2026-10-06T15:00 or 2026-10-06 15:00
     iso = re.match(
@@ -180,9 +242,92 @@ def parse_callback_datetime(
             int(iso.group(6) or 0),
             tzinfo=tz,
         )
-        return when.astimezone(timezone.utc), ""
+        return when.astimezone(dt_timezone.utc), ""
 
     return None, f"Could not understand callback time: {text}"
+
+
+_CALLBACK_INTENT = re.compile(
+    r"\b("
+    r"call\s+(me\s+)?back"
+    r"|call\s+me\b"
+    r"|reach\s+(me\s+)?back"
+    r"|callback"
+    r"|call\s+later"
+    r")\b",
+    re.I,
+)
+
+
+def extract_callback_time_from_transcript(transcript) -> str:
+    """
+    Best-effort: find a patient turn that asks for a callback and return
+    a time phrase (or the utterance) for parse_callback_datetime.
+    """
+    if not isinstance(transcript, list):
+        return ""
+    for entry in transcript:
+        if not isinstance(entry, dict):
+            continue
+        speaker = str(entry.get("speaker") or entry.get("role") or "").strip().lower()
+        if speaker not in {"patient", "user"}:
+            continue
+        text = str(entry.get("text") or "").strip()
+        if not text or not _CALLBACK_INTENT.search(text):
+            continue
+        # Prefer an explicit day/time clause inside the utterance.
+        lowered = text.lower()
+        m = re.search(
+            r"\b("
+            r"tomorrow\b.*|today\b.*|"
+            r"in\s+\d+\s*(?:hours?|hrs?|minutes?|mins?)\b.*"
+            r")",
+            lowered,
+        )
+        if m:
+            return m.group(1).strip(" ,.?!'")
+        return text
+    return ""
+
+
+def maybe_schedule_callback_from_transcript(call: Call) -> Optional[ScheduledOutreach]:
+    """
+    Fallback when the Retell agent confirms a callback verbally but never
+    invokes log_callback_request.
+    """
+    if not call or not call.patient_id:
+        return None
+    if call.status == Call.Status.CALLBACK:
+        return None
+    if ScheduledOutreach.objects.filter(
+        source_call=call,
+        kind=ScheduledOutreach.Kind.CALLBACK_REQUESTED,
+        status=ScheduledOutreach.Status.SCHEDULED,
+    ).exists():
+        return None
+
+    raw = extract_callback_time_from_transcript(call.transcript or [])
+    if not raw:
+        raw = extract_callback_time_from_transcript(call.retell_transcript or [])
+    if not raw:
+        return None
+
+    row, err = schedule_callback_request(call=call, raw_time_text=raw)
+    if err:
+        dialer_logger.warning(
+            "CALLBACK_TRANSCRIPT_FALLBACK_FAILED call_id=%s raw=%s err=%s",
+            call.id,
+            raw[:120],
+            err,
+        )
+        return None
+    dialer_logger.info(
+        "CALLBACK_TRANSCRIPT_FALLBACK call_id=%s outreach_id=%s raw=%s",
+        call.id,
+        getattr(row, "id", None),
+        raw[:120],
+    )
+    return row
 
 
 def schedule_callback_request(
