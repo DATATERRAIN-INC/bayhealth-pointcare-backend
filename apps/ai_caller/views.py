@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 from apps.ai_caller.models import Call, PatientSource, ScheduledOutreach
 from apps.ai_caller.scheduling import (
     get_scheduled_outreach_queryset,
+    mark_outreach_triggered,
     schedule_callback_request,
 )
 from apps.ai_caller.serializers import (
@@ -129,7 +130,7 @@ class PatientViewSet(viewsets.ModelViewSet):
 class CallViewSet(viewsets.ModelViewSet):
     serializer_class = CallSerializer
     pagination_class = CommonPagination
-    http_method_names = ["get", "put", "patch", "head", "options"]
+    http_method_names = ["get", "post", "put", "patch", "head", "options"]
 
     def get_queryset(self):
         # Support one or many: ?status=queued|scheduled|paused|cancel
@@ -259,12 +260,46 @@ class CallViewSet(viewsets.ModelViewSet):
             }
         )
 
-    @action(detail=True, methods=["post"], url_path="sync-transcript")
-    def sync_transcript(self, request, pk=None):
-        call, error = sync_call_transcript(self.get_object())
-        if error:
-            return error_response(error)
-        return message_response("Transcript synced successfully.")
+    @action(detail=True, methods=["post"], url_path="trigger")
+    def trigger(self, request, pk=None):
+        """Manually place/dial a queued or scheduled Call by id."""
+        call = Call.objects.filter(pk=pk, user=request.user).select_related(
+            "patient"
+        ).first()
+        if not call:
+            return error_response("Call not found.", 404)
+        if call.status not in {Call.Status.QUEUED, Call.Status.SCHEDULED}:
+            return error_response(
+                "Only queued or scheduled calls can be triggered.",
+                400,
+            )
+        if call.is_paused:
+            return error_response("Call is paused.", 400)
+        if not call.patient_id:
+            return error_response("Call has no patient.", 400)
+
+        result = place_outbound_call_for_patient(
+            call.patient_id,
+            user=request.user,
+            call_id=call.id,
+        )
+        if not result.get("ok"):
+            return error_response(
+                result.get("error") or "Failed to place call.",
+                int(result.get("status_code") or 502),
+            )
+
+        # If this call belonged to an open outreach, mark it triggered.
+        outreach = ScheduledOutreach.objects.filter(
+            queued_call_id=call.id,
+            status=ScheduledOutreach.Status.SCHEDULED,
+        ).first()
+        if outreach:
+            triggered = Call.objects.filter(pk=call.id).first()
+            mark_outreach_triggered(outreach, triggered)
+
+        call.refresh_from_db()
+        return Response(CallSerializer(call).data)
 
 
 class PlaceOutboundCallView(APIView):
