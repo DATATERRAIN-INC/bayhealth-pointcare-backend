@@ -74,6 +74,29 @@ def get_patient_queryset(*, user=None, search="", source="", is_blocked=None, up
     )
 
 
+def _parse_status_list(status):
+    """
+    Accept one status or many:
+    - "queued"
+    - "queued,paused"
+    - ["queued", "paused"]
+    """
+    if status is None:
+        return []
+    if isinstance(status, (list, tuple)):
+        raw_parts = []
+        for item in status:
+            raw_parts.extend(str(item or "").split(","))
+    else:
+        raw_parts = str(status).split(",")
+    statuses = []
+    for part in raw_parts:
+        value = part.strip().lower()
+        if value and value != "all" and value not in statuses:
+            statuses.append(value)
+    return statuses
+
+
 def get_call_queryset(
     *,
     user=None,
@@ -89,7 +112,7 @@ def get_call_queryset(
         queryset = queryset.filter(user=user)
     search = (search or "").strip()
     source = (source or "").strip().lower()
-    status = (status or "").strip().lower()
+    statuses = _parse_status_list(status)
     patient_id = (patient_id or "").strip()
     retell_call_id = (retell_call_id or "").strip()
 
@@ -109,10 +132,10 @@ def get_call_queryset(
 
     if source and source != "all":
         queryset = queryset.filter(patient__source=source)
-    if status and status != "all":
-        queryset = queryset.filter(status=status)
+    if statuses:
+        queryset = queryset.filter(status__in=statuses)
     elif exclude_queued:
-        # List default: hide dial-queue rows (use ?status=queued|paused).
+        # List default: hide dial-queue rows (use ?status=queued,paused).
         queryset = queryset.exclude(
             status__in=[Call.Status.QUEUED, Call.Status.PAUSED]
         )
