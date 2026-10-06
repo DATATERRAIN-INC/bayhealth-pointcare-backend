@@ -55,14 +55,30 @@ def cancel_scheduled_for_patient(
     if queued_call_ids:
         Call.objects.filter(
             id__in=queued_call_ids,
-            status__in=[Call.Status.QUEUED, Call.Status.PAUSED],
+            status__in=[
+                Call.Status.QUEUED,
+                Call.Status.SCHEDULED,
+                Call.Status.PAUSED,
+            ],
         ).delete()
     return count
 
 
-def create_queued_call_for_patient(patient, *, user=None, actor=None) -> Call:
+def create_queued_call_for_patient(
+    patient, *, user=None, actor=None, status: str = ""
+) -> Call:
+    """
+    Create a dial-queue Call.
+    Use status=scheduled for callback/reminder outreaches; queued for ready-now.
+    """
     actor = actor or user or getattr(patient, "user", None)
     to_number = f"{patient.country_code or ''}{patient.phone_number or ''}".strip()
+    call_status = (status or "").strip() or Call.Status.QUEUED
+    if call_status not in {
+        Call.Status.QUEUED,
+        Call.Status.SCHEDULED,
+    }:
+        call_status = Call.Status.QUEUED
     return Call.objects.create(
         user=user or getattr(patient, "user", None),
         created_by=actor,
@@ -70,7 +86,7 @@ def create_queued_call_for_patient(patient, *, user=None, actor=None) -> Call:
         patient=patient,
         retell_call_id=None,
         flow=Call.Flow.OUTBOUND,
-        status=Call.Status.QUEUED,
+        status=call_status,
         is_paused=False,
         to_number=to_number,
         started_at=None,
@@ -360,7 +376,9 @@ def schedule_callback_request(
         reason="Replaced by new callback request",
     )
 
-    queued_call = create_queued_call_for_patient(patient, user=user, actor=user)
+    queued_call = create_queued_call_for_patient(
+        patient, user=user, actor=user, status=Call.Status.SCHEDULED
+    )
     row = ScheduledOutreach.objects.create(
         user=user,
         patient=patient,
@@ -440,7 +458,9 @@ def schedule_reminder_for_missed_call(call: Call) -> Optional[ScheduledOutreach]
         reason="Replaced by newer reminder",
     )
 
-    queued_call = create_queued_call_for_patient(patient, user=user, actor=user)
+    queued_call = create_queued_call_for_patient(
+        patient, user=user, actor=user, status=Call.Status.SCHEDULED
+    )
     row = ScheduledOutreach.objects.create(
         user=user,
         patient=patient,
@@ -463,33 +483,47 @@ def schedule_reminder_for_missed_call(call: Call) -> Optional[ScheduledOutreach]
 
 
 def due_scheduled_outreaches(settings_obj, *, limit: int):
-    """Open scheduled rows that are due now for this user (skip paused queued calls)."""
+    """Open scheduled rows that are due now for this user (skip paused dials)."""
     now = timezone.now()
-    return list(
+    completed_patient_ids = Call.objects.filter(
+        user=settings_obj.user,
+        status=Call.Status.COMPLETED,
+    ).values_list("patient_id", flat=True)
+    in_progress_patient_ids = Call.objects.filter(
+        user=settings_obj.user,
+        status=Call.Status.IN_PROGRESS,
+    ).values_list("patient_id", flat=True)
+
+    qs = (
         ScheduledOutreach.objects.filter(
             user=settings_obj.user,
             status=ScheduledOutreach.Status.SCHEDULED,
             scheduled_at__lte=now,
             patient__is_blocked=False,
         )
+        .exclude(patient_id__in=in_progress_patient_ids)
+        # Reminders skip patients who already completed; patient-requested
+        # callbacks must still dial even if an earlier call was completed.
         .exclude(
-            patient_id__in=Call.objects.filter(
-                user=settings_obj.user,
-                status=Call.Status.COMPLETED,
-            ).values_list("patient_id", flat=True)
-        )
-        .exclude(
-            patient_id__in=Call.objects.filter(
-                user=settings_obj.user,
-                status=Call.Status.IN_PROGRESS,
-            ).values_list("patient_id", flat=True)
+            kind=ScheduledOutreach.Kind.REMINDER,
+            patient_id__in=completed_patient_ids,
         )
         # Paused future dials stay scheduled but are not placed.
         .exclude(queued_call__status=Call.Status.PAUSED)
         .exclude(queued_call__is_paused=True)
+        .filter(
+            Q(queued_call__isnull=True)
+            | Q(
+                queued_call__status__in=[
+                    Call.Status.SCHEDULED,
+                    Call.Status.QUEUED,
+                ]
+            )
+        )
         .select_related("patient", "queued_call")
-        .order_by("scheduled_at", "id")[: max(1, int(limit))]
+        .order_by("scheduled_at", "id")
     )
+    return list(qs[: max(1, int(limit))])
 
 
 def mark_outreach_triggered(row: ScheduledOutreach, call: Optional[Call] = None):
