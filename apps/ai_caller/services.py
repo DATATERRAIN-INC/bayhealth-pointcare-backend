@@ -158,7 +158,7 @@ def get_call_queryset(
     retell_call_id="",
     exclude_queued=False,
 ):
-    queryset = Call.objects.select_related("patient").all()
+    queryset = Call.objects.select_related("patient").filter(is_deleted=False)
     if user is not None:
         queryset = queryset.filter(user=user)
     search = (search or "").strip()
@@ -983,7 +983,7 @@ def save_call_decline_reason(*, retell_call_id="", reason="", call=None):
         call_id = str(retell_call_id or "").strip()
         if not call_id:
             return None, "call_id is missing."
-        call = Call.objects.filter(retell_call_id=call_id).first()
+        call = Call.all_objects.filter(retell_call_id=call_id).first()
         if not call:
             return None, "Call not found."
 
@@ -1009,7 +1009,7 @@ def update_call_from_retell_payload(payload):
     if not call_id:
         return None, "call_id is missing."
 
-    call = Call.objects.filter(retell_call_id=call_id).first()
+    call = Call.all_objects.filter(retell_call_id=call_id).first()
     if not call:
         return None, "Call not found."
 

@@ -121,7 +121,7 @@ class PatientViewSet(viewsets.ModelViewSet):
 class CallViewSet(viewsets.ModelViewSet):
     serializer_class = CallSerializer
     pagination_class = CommonPagination
-    http_method_names = ["get", "put", "patch", "head", "options"]
+    http_method_names = ["get", "put", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         # Support one or many: ?status=queued|scheduled|paused
@@ -196,10 +196,18 @@ class CallViewSet(viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         return self.update(request, *args, **kwargs)
 
+    def destroy(self, request, *args, **kwargs):
+        """Soft-delete a call (sets is_deleted=true)."""
+        call = Call.objects.filter(pk=kwargs.get("pk"), user=request.user).first()
+        if not call:
+            return error_response("Call not found.", 404)
+        call.soft_delete(actor=request.user)
+        return message_response("Call deleted successfully.")
+
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
         sync_in_progress_calls_from_retell(user=request.user, limit=25)
-        queryset = Call.objects.filter(user=request.user)
+        queryset = Call.objects.filter(user=request.user, is_deleted=False)
         return Response(
             {
                 "all": queryset.exclude(
@@ -388,7 +396,7 @@ class RetellToolWebhookView(APIView):
                 callback_time = str(
                     data.get("callback_time") or data.get("time") or ""
                 ).strip()
-            call = Call.objects.filter(retell_call_id=call_id).first()
+            call = Call.all_objects.filter(retell_call_id=call_id).first()
             if not call:
                 return error_response("Call not found.", 404)
             _, error = schedule_callback_request(

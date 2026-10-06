@@ -132,30 +132,38 @@ class PatientSerializer(serializers.ModelSerializer):
 
     def get_call_status(self, obj):
         """
-        Current dial status for this patient:
-        in_progress > paused > scheduled > queued > latest call status.
+        Current dial status for this patient.
+        Priority: in_progress > latest real call outcome > paused/scheduled/queued.
+        Queue rows (queued/scheduled/paused) do not override a newer not_attended/completed/callback.
         """
         if getattr(obj, "_has_in_progress", None) or Call.objects.filter(
             patient=obj, status=Call.Status.IN_PROGRESS
         ).exists():
             return Call.Status.IN_PROGRESS
+
+        latest_real = (
+            Call.objects.filter(patient=obj)
+            .exclude(
+                status__in=[
+                    Call.Status.QUEUED,
+                    Call.Status.SCHEDULED,
+                    Call.Status.PAUSED,
+                ]
+            )
+            .order_by("-ended_at", "-started_at", "-id")
+            .values_list("status", flat=True)
+            .first()
+        )
+        if latest_real:
+            return latest_real
+
         if Call.objects.filter(patient=obj, status=Call.Status.PAUSED).exists():
             return Call.Status.PAUSED
         if Call.objects.filter(patient=obj, status=Call.Status.SCHEDULED).exists():
             return Call.Status.SCHEDULED
         if Call.objects.filter(patient=obj, status=Call.Status.QUEUED).exists():
             return Call.Status.QUEUED
-
-        annotated = getattr(obj, "_latest_call_status", None)
-        if annotated:
-            return annotated
-        latest = (
-            Call.objects.filter(patient=obj)
-            .order_by("-started_at", "-id")
-            .values_list("status", flat=True)
-            .first()
-        )
-        return latest or None
+        return None
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -237,6 +245,7 @@ class CallSerializer(serializers.ModelSerializer):
             "flow",
             "status",
             "is_paused",
+            "is_deleted",
             "from_number",
             "to_number",
             "agent_id",
