@@ -213,15 +213,17 @@ def transcribe_mix_with_diarization(
     for model in models:
         if "diarize" not in model:
             continue
+        # OpenAI now requires chunking_strategy for diarization models.
         data = {
             "model": model,
             "response_format": "diarized_json",
+            "chunking_strategy": "auto",
         }
         try:
             resp = requests.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {key}"},
-                files={"file": (filename, audio)},
+                files={"file": (filename, audio, "audio/wav")},
                 data=data,
                 timeout=180,
             )
@@ -246,22 +248,33 @@ def transcribe_mix_with_diarization(
 
 
 def _map_diarized_speaker(raw: str, speaker_map: Dict[str, str]) -> str:
+    """Map diarization labels onto patient / live_agent only (2-party transfer)."""
     label = (raw or "").strip()
     if not label:
         return "unknown"
     if label in speaker_map:
         return speaker_map[label]
     lowered = label.lower().replace(" ", "_")
-    if lowered in {"speaker_0", "a", "spk_0", "0", "speaker0"}:
+    if lowered in {"speaker_0", "a", "spk_0", "0", "speaker0", "patient"}:
         assigned = "patient"
-    elif lowered in {"speaker_1", "b", "spk_1", "1", "speaker1"}:
+    elif lowered in {
+        "speaker_1",
+        "b",
+        "spk_1",
+        "1",
+        "speaker1",
+        "live_agent",
+        "agent",
+        "provider",
+    }:
         assigned = "live_agent"
     elif len(speaker_map) == 0:
         assigned = "patient"
-    elif len(speaker_map) == 1:
+    elif "live_agent" not in speaker_map.values():
         assigned = "live_agent"
     else:
-        assigned = f"speaker_{len(speaker_map) + 1}"
+        # Extra clusters on a 2-party call → attach to live_agent.
+        assigned = "live_agent"
     speaker_map[label] = assigned
     return assigned
 
@@ -274,6 +287,8 @@ def _diarized_segments_to_items(segments: List[Dict[str, Any]]) -> List[Dict[str
         if not text:
             continue
         speaker = _map_diarized_speaker(str(seg.get("speaker") or ""), speaker_map)
+        if speaker not in {"patient", "live_agent"}:
+            speaker = "live_agent"
         items.append(
             {
                 "speaker": speaker,
@@ -514,6 +529,7 @@ def save_humans_transcript_for_call(
     provider_text: str = "",
     mix_text: str = "",
     recording_url: str = "",
+    live_agent_recording_url: str = "",
     twilio_call_sid: str = "",
     session_id: str = "",  # legacy kwarg; ignored for DB storage
     patient_segments: Optional[List[Dict[str, Any]]] = None,
@@ -544,7 +560,7 @@ def save_humans_transcript_for_call(
         mix_items=mix_items,
     )
     if not humans:
-        # Still persist Twilio Call SID / recording if we have them.
+        # Still persist Twilio Call SID / recording URLs if we have them.
         update_fields = []
         sid = (twilio_call_sid or "").strip()
         if sid and call.warm_transfer_session_id != sid:
@@ -553,14 +569,41 @@ def save_humans_transcript_for_call(
         if recording_url and recording_url != (call.recording_url or ""):
             call.recording_url = recording_url[:1024]
             update_fields.append("recording_url")
+        if live_agent_recording_url and live_agent_recording_url != (
+            call.live_agent_recording_url or ""
+        ):
+            call.live_agent_recording_url = live_agent_recording_url[:1024]
+            update_fields.append("live_agent_recording_url")
         if update_fields:
             update_fields.append("updated_at")
             call.save(update_fields=update_fields)
         return call
 
-    call.live_agent_transcript = humans
+    existing = call.live_agent_transcript or []
+    existing_speakers = {
+        str(i.get("speaker") or "") for i in existing if isinstance(i, dict)
+    }
+    new_speakers = {str(i.get("speaker") or "") for i in humans}
+    # Never replace a good patient+live_agent split with a single wall.
+    if (
+        existing
+        and {"patient", "live_agent"}.issubset(existing_speakers)
+        and not {"patient", "live_agent"}.issubset(new_speakers)
+    ):
+        logger.info(
+            "Keeping existing split humans transcript call_id=%s "
+            "(new had speakers=%s)",
+            call_id,
+            sorted(new_speakers),
+        )
+        humans = existing
+    else:
+        call.live_agent_transcript = humans
+
     if recording_url:
         call.recording_url = recording_url[:1024]
+    if live_agent_recording_url:
+        call.live_agent_recording_url = live_agent_recording_url[:1024]
     sid = (twilio_call_sid or "").strip()
     if sid:
         call.warm_transfer_session_id = sid[:64]
@@ -569,6 +612,7 @@ def save_humans_transcript_for_call(
         update_fields=[
             "live_agent_transcript",
             "recording_url",
+            "live_agent_recording_url",
             "warm_transfer_session_id",
             "transcript",
             "updated_at",

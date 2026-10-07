@@ -196,6 +196,9 @@ class PersistToCallTests(unittest.TestCase):
             patient_offset=100.0,
             provider_offset=100.0,
             recording_url="https://s3.example.com/warm-transfer-recordings/patient.wav",
+            live_agent_recording_url=(
+                "https://s3.example.com/warm-transfer-recordings/provider.wav"
+            ),
             twilio_call_sid="CAfdf3f0de1aa3fad3010bca21bf9d2c27",
         )
         self.assertIs(saved, call)
@@ -211,6 +214,10 @@ class PersistToCallTests(unittest.TestCase):
         self.assertIn(call.transcript[1]["speaker"], {"patient", "live_agent"})
         self.assertEqual(
             call.warm_transfer_session_id, "CAfdf3f0de1aa3fad3010bca21bf9d2c27"
+        )
+        self.assertEqual(
+            call.live_agent_recording_url,
+            "https://s3.example.com/warm-transfer-recordings/provider.wav",
         )
         call.save.assert_called_once()
 

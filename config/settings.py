@@ -133,15 +133,23 @@ AWS_S3_BASE_URL = os.environ.get("AWS_S3_BASE_URL", "").rstrip("/")
 AWS_MEDIA_FOLDER = os.environ.get("AWS_MEDIA_FOLDER", "bayhealth")
 
 _REDIS_URL = os.getenv("CELERY_BROKER_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+_WT_FILE_CACHE = BASE_DIR / "apps" / "ai_caller" / "data" / "warm_transfer" / "cache"
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
     },
-    # Warm-transfer session state (replaces JSON files under apps/ai_caller/data/...)
+    # Warm-transfer session state (shared across workers via Redis).
     "warm_transfer": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
         "LOCATION": _REDIS_URL,
         "KEY_PREFIX": "wt",
+        "TIMEOUT": 60 * 60 * 24,
+    },
+    # Used only if Redis is down — file cache is shared across processes
+    # (LocMem is not, and caused patient/provider STT to lose each other).
+    "warm_transfer_file": {
+        "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+        "LOCATION": str(_WT_FILE_CACHE),
         "TIMEOUT": 60 * 60 * 24,
     },
 }

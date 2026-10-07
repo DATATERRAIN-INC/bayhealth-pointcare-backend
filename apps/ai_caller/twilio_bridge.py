@@ -8,13 +8,16 @@ with call recording, then transcribe that audio into humans_transcript.
 
 from __future__ import annotations
 
+import audioop
+import io
 import logging
 import re
 import threading
 import time
 import uuid
+import wave
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape
 
@@ -65,13 +68,16 @@ def _voice() -> str:
 
 
 def _session_cache():
-    """Prefer Redis warm_transfer cache; fall back to default if Redis is down."""
+    """Prefer Redis; fall back to shared file cache (never LocMem)."""
     try:
         cache = caches["warm_transfer"]
         cache.get("_wt_ping")
         return cache
     except Exception:
-        return caches["default"]
+        wt_logger.warning(
+            "TRANSFER_SESSION_CACHE_FALLBACK using file cache (redis unavailable)"
+        )
+        return caches["warm_transfer_file"]
 
 
 def _session_cache_key(session_id: str) -> str:
@@ -86,7 +92,7 @@ def load_session(session_id: str) -> Dict[str, Any]:
     try:
         data = _session_cache().get(_session_cache_key(session_id))
     except Exception:
-        data = caches["default"].get(_session_cache_key(session_id))
+        data = caches["warm_transfer_file"].get(_session_cache_key(session_id))
     return data if isinstance(data, dict) else {}
 
 
@@ -94,7 +100,7 @@ def load_pending_session() -> Dict[str, Any]:
     try:
         pending = _session_cache().get(_PENDING_CACHE_KEY)
     except Exception:
-        pending = caches["default"].get(_PENDING_CACHE_KEY)
+        pending = caches["warm_transfer_file"].get(_PENDING_CACHE_KEY)
     if not isinstance(pending, dict):
         return {}
     session_id = str(pending.get("session_id") or "").strip()
@@ -102,7 +108,7 @@ def load_pending_session() -> Dict[str, Any]:
 
 
 def save_session(session: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist warm-transfer state in Redis/cache — not on the filesystem."""
+    """Persist warm-transfer state in Redis (or shared file cache)."""
     session = dict(session or {})
     session_id = str(session.get("session_id") or "").strip()
     if not session_id:
@@ -117,7 +123,7 @@ def save_session(session: Dict[str, Any]) -> Dict[str, Any]:
             timeout=_SESSION_TTL_SECONDS,
         )
     except Exception:
-        fallback = caches["default"]
+        fallback = caches["warm_transfer_file"]
         fallback.set(
             _session_cache_key(session_id), session, timeout=_SESSION_TTL_SECONDS
         )
@@ -127,14 +133,93 @@ def save_session(session: Dict[str, Any]) -> Dict[str, Any]:
             timeout=_SESSION_TTL_SECONDS,
         )
         wt_logger.warning(
-            "TRANSFER_SESSION_CACHE_FALLBACK session=%s (redis unavailable)",
+            "TRANSFER_SESSION_CACHE_FALLBACK session=%s (file cache)",
             session_id,
         )
     return session
 
 
-def _sync_call_twilio_ids(session: Dict[str, Any], *, recording_url: str = "") -> None:
-    """Store Twilio Call SID (CA...) on Call.warm_transfer_session_id + recording URL."""
+def split_stereo_wav(audio: bytes) -> Tuple[bytes, bytes]:
+    """
+    Split Twilio dual-channel WAV into (left/inbound, right/outbound) mono WAVs.
+
+    On the patient call leg: left = patient mic, right = what patient hears
+    (live agent in conference).
+    """
+    if not audio:
+        return b"", b""
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wf:
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+    except Exception:
+        logger.exception("Failed to parse WAV for stereo split")
+        return audio, b""
+
+    if channels < 2:
+        return audio, b""
+
+    try:
+        left = audioop.tomono(frames, sampwidth, 1, 0)
+        right = audioop.tomono(frames, sampwidth, 0, 1)
+    except Exception:
+        logger.exception("Failed to split stereo channels")
+        return audio, b""
+
+    def _mono_wav(mono_frames: bytes) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(sampwidth)
+            out.setframerate(framerate)
+            out.writeframes(mono_frames)
+        return buf.getvalue()
+
+    return _mono_wav(left), _mono_wav(right)
+
+
+def patch_session(session_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge fields into the latest cached session.
+
+    Avoids lost updates when patient + provider STT finish in parallel
+    (each process must not overwrite the other leg's transcript).
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        return dict(updates or {})
+    latest = load_session(session_id) or {"session_id": session_id}
+    latest.update(dict(updates or {}))
+    latest["session_id"] = session_id
+    return save_session(latest)
+
+
+def _has_speaker_split(session: Dict[str, Any]) -> bool:
+    """True when we already have labeled patient + live_agent text."""
+    s = session or {}
+    if s.get("dual_channel_split") or s.get("diarized_from_patient_mono"):
+        return True
+    if s.get("mix_diarized_items"):
+        return True
+    patient = str(s.get("patient_transcript") or "").strip()
+    provider = str(s.get("provider_transcript") or "").strip()
+    return bool(patient and provider)
+
+
+def _should_skip_mix(session: Dict[str, Any]) -> bool:
+    """Skip conference-mix STT only when a real speaker split already exists."""
+    return _has_speaker_split(session)
+
+
+def _sync_call_twilio_ids(
+    session: Dict[str, Any],
+    *,
+    recording_url: str = "",
+    live_agent_recording_url: str = "",
+) -> None:
+    """Store Twilio CA SID + patient/live-agent recording URLs on Call."""
     from apps.ai_caller.models import Call
 
     retell_call_id = str((session or {}).get("retell_call_id") or "").strip()
@@ -149,21 +234,36 @@ def _sync_call_twilio_ids(session: Dict[str, Any], *, recording_url: str = "") -
         or (session or {}).get("dial_call_sid")
         or ""
     ).strip()
+    patient_url = (
+        recording_url
+        or str((session or {}).get("patient_recording_s3_url") or "")
+        or str((session or {}).get("patient_recording_url") or "")
+    ).strip()
+    agent_url = (
+        live_agent_recording_url
+        or str((session or {}).get("provider_recording_s3_url") or "")
+        or str((session or {}).get("provider_recording_url") or "")
+    ).strip()
     update_fields = []
     if twilio_call_sid and call.warm_transfer_session_id != twilio_call_sid:
         call.warm_transfer_session_id = twilio_call_sid[:64]
         update_fields.append("warm_transfer_session_id")
-    if recording_url and recording_url != (call.recording_url or ""):
-        call.recording_url = recording_url[:1024]
+    if patient_url and patient_url != (call.recording_url or ""):
+        call.recording_url = patient_url[:1024]
         update_fields.append("recording_url")
+    if agent_url and agent_url != (call.live_agent_recording_url or ""):
+        call.live_agent_recording_url = agent_url[:1024]
+        update_fields.append("live_agent_recording_url")
     if update_fields:
         update_fields.append("updated_at")
         call.save(update_fields=update_fields)
         wt_logger.info(
-            "TRANSFER_CALL_IDS retell_call_id=%s twilio_call_sid=%s recording=%s",
+            "TRANSFER_CALL_IDS retell_call_id=%s twilio_call_sid=%s "
+            "patient_recording=%s live_agent_recording=%s",
             retell_call_id,
             twilio_call_sid or "-",
-            bool(recording_url),
+            bool(patient_url),
+            bool(agent_url),
         )
 
 
@@ -491,52 +591,98 @@ def maybe_failover_on_agent_status(
 
 
 def start_leg_recording(session: Dict[str, Any], call_sid: str, leg: str) -> None:
-    """Record only that person's mic (inbound track) for speaker-split transcripts."""
+    """Start per-leg Twilio recording for speaker-split transcripts.
+
+    Patient: try dual-channel first (left=patient, right=agent audio patient hears),
+    then fall back to mono inbound. Provider: inbound mono.
+
+    Must be called once the call is in-conference — starting too early causes
+    Twilio error 21220 (not eligible for recording).
+    """
     session_id = str((session or {}).get("session_id") or "")
     call_sid = (call_sid or "").strip()
     leg = (leg or "").strip().lower()
     if not session_id or not call_sid or leg not in {"patient", "provider"}:
         return
     session = load_session(session_id) or dict(session or {})
-    if session.get(f"{leg}_recording_started"):
+    if session.get(f"{leg}_recording_started") and session.get(
+        f"{leg}_twilio_recording_sid"
+    ):
         return
     client = _twilio_client()
     if client is None:
         return
+
+    attempts = []
+    if leg == "patient":
+        attempts.append({"channels": "dual", "track": "both", "dual": True})
+    attempts.append({"channels": "mono", "track": "inbound", "dual": False})
+
     session[f"{leg}_recording_started"] = True
-    # Wall-clock anchor so patient/provider segment times can be interleaved.
     session[f"{leg}_recording_started_at"] = time.time()
     save_session(session)
-    try:
-        rec = client.calls(call_sid).recordings.create(
-            recording_channels="mono",
-            recording_track="inbound",
-            recording_status_callback=_abs_url(
-                "/api/ai-call/twilio/warm-transfer/recording/",
+
+    last_err = None
+    for attempt in attempts:
+        try:
+            rec = client.calls(call_sid).recordings.create(
+                recording_channels=attempt["channels"],
+                recording_track=attempt["track"],
+                recording_status_callback=_abs_url(
+                    "/api/ai-call/twilio/warm-transfer/recording/",
+                    session_id,
+                    leg=leg,
+                ),
+                recording_status_callback_event=["completed"],
+                recording_status_callback_method="POST",
+            )
+            patch_session(
                 session_id,
-                leg=leg,
-            ),
-            recording_status_callback_event=["completed"],
-            recording_status_callback_method="POST",
-        )
-        session[f"{leg}_twilio_recording_sid"] = str(getattr(rec, "sid", "") or "")
-        save_session(session)
-        logger.info(
-            "Started %s inbound recording session=%s call=%s rec=%s",
-            leg,
-            session_id,
-            call_sid,
-            session.get(f"{leg}_twilio_recording_sid"),
-        )
-    except Exception:
-        session[f"{leg}_recording_started"] = False
-        save_session(session)
-        logger.exception(
-            "Failed to start %s recording session=%s call=%s",
-            leg,
-            session_id,
-            call_sid,
-        )
+                {
+                    f"{leg}_twilio_recording_sid": str(getattr(rec, "sid", "") or ""),
+                    f"{leg}_recording_dual": bool(attempt["dual"]),
+                    f"{leg}_recording_started": True,
+                },
+            )
+            logger.info(
+                "Started %s recording session=%s call=%s rec=%s dual=%s channels=%s",
+                leg,
+                session_id,
+                call_sid,
+                getattr(rec, "sid", ""),
+                attempt["dual"],
+                attempt["channels"],
+            )
+            return
+        except Exception as exc:
+            last_err = exc
+            err_text = str(exc)
+            # 21220 = not eligible yet / unsupported mode — try next attempt.
+            if "21220" in err_text or "not eligible" in err_text.lower():
+                wt_logger.warning(
+                    "TRANSFER_RECORDING_RETRY session=%s leg=%s dual=%s err=%s",
+                    session_id,
+                    leg,
+                    attempt["dual"],
+                    err_text[:180],
+                )
+                continue
+            break
+
+    patch_session(
+        session_id,
+        {
+            f"{leg}_recording_started": False,
+            f"{leg}_twilio_recording_sid": "",
+        },
+    )
+    wt_logger.error(
+        "TRANSFER_RECORDING_FAIL session=%s leg=%s call=%s err=%s",
+        session_id,
+        leg,
+        call_sid,
+        (str(last_err) if last_err else "unknown")[:300],
+    )
 
 
 def start_leg_recording_for_call(session: Dict[str, Any], call_sid: str) -> None:
@@ -581,6 +727,13 @@ def announce_you_can_speak_now(session: Dict[str, Any], conference_sid: str) -> 
         logger.exception("Failed to announce connected session=%s", session_id)
 
 
+def _delayed_start_leg_recording(session_id: str, call_sid: str, leg: str) -> None:
+    """Wait briefly so Twilio marks the call in-conference (avoids 21220)."""
+    time.sleep(1.5)
+    session = load_session(session_id) or {"session_id": session_id}
+    start_leg_recording(session, call_sid, leg)
+
+
 def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -> None:
     session = dict(session or {})
     event = (
@@ -592,7 +745,20 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
         session["conference_sid"] = conference_sid
         save_session(session)
     if event == "join" and join_call:
-        start_leg_recording_for_call(session, join_call)
+        session = load_session(str(session.get("session_id") or "")) or session
+        inbound_sid = str(session.get("call_sid") or "").strip()
+        dial_sid = str(session.get("dial_call_sid") or "").strip()
+        leg = ""
+        if dial_sid and join_call == dial_sid:
+            leg = str(session.get("dial_speaker") or "provider")
+        elif inbound_sid and join_call == inbound_sid:
+            leg = str(session.get("inbound_speaker") or "patient")
+        if leg:
+            threading.Thread(
+                target=_delayed_start_leg_recording,
+                args=(str(session.get("session_id") or ""), join_call, leg),
+                daemon=True,
+            ).start()
         session = load_session(str(session.get("session_id") or "")) or session
     if event != "join" or session.get("spoke_now") or not conference_sid:
         return
@@ -703,16 +869,39 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
     provider = str(session.get("provider_transcript") or "")
     mix = ""
     mix_items = session.get("mix_diarized_items") or None
-    if not patient and not provider and not mix_items:
+    # Prefer a real speaker split (both legs or diarized mix).
+    if patient and provider:
+        mix = ""
+        mix_items = None
+    elif mix_items:
+        # Diarized conference mix beats a single-leg wall.
+        patient = ""
+        provider = ""
+        mix = ""
+    elif not patient and not provider:
         mix = str(session.get("humans_transcript") or "")
+    else:
+        # One leg only — keep it; do not attach undiarized mix wall.
+        mix = ""
+        mix_items = None
     # Prefer S3 URLs we uploaded; fall back to Twilio media URLs.
     recording_url = (
         str(session.get("patient_recording_s3_url") or "")
-        or str(session.get("provider_recording_s3_url") or "")
-        or str(session.get("mix_recording_s3_url") or "")
         or str(session.get("patient_recording_url") or "")
+        or (
+            str(session.get("mix_recording_s3_url") or "")
+            if not patient and not provider
+            else ""
+        )
+        or (
+            str(session.get("mix_recording_url") or "")
+            if not patient and not provider
+            else ""
+        )
+    )
+    live_agent_recording_url = (
+        str(session.get("provider_recording_s3_url") or "")
         or str(session.get("provider_recording_url") or "")
-        or str(session.get("mix_recording_url") or "")
     )
     twilio_call_sid = str(
         session.get("call_sid") or session.get("dial_call_sid") or ""
@@ -730,6 +919,7 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
             provider_text=provider,
             mix_text=mix,
             recording_url=recording_url,
+            live_agent_recording_url=live_agent_recording_url,
             twilio_call_sid=twilio_call_sid,
             patient_segments=session.get("patient_segments") or [],
             provider_segments=session.get("provider_segments") or [],
@@ -740,12 +930,13 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
         if call and (call.live_agent_transcript or []):
             wt_logger.info(
                 "TRANSFER_TRANSCRIPT_OK retell_call_id=%s twilio_call_sid=%s "
-                "humans=%s merged=%s recording=%s",
+                "humans=%s merged=%s patient_recording=%s live_agent_recording=%s",
                 retell_call_id,
                 twilio_call_sid or "-",
                 len(call.live_agent_transcript or []),
                 len(call.transcript or []),
                 (call.recording_url or "")[:120],
+                (call.live_agent_recording_url or "")[:120],
             )
         else:
             wt_logger.warning(
@@ -774,12 +965,16 @@ def _persist_mix_transcript(
     recording_url: str,
     recording_sid: str = "",
 ) -> Dict[str, Any]:
-    """Fallback when per-speaker inbound recordings never appear."""
-    session = dict(session or {})
-    session_id = str(session.get("session_id") or "")
-    if session.get("patient_transcript") or session.get("provider_transcript"):
+    """Fallback only when per-speaker inbound recordings never appear."""
+    session_id = str((session or {}).get("session_id") or "")
+    session = load_session(session_id) or dict(session or {})
+    if _should_skip_mix(session):
+        wt_logger.info(
+            "TRANSFER_MIX_SKIP session=%s reason=speaker_split_ready",
+            session_id,
+        )
         return session
-    if session.get("mix_saved"):
+    if session.get("mix_saved") and session.get("mix_diarized_items"):
         return session
     time.sleep(4)
     audio = _download_twilio_recording(recording_url)
@@ -789,6 +984,14 @@ def _persist_mix_transcript(
             session_id,
             (recording_url or "")[:160],
         )
+    # Re-check after download wait — dual/per-leg STT may have finished.
+    session = load_session(session_id) or session
+    if _should_skip_mix(session):
+        wt_logger.info(
+            "TRANSFER_MIX_SKIP session=%s reason=speaker_split_ready_after_wait",
+            session_id,
+        )
+        return session
     s3_url = _upload_recording_audio(
         audio,
         retell_call_id=str(session.get("retell_call_id") or ""),
@@ -798,46 +1001,110 @@ def _persist_mix_transcript(
     diarized_items = (
         transcribe_mix_with_diarization(audio, filename="mix.wav") if audio else []
     )
-    text = ""
-    if diarized_items:
-        session["mix_diarized_items"] = diarized_items
-        text = " ".join(
-            str(item.get("text") or "").strip()
-            for item in diarized_items
-            if str(item.get("text") or "").strip()
-        )
-    elif audio:
-        text = transcribe_recording_bytes(audio, filename="mix.wav")
-    session["humans_transcript"] = text
-    session["mix_recording_url"] = recording_url
-    session["mix_recording_sid"] = recording_sid
-    if s3_url:
-        session["mix_recording_s3_url"] = s3_url
-    session["mix_saved"] = True
-    session["humans_saved"] = bool(diarized_items or (text or "").strip())
-    session["call_status"] = "ended"
-    save_session(session)
-    _sync_call_twilio_ids(session, recording_url=s3_url or recording_url)
-    if session["humans_saved"]:
-        _persist_to_db(session)
-        restore_inbound_voice_url(session)
-        wt_logger.info(
-            "TRANSFER_SUCCESS session=%s leg=mix chars=%s diarized=%s",
+    # Never store an undiarized mixed wall as the humans transcript.
+    if not diarized_items:
+        patch_session(
             session_id,
-            len(text or ""),
-            len(diarized_items or []),
+            {
+                "mix_saved": True,
+                "mix_recording_url": recording_url,
+                "mix_recording_sid": recording_sid,
+                **({"mix_recording_s3_url": s3_url} if s3_url else {}),
+            },
         )
-    else:
         wt_logger.error(
-            "TRANSFER_FAIL session=%s leg=mix reason=empty_transcript",
+            "TRANSFER_FAIL session=%s leg=mix reason=no_diarization",
             session_id,
         )
-    logger.info(
-        "Saved mixed humans transcript session=%s chars=%s diarized_turns=%s",
+        return load_session(session_id) or session
+
+    text = " ".join(
+        str(item.get("text") or "").strip()
+        for item in diarized_items
+        if str(item.get("text") or "").strip()
+    )
+    session = patch_session(
+        session_id,
+        {
+            "mix_diarized_items": diarized_items,
+            "humans_transcript": text,
+            "mix_recording_url": recording_url,
+            "mix_recording_sid": recording_sid,
+            **({"mix_recording_s3_url": s3_url} if s3_url else {}),
+            "mix_saved": True,
+            "humans_saved": True,
+            "db_persisted_complete": True,
+            "call_status": "ended",
+        },
+    )
+    _sync_call_twilio_ids(session, recording_url=s3_url or recording_url)
+    _persist_to_db(session)
+    restore_inbound_voice_url(session)
+    wt_logger.info(
+        "TRANSFER_SUCCESS session=%s leg=mix chars=%s diarized=%s",
         session_id,
         len(text or ""),
         len(diarized_items or []),
     )
+    return session
+
+
+def _finalize_leg_persist(session_id: str, *, speaker: str = "") -> Dict[str, Any]:
+    """Reload both legs from cache and write merged transcript once ready."""
+    session = load_session(session_id) or {}
+    patient = str(session.get("patient_transcript") or "")
+    provider = str(session.get("provider_transcript") or "")
+    both_ready = bool(patient and provider)
+    if not patient and not provider:
+        return session
+    if session.get("db_persisted_complete") and both_ready:
+        return session
+
+    patient_recording = (
+        str(session.get("patient_recording_s3_url") or "")
+        or str(session.get("patient_recording_url") or "")
+    )
+    live_agent_recording = (
+        str(session.get("provider_recording_s3_url") or "")
+        or str(session.get("provider_recording_url") or "")
+    )
+    updates: Dict[str, Any] = {
+        "humans_transcript": _combined_speaker_transcript(patient, provider),
+        "humans_saved": both_ready,
+    }
+    if both_ready:
+        updates["call_status"] = "ended"
+        updates["db_persisted_complete"] = True
+    # Stop poller spam once both legs were attempted (even if one STT empty).
+    if session.get("patient_saved") and session.get("provider_saved"):
+        updates["db_persisted_complete"] = True
+        updates["call_status"] = "ended"
+    session = patch_session(session_id, updates)
+    _sync_call_twilio_ids(
+        session,
+        recording_url=patient_recording,
+        live_agent_recording_url=live_agent_recording,
+    )
+    _persist_to_db(session)
+    if both_ready:
+        restore_inbound_voice_url(session)
+        wt_logger.info(
+            "TRANSFER_SUCCESS session=%s leg=%s patient_chars=%s provider_chars=%s both=1 "
+            "twilio_call_sid=%s",
+            session_id,
+            speaker or "-",
+            len(patient),
+            len(provider),
+            str(session.get("call_sid") or session.get("dial_call_sid") or "-"),
+        )
+    elif session.get("patient_saved") and session.get("provider_saved"):
+        wt_logger.warning(
+            "TRANSFER_PARTIAL session=%s patient_chars=%s provider_chars=%s",
+            session_id,
+            len(patient),
+            len(provider),
+        )
+        restore_inbound_voice_url(session)
     return session
 
 
@@ -861,18 +1128,18 @@ def persist_humans_transcript(
     if speaker not in {"patient", "provider"}:
         logger.info("Skipping unlabeled warm-transfer recording session=%s", session_id)
         return session
-    if session.get(f"{speaker}_stt_started") or session.get(f"{speaker}_transcript"):
-        patient = str(session.get("patient_transcript") or "")
-        provider = str(session.get("provider_transcript") or "")
-        if patient or provider:
-            session["humans_saved"] = bool(patient and provider)
-            save_session(session)
-            _persist_to_db(session)
-            if patient and provider:
-                restore_inbound_voice_url(session)
+
+    # Already transcribed this leg — merge from latest cache, do not re-STT.
+    if session.get(f"{speaker}_saved") or (
+        session.get(f"{speaker}_transcript") and session.get(f"{speaker}_stt_started")
+    ):
+        return _finalize_leg_persist(session_id, speaker=speaker)
+
+    # Another worker is already STT'ing this leg.
+    if session.get(f"{speaker}_stt_started"):
         return session
-    session[f"{speaker}_stt_started"] = True
-    save_session(session)
+
+    patch_session(session_id, {f"{speaker}_stt_started": True})
     time.sleep(4)
     audio = _download_twilio_recording(recording_url)
     if not audio:
@@ -882,69 +1149,163 @@ def persist_humans_transcript(
             speaker,
             (recording_url or "")[:160],
         )
+        patch_session(session_id, {f"{speaker}_stt_started": False})
+        return load_session(session_id) or session
+
+    retell_call_id = str(
+        (load_session(session_id) or session).get("retell_call_id") or ""
+    )
     s3_url = _upload_recording_audio(
         audio,
-        retell_call_id=str(session.get("retell_call_id") or ""),
+        retell_call_id=retell_call_id,
         leg=speaker,
         recording_sid=recording_sid,
     )
-    detailed = (
-        transcribe_recording_detailed(audio, filename=f"{speaker}.wav")
-        if audio
-        else {"text": "", "segments": []}
-    )
-    text = str(detailed.get("text") or "")
-    segments = detailed.get("segments") or []
-    session[f"{speaker}_transcript"] = text
-    session[f"{speaker}_segments"] = segments
-    session[f"{speaker}_recording_url"] = recording_url
-    session[f"{speaker}_recording_sid"] = recording_sid
+
+    # Patient dual-channel: left=patient, right=live agent (what patient hears).
+    left_audio, right_audio = (b"", b"")
+    if speaker == "patient":
+        left_audio, right_audio = split_stereo_wav(audio)
+
+    leg_updates: Dict[str, Any] = {
+        f"{speaker}_recording_url": recording_url,
+        f"{speaker}_recording_sid": recording_sid,
+        f"{speaker}_saved": True,
+        f"{speaker}_stt_started": True,
+    }
     if s3_url:
-        session[f"{speaker}_recording_s3_url"] = s3_url
-    session[f"{speaker}_saved"] = True
-    patient = str(session.get("patient_transcript") or "")
-    provider = str(session.get("provider_transcript") or "")
-    session["humans_transcript"] = _combined_speaker_transcript(patient, provider)
-    both_ready = bool(patient and provider)
-    # Persist as soon as any leg has text; refresh again when the second arrives.
-    session["humans_saved"] = both_ready
-    session["call_status"] = "ended" if both_ready else (
-        session.get("call_status") or "ended"
-    )
-    save_session(session)
-    stored_recording = (
-        str(session.get("patient_recording_s3_url") or "")
-        or str(session.get("provider_recording_s3_url") or "")
-        or s3_url
-        or recording_url
-    )
-    _sync_call_twilio_ids(session, recording_url=stored_recording)
-    if patient or provider:
-        _persist_to_db(session)
-    if both_ready:
-        restore_inbound_voice_url(session)
-        wt_logger.info(
-            "TRANSFER_SUCCESS session=%s leg=%s chars=%s segments=%s both=1 "
-            "twilio_call_sid=%s",
-            session_id,
-            speaker,
-            len(text),
-            len(segments),
-            str(session.get("call_sid") or session.get("dial_call_sid") or "-"),
+        leg_updates[f"{speaker}_recording_s3_url"] = s3_url
+
+    if speaker == "patient" and right_audio:
+        patient_detailed = transcribe_recording_detailed(
+            left_audio or audio, filename="patient.wav"
         )
-    elif not text:
+        provider_detailed = transcribe_recording_detailed(
+            right_audio, filename="provider_from_dual.wav"
+        )
+        patient_text = str(patient_detailed.get("text") or "")
+        provider_text = str(provider_detailed.get("text") or "")
+        leg_updates.update(
+            {
+                "patient_transcript": patient_text,
+                "patient_segments": patient_detailed.get("segments") or [],
+                "provider_transcript": provider_text,
+                "provider_segments": provider_detailed.get("segments") or [],
+                "provider_saved": True,
+                "provider_stt_started": True,
+                "dual_channel_split": True,
+            }
+        )
+        # Keep separate agent audio URL on Call when we upload right channel.
+        agent_s3 = _upload_recording_audio(
+            right_audio,
+            retell_call_id=retell_call_id,
+            leg="provider",
+            recording_sid=f"{recording_sid}_R",
+        )
+        if agent_s3:
+            leg_updates["provider_recording_s3_url"] = agent_s3
+        wt_logger.info(
+            "TRANSFER_DUAL_SPLIT session=%s patient_chars=%s provider_chars=%s",
+            session_id,
+            len(patient_text),
+            len(provider_text),
+        )
+        text = patient_text
+        segments = patient_detailed.get("segments") or []
+    elif speaker == "patient":
+        # Mono mix fallback: diarize so we don't store one Patient wall.
+        detailed = transcribe_recording_detailed(audio, filename="patient.wav")
+        text = str(detailed.get("text") or "")
+        segments = detailed.get("segments") or []
+        diarized = transcribe_mix_with_diarization(audio, filename="patient_mix.wav")
+        speakers = {str(i.get("speaker") or "") for i in (diarized or [])}
+        if diarized and speakers & {"patient", "live_agent"} and len(speakers) >= 2:
+            patient_parts = [
+                str(i.get("text") or "").strip()
+                for i in diarized
+                if i.get("speaker") == "patient" and str(i.get("text") or "").strip()
+            ]
+            provider_parts = [
+                str(i.get("text") or "").strip()
+                for i in diarized
+                if i.get("speaker") == "live_agent" and str(i.get("text") or "").strip()
+            ]
+            leg_updates.update(
+                {
+                    "patient_transcript": " ".join(patient_parts),
+                    "provider_transcript": " ".join(provider_parts),
+                    "patient_segments": [
+                        {"start": i.get("at") or 0, "end": i.get("at") or 0, "text": i.get("text")}
+                        for i in diarized
+                        if i.get("speaker") == "patient"
+                    ],
+                    "provider_segments": [
+                        {"start": i.get("at") or 0, "end": i.get("at") or 0, "text": i.get("text")}
+                        for i in diarized
+                        if i.get("speaker") == "live_agent"
+                    ],
+                    "mix_diarized_items": diarized,
+                    "provider_saved": True,
+                    "provider_stt_started": True,
+                    "diarized_from_patient_mono": True,
+                }
+            )
+            wt_logger.info(
+                "TRANSFER_DIARIZE_FALLBACK session=%s turns=%s speakers=%s",
+                session_id,
+                len(diarized),
+                sorted(speakers),
+            )
+        else:
+            leg_updates["patient_transcript"] = text
+            leg_updates["patient_segments"] = segments
+    else:
+        detailed = (
+            transcribe_recording_detailed(audio, filename=f"{speaker}.wav")
+            if audio
+            else {"text": "", "segments": []}
+        )
+        text = str(detailed.get("text") or "")
+        segments = detailed.get("segments") or []
+        # Do not overwrite dual-split provider text with empty inbound STT.
+        latest = load_session(session_id) or {}
+        if speaker == "provider" and latest.get("dual_channel_split") and (
+            latest.get("provider_transcript") or ""
+        ).strip():
+            leg_updates = {
+                "provider_recording_url": recording_url,
+                "provider_recording_sid": recording_sid,
+                "provider_saved": True,
+                "provider_stt_started": True,
+            }
+            if s3_url and not latest.get("provider_recording_s3_url"):
+                leg_updates["provider_recording_s3_url"] = s3_url
+            text = str(latest.get("provider_transcript") or "")
+            segments = latest.get("provider_segments") or []
+        else:
+            leg_updates[f"{speaker}_transcript"] = text
+            leg_updates[f"{speaker}_segments"] = segments
+
+    patch_session(session_id, leg_updates)
+
+    session = _finalize_leg_persist(session_id, speaker=speaker)
+    if not text and speaker == "patient":
         wt_logger.error(
             "TRANSFER_FAIL session=%s leg=%s reason=empty_stt",
             session_id,
             speaker,
         )
     logger.info(
-        "Saved %s transcript session=%s chars=%s segments=%s both=%s",
+        "Saved %s transcript session=%s chars=%s segments=%s both=%s dual=%s",
         speaker,
         session_id,
         len(text),
         len(segments),
-        both_ready,
+        bool(
+            session.get("patient_transcript") and session.get("provider_transcript")
+        ),
+        bool(session.get("dual_channel_split")),
     )
     return session
 
@@ -959,7 +1320,12 @@ def _poll_twilio_recording(session_id: str) -> None:
         if not session:
             time.sleep(_POLL_INTERVAL_SECONDS)
             continue
-        if session.get("patient_transcript") and session.get("provider_transcript"):
+        if session.get("db_persisted_complete") or (
+            session.get("patient_transcript") and session.get("provider_transcript")
+        ):
+            if session.get("patient_transcript") and session.get("provider_transcript"):
+                if not session.get("db_persisted_complete"):
+                    _finalize_leg_persist(session_id, speaker="poll")
             return
         call_sid = str(session.get("call_sid") or "").strip()
         dial_sid = str(session.get("dial_call_sid") or "").strip()
@@ -981,10 +1347,14 @@ def _poll_twilio_recording(session_id: str) -> None:
             logger.exception("Twilio recording list failed call_sid=%s", call_sid)
             time.sleep(_POLL_INTERVAL_SECONDS)
             continue
+        processed = set(session.get("processed_recording_sids") or [])
         for rec in recordings:
             rec_status = str(getattr(rec, "status", "") or "").lower()
             duration = int(getattr(rec, "duration", 0) or 0)
             if rec_status != "completed" or duration < 3:
+                continue
+            rec_sid = str(getattr(rec, "sid", "") or "")
+            if rec_sid and rec_sid in processed:
                 continue
             uri = str(getattr(rec, "uri", "") or "").split(".json")[0]
             account = (getattr(settings, "TWILIO_ACCOUNT_SID", "") or "").strip()
@@ -1001,14 +1371,26 @@ def _poll_twilio_recording(session_id: str) -> None:
                 rec_leg = "patient"
             else:
                 rec_leg = "mix"
+            if rec_leg == "mix" and _should_skip_mix(session):
+                continue
             persist_humans_transcript(
                 session,
                 recording_url=recording_url,
-                recording_sid=str(getattr(rec, "sid", "") or ""),
+                recording_sid=rec_sid,
                 leg=rec_leg,
             )
+            if rec_sid:
+                processed.add(rec_sid)
+                patch_session(
+                    session_id, {"processed_recording_sids": list(processed)}
+                )
             session = load_session(session_id)
-            if session.get("patient_transcript") and session.get("provider_transcript"):
+            if session.get("db_persisted_complete") or (
+                session.get("patient_transcript")
+                and session.get("provider_transcript")
+            ):
+                if not session.get("db_persisted_complete"):
+                    _finalize_leg_persist(session_id, speaker="poll")
                 return
         time.sleep(_POLL_INTERVAL_SECONDS)
     logger.warning("Timed out waiting for two-human recording session=%s", session_id)

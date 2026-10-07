@@ -176,7 +176,10 @@ class Call(models.Model):
     transcript = models.JSONField(default=list, blank=True)
     retell_transcript = models.JSONField(default=list, blank=True)
     live_agent_transcript = models.JSONField(default=list, blank=True)
+    # Patient (inbound) warm-transfer recording URL (S3 preferred).
     recording_url = models.CharField(max_length=1024, blank=True, default="")
+    # Live-agent / provider warm-transfer recording URL (S3 preferred).
+    live_agent_recording_url = models.CharField(max_length=1024, blank=True, default="")
     # Twilio Call SID for the warm-transfer patient leg (CA...).
     warm_transfer_session_id = models.CharField(max_length=64, blank=True, default="")
     started_at = models.DateTimeField(null=True, blank=True, default=timezone.now)
