@@ -237,6 +237,13 @@ class CallerSettings(models.Model):
         help_text="Max simultaneous in-progress outbound calls. New dials fill free slots only.",
     )
     call_trigger_count = models.PositiveIntegerField(default=3)
+    sms_trigger_after_calls = models.PositiveIntegerField(
+        default=3,
+        help_text=(
+            "After this many consecutive not-attended calls, auto-start SMS "
+            "(when text_sms_enabled). Must be <= call_trigger_count."
+        ),
+    )
     reminder_timeframe_hours = models.PositiveIntegerField(
         default=24,
         help_text="Hours to wait after a missed call before the next reminder call.",
