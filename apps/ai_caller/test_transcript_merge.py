@@ -181,7 +181,7 @@ class PersistToCallTests(unittest.TestCase):
         call.recording_url = ""
         mock_objects.filter.return_value.first.return_value = call
 
-        saved = save_humans_transcript_for_call(  # noqa: uses patched Call.objects
+        saved = save_humans_transcript_for_call(
             retell_call_id="call_test_123",
             patient_text=_PATIENT_TEXT,
             provider_text=_PROVIDER_TEXT,
@@ -195,8 +195,8 @@ class PersistToCallTests(unittest.TestCase):
             ],
             patient_offset=100.0,
             provider_offset=100.0,
-            recording_url="https://api.twilio.com/rec.wav",
-            session_id="sess123",
+            recording_url="https://s3.example.com/warm-transfer-recordings/patient.wav",
+            twilio_call_sid="CAfdf3f0de1aa3fad3010bca21bf9d2c27",
         )
         self.assertIs(saved, call)
         humans = call.live_agent_transcript
@@ -209,6 +209,9 @@ class PersistToCallTests(unittest.TestCase):
         # Merged transcript must include AI then humans.
         self.assertEqual(call.transcript[0]["segment"], "ai")
         self.assertIn(call.transcript[1]["speaker"], {"patient", "live_agent"})
+        self.assertEqual(
+            call.warm_transfer_session_id, "CAfdf3f0de1aa3fad3010bca21bf9d2c27"
+        )
         call.save.assert_called_once()
 
 

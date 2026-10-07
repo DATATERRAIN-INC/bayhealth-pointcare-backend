@@ -132,10 +132,18 @@ COGNITO_APP_CLIENT_SECRET = os.environ.get("COGNITO_CLIENT_SECRET", "COGNITO_APP
 AWS_S3_BASE_URL = os.environ.get("AWS_S3_BASE_URL", "").rstrip("/")
 AWS_MEDIA_FOLDER = os.environ.get("AWS_MEDIA_FOLDER", "bayhealth")
 
+_REDIS_URL = os.getenv("CELERY_BROKER_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-    }
+    },
+    # Warm-transfer session state (replaces JSON files under apps/ai_caller/data/...)
+    "warm_transfer": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": _REDIS_URL,
+        "KEY_PREFIX": "wt",
+        "TIMEOUT": 60 * 60 * 24,
+    },
 }
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
@@ -212,10 +220,22 @@ LOGGING = {
             "backupCount": 5,
             "formatter": "dialer",
         },
+        "warm_transfer_file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(LOG_DIR / "warm_transfer.log"),
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 5,
+            "formatter": "dialer",
+        },
     },
     "loggers": {
         "ai_caller.dialer": {
             "handlers": ["dialer_file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "ai_caller.warm_transfer": {
+            "handlers": ["warm_transfer_file"],
             "level": "INFO",
             "propagate": False,
         },

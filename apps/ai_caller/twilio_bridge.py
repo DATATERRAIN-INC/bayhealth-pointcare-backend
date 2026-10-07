@@ -8,19 +8,18 @@ with call recording, then transcribe that audio into humans_transcript.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape
 
 from django.conf import settings
+from django.core.cache import caches
 
 from apps.ai_caller.retell import _digits, normalize_phone
 from apps.ai_caller.transcript_merge import (
@@ -31,6 +30,10 @@ from apps.ai_caller.transcript_merge import (
 )
 
 logger = logging.getLogger(__name__)
+wt_logger = logging.getLogger("ai_caller.warm_transfer")
+
+_SESSION_TTL_SECONDS = 60 * 60 * 24
+_PENDING_CACHE_KEY = "warm_transfer:pending"
 
 _POLL_INTERVAL_SECONDS = 5
 _YES_RE = re.compile(
@@ -61,49 +64,133 @@ def _voice() -> str:
     return raw
 
 
-def sessions_dir() -> Path:
-    return Path(settings.BASE_DIR) / "apps" / "ai_caller" / "data" / "warm_transfer" / "sessions"
+def _session_cache():
+    """Prefer Redis warm_transfer cache; fall back to default if Redis is down."""
+    try:
+        cache = caches["warm_transfer"]
+        cache.get("_wt_ping")
+        return cache
+    except Exception:
+        return caches["default"]
 
 
-def _session_path(session_id: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:80]
-    return sessions_dir() / f"{safe}.json"
+def _session_cache_key(session_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", (session_id or "").strip())[:80]
+    return f"warm_transfer:session:{safe}"
 
 
 def load_session(session_id: str) -> Dict[str, Any]:
-    path = _session_path(session_id)
-    if not path.exists():
+    session_id = (session_id or "").strip()
+    if not session_id:
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+        data = _session_cache().get(_session_cache_key(session_id))
+    except Exception:
+        data = caches["default"].get(_session_cache_key(session_id))
     return data if isinstance(data, dict) else {}
 
 
 def load_pending_session() -> Dict[str, Any]:
-    pending = sessions_dir() / "pending.json"
-    if not pending.exists():
-        return {}
     try:
-        data = json.loads(pending.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        pending = _session_cache().get(_PENDING_CACHE_KEY)
+    except Exception:
+        pending = caches["default"].get(_PENDING_CACHE_KEY)
+    if not isinstance(pending, dict):
         return {}
-    session_id = str((data or {}).get("session_id") or "").strip()
+    session_id = str(pending.get("session_id") or "").strip()
     return load_session(session_id) if session_id else {}
 
 
 def save_session(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist warm-transfer state in Redis/cache — not on the filesystem."""
     session = dict(session or {})
     session_id = str(session.get("session_id") or "").strip()
     if not session_id:
         return session
     session["updated_at"] = datetime.now(timezone.utc).isoformat()
-    folder = sessions_dir()
-    folder.mkdir(parents=True, exist_ok=True)
-    path = _session_path(session_id)
-    path.write_text(json.dumps(session, indent=2) + "\n", encoding="utf-8")
+    cache = _session_cache()
+    try:
+        cache.set(_session_cache_key(session_id), session, timeout=_SESSION_TTL_SECONDS)
+        cache.set(
+            _PENDING_CACHE_KEY,
+            {"session_id": session_id},
+            timeout=_SESSION_TTL_SECONDS,
+        )
+    except Exception:
+        fallback = caches["default"]
+        fallback.set(
+            _session_cache_key(session_id), session, timeout=_SESSION_TTL_SECONDS
+        )
+        fallback.set(
+            _PENDING_CACHE_KEY,
+            {"session_id": session_id},
+            timeout=_SESSION_TTL_SECONDS,
+        )
+        wt_logger.warning(
+            "TRANSFER_SESSION_CACHE_FALLBACK session=%s (redis unavailable)",
+            session_id,
+        )
     return session
+
+
+def _sync_call_twilio_ids(session: Dict[str, Any], *, recording_url: str = "") -> None:
+    """Store Twilio Call SID (CA...) on Call.warm_transfer_session_id + recording URL."""
+    from apps.ai_caller.models import Call
+
+    retell_call_id = str((session or {}).get("retell_call_id") or "").strip()
+    if not retell_call_id:
+        return
+    call = Call.objects.filter(retell_call_id=retell_call_id).first()
+    if not call:
+        return
+
+    twilio_call_sid = str(
+        (session or {}).get("call_sid")
+        or (session or {}).get("dial_call_sid")
+        or ""
+    ).strip()
+    update_fields = []
+    if twilio_call_sid and call.warm_transfer_session_id != twilio_call_sid:
+        call.warm_transfer_session_id = twilio_call_sid[:64]
+        update_fields.append("warm_transfer_session_id")
+    if recording_url and recording_url != (call.recording_url or ""):
+        call.recording_url = recording_url[:1024]
+        update_fields.append("recording_url")
+    if update_fields:
+        update_fields.append("updated_at")
+        call.save(update_fields=update_fields)
+        wt_logger.info(
+            "TRANSFER_CALL_IDS retell_call_id=%s twilio_call_sid=%s recording=%s",
+            retell_call_id,
+            twilio_call_sid or "-",
+            bool(recording_url),
+        )
+
+
+def _upload_recording_audio(
+    audio: bytes, *, retell_call_id: str, leg: str, recording_sid: str = ""
+) -> str:
+    """Upload Twilio recording bytes to S3; return public/media URL."""
+    if not audio:
+        return ""
+    try:
+        from common.s3 import build_s3_url, upload_bytes
+
+        filename = f"{leg}_{(recording_sid or retell_call_id or 'call')[:32]}.wav"
+        key = upload_bytes(
+            audio,
+            filename=filename,
+            folder="warm-transfer-recordings",
+            content_type="audio/wav",
+        )
+        return build_s3_url(key)
+    except Exception:
+        wt_logger.exception(
+            "TRANSFER_RECORDING_UPLOAD_FAILED retell_call_id=%s leg=%s",
+            retell_call_id,
+            leg,
+        )
+        return ""
 
 
 def _twilio_client():
@@ -368,7 +455,7 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
         try:
             from apps.ai_caller.models import Call
 
-            Call.all_objects.filter(retell_call_id=retell_call_id).update(
+            Call.objects.filter(retell_call_id=retell_call_id).update(
                 transfer_number=nxt
             )
         except Exception:
@@ -607,6 +694,10 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
     session = dict(session or {})
     retell_call_id = str(session.get("retell_call_id") or "").strip()
     if not retell_call_id:
+        wt_logger.error(
+            "TRANSFER_TRANSCRIPT_FAIL session=%s reason=missing_retell_call_id",
+            session.get("session_id"),
+        )
         return
     patient = str(session.get("patient_transcript") or "")
     provider = str(session.get("provider_transcript") or "")
@@ -614,11 +705,18 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
     mix_items = session.get("mix_diarized_items") or None
     if not patient and not provider and not mix_items:
         mix = str(session.get("humans_transcript") or "")
+    # Prefer S3 URLs we uploaded; fall back to Twilio media URLs.
     recording_url = (
-        str(session.get("patient_recording_url") or "")
+        str(session.get("patient_recording_s3_url") or "")
+        or str(session.get("provider_recording_s3_url") or "")
+        or str(session.get("mix_recording_s3_url") or "")
+        or str(session.get("patient_recording_url") or "")
         or str(session.get("provider_recording_url") or "")
         or str(session.get("mix_recording_url") or "")
     )
+    twilio_call_sid = str(
+        session.get("call_sid") or session.get("dial_call_sid") or ""
+    ).strip()
     patient_offset = _recording_offset(session, "patient")
     provider_offset = _recording_offset(session, "provider")
     # If one leg has no wall-clock, keep relative-only merge (both 0).
@@ -626,20 +724,44 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
         patient_offset = 0.0
         provider_offset = 0.0
     try:
-        save_humans_transcript_for_call(
+        call = save_humans_transcript_for_call(
             retell_call_id=retell_call_id,
             patient_text=patient,
             provider_text=provider,
             mix_text=mix,
             recording_url=recording_url,
-            session_id=str(session.get("session_id") or ""),
+            twilio_call_sid=twilio_call_sid,
             patient_segments=session.get("patient_segments") or [],
             provider_segments=session.get("provider_segments") or [],
             patient_offset=patient_offset,
             provider_offset=provider_offset,
             mix_items=mix_items if isinstance(mix_items, list) else None,
         )
+        if call and (call.live_agent_transcript or []):
+            wt_logger.info(
+                "TRANSFER_TRANSCRIPT_OK retell_call_id=%s twilio_call_sid=%s "
+                "humans=%s merged=%s recording=%s",
+                retell_call_id,
+                twilio_call_sid or "-",
+                len(call.live_agent_transcript or []),
+                len(call.transcript or []),
+                (call.recording_url or "")[:120],
+            )
+        else:
+            wt_logger.warning(
+                "TRANSFER_TRANSCRIPT_EMPTY retell_call_id=%s twilio_call_sid=%s "
+                "patient_chars=%s provider_chars=%s",
+                retell_call_id,
+                twilio_call_sid or "-",
+                len(patient),
+                len(provider),
+            )
     except Exception:
+        wt_logger.exception(
+            "TRANSFER_TRANSCRIPT_FAIL retell_call_id=%s twilio_call_sid=%s",
+            retell_call_id,
+            twilio_call_sid or "-",
+        )
         logger.exception(
             "Failed to persist humans transcript to DB retell_call_id=%s",
             retell_call_id,
@@ -661,6 +783,18 @@ def _persist_mix_transcript(
         return session
     time.sleep(4)
     audio = _download_twilio_recording(recording_url)
+    if not audio:
+        wt_logger.error(
+            "TRANSFER_RECORDING_DOWNLOAD_FAIL session=%s leg=mix url=%s",
+            session_id,
+            (recording_url or "")[:160],
+        )
+    s3_url = _upload_recording_audio(
+        audio,
+        retell_call_id=str(session.get("retell_call_id") or ""),
+        leg="mix",
+        recording_sid=recording_sid,
+    )
     diarized_items = (
         transcribe_mix_with_diarization(audio, filename="mix.wav") if audio else []
     )
@@ -677,13 +811,27 @@ def _persist_mix_transcript(
     session["humans_transcript"] = text
     session["mix_recording_url"] = recording_url
     session["mix_recording_sid"] = recording_sid
+    if s3_url:
+        session["mix_recording_s3_url"] = s3_url
     session["mix_saved"] = True
     session["humans_saved"] = bool(diarized_items or (text or "").strip())
     session["call_status"] = "ended"
     save_session(session)
+    _sync_call_twilio_ids(session, recording_url=s3_url or recording_url)
     if session["humans_saved"]:
         _persist_to_db(session)
         restore_inbound_voice_url(session)
+        wt_logger.info(
+            "TRANSFER_SUCCESS session=%s leg=mix chars=%s diarized=%s",
+            session_id,
+            len(text or ""),
+            len(diarized_items or []),
+        )
+    else:
+        wt_logger.error(
+            "TRANSFER_FAIL session=%s leg=mix reason=empty_transcript",
+            session_id,
+        )
     logger.info(
         "Saved mixed humans transcript session=%s chars=%s diarized_turns=%s",
         session_id,
@@ -727,6 +875,19 @@ def persist_humans_transcript(
     save_session(session)
     time.sleep(4)
     audio = _download_twilio_recording(recording_url)
+    if not audio:
+        wt_logger.error(
+            "TRANSFER_RECORDING_DOWNLOAD_FAIL session=%s leg=%s url=%s",
+            session_id,
+            speaker,
+            (recording_url or "")[:160],
+        )
+    s3_url = _upload_recording_audio(
+        audio,
+        retell_call_id=str(session.get("retell_call_id") or ""),
+        leg=speaker,
+        recording_sid=recording_sid,
+    )
     detailed = (
         transcribe_recording_detailed(audio, filename=f"{speaker}.wav")
         if audio
@@ -738,6 +899,8 @@ def persist_humans_transcript(
     session[f"{speaker}_segments"] = segments
     session[f"{speaker}_recording_url"] = recording_url
     session[f"{speaker}_recording_sid"] = recording_sid
+    if s3_url:
+        session[f"{speaker}_recording_s3_url"] = s3_url
     session[f"{speaker}_saved"] = True
     patient = str(session.get("patient_transcript") or "")
     provider = str(session.get("provider_transcript") or "")
@@ -749,10 +912,32 @@ def persist_humans_transcript(
         session.get("call_status") or "ended"
     )
     save_session(session)
+    stored_recording = (
+        str(session.get("patient_recording_s3_url") or "")
+        or str(session.get("provider_recording_s3_url") or "")
+        or s3_url
+        or recording_url
+    )
+    _sync_call_twilio_ids(session, recording_url=stored_recording)
     if patient or provider:
         _persist_to_db(session)
     if both_ready:
         restore_inbound_voice_url(session)
+        wt_logger.info(
+            "TRANSFER_SUCCESS session=%s leg=%s chars=%s segments=%s both=1 "
+            "twilio_call_sid=%s",
+            session_id,
+            speaker,
+            len(text),
+            len(segments),
+            str(session.get("call_sid") or session.get("dial_call_sid") or "-"),
+        )
+    elif not text:
+        wt_logger.error(
+            "TRANSFER_FAIL session=%s leg=%s reason=empty_stt",
+            session_id,
+            speaker,
+        )
     logger.info(
         "Saved %s transcript session=%s chars=%s segments=%s both=%s",
         speaker,
@@ -991,11 +1176,13 @@ def prepare_retell_bridge(
             session_data["transfer_number"] = extra_numbers[0]
             session_data["transfer_number_index"] = 0
     session = save_session(session_data)
-    (sessions_dir() / "pending.json").write_text(
-        json.dumps({"session_id": session_id}, indent=2) + "\n",
-        encoding="utf-8",
-    )
     _schedule_voice_url_restore(session_id)
+    wt_logger.info(
+        "TRANSFER_BRIDGE_READY session=%s inbound=%s agents=%s",
+        session_id,
+        inbound_url,
+        session_data.get("transfer_numbers"),
+    )
     logger.info(
         "Retell bridge ready session=%s inbound=%s agents=%s",
         session_id,
