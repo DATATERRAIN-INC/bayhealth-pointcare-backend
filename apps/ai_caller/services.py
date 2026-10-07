@@ -733,7 +733,8 @@ def _save_call(
         "to_number": dial_number,
         "agent_id": result.get("agent_id") or "",
         "transfer_number": transfer_number,
-        "warm_transfer_session_id": (session_id or "")[:64],
+        # Twilio Call SID (CA...) is written later when warm-transfer inbound arrives.
+        "warm_transfer_session_id": "",
         "started_at": timezone.now(),
         "ended_at": None,
     }

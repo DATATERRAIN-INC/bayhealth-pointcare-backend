@@ -9,6 +9,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from apps.ai_caller.twilio_bridge import (
+    _sync_call_twilio_ids,
     answer_twiml,
     connect_twiml,
     declined_twiml,
@@ -46,6 +47,8 @@ def _session(request):
     if session and call_sid and not session.get("call_sid"):
         session["call_sid"] = call_sid
         save_session(session)
+        # Persist Twilio CA... Call SID on Call.warm_transfer_session_id.
+        _sync_call_twilio_ids(session)
     return session
 
 

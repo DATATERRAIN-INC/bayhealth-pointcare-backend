@@ -514,7 +514,8 @@ def save_humans_transcript_for_call(
     provider_text: str = "",
     mix_text: str = "",
     recording_url: str = "",
-    session_id: str = "",
+    twilio_call_sid: str = "",
+    session_id: str = "",  # legacy kwarg; ignored for DB storage
     patient_segments: Optional[List[Dict[str, Any]]] = None,
     provider_segments: Optional[List[Dict[str, Any]]] = None,
     patient_offset: float = 0.0,
@@ -527,7 +528,7 @@ def save_humans_transcript_for_call(
     if not call_id:
         return None
 
-    call = Call.all_objects.filter(retell_call_id=call_id).first()
+    call = Call.objects.filter(retell_call_id=call_id).first()
     if not call:
         logger.warning("No Call row for retell_call_id=%s (humans transcript)", call_id)
         return None
@@ -543,13 +544,26 @@ def save_humans_transcript_for_call(
         mix_items=mix_items,
     )
     if not humans:
+        # Still persist Twilio Call SID / recording if we have them.
+        update_fields = []
+        sid = (twilio_call_sid or "").strip()
+        if sid and call.warm_transfer_session_id != sid:
+            call.warm_transfer_session_id = sid[:64]
+            update_fields.append("warm_transfer_session_id")
+        if recording_url and recording_url != (call.recording_url or ""):
+            call.recording_url = recording_url[:1024]
+            update_fields.append("recording_url")
+        if update_fields:
+            update_fields.append("updated_at")
+            call.save(update_fields=update_fields)
         return call
 
     call.live_agent_transcript = humans
     if recording_url:
         call.recording_url = recording_url[:1024]
-    if session_id and not call.warm_transfer_session_id:
-        call.warm_transfer_session_id = session_id[:64]
+    sid = (twilio_call_sid or "").strip()
+    if sid:
+        call.warm_transfer_session_id = sid[:64]
     call.transcript = merge_ai_and_humans(call.retell_transcript or [], humans)
     call.save(
         update_fields=[
@@ -561,9 +575,10 @@ def save_humans_transcript_for_call(
         ]
     )
     logger.info(
-        "Merged humans transcript call_id=%s humans=%s total=%s",
+        "Merged humans transcript call_id=%s humans=%s total=%s twilio_call_sid=%s",
         call_id,
         len(humans),
         len(call.transcript or []),
+        sid or "-",
     )
     return call
