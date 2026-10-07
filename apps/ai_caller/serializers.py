@@ -272,6 +272,7 @@ class CallSerializer(serializers.ModelSerializer):
             "duration_seconds",
             "has_transcript",
             "message_count",
+            "recording_url",
             "scheduled_at",
             "schedule_kind",
             "schedule_raw_time",
@@ -412,6 +413,7 @@ class CallerSettingsSerializer(serializers.ModelSerializer):
             "timezone",
             "max_calls_per_run",
             "call_trigger_count",
+            "sms_trigger_after_calls",
             "reminder_timeframe_hours",
             "live_agent_numbers",
             "window_summary",
@@ -450,6 +452,26 @@ class CallerSettingsSerializer(serializers.ModelSerializer):
         if trigger is not None and int(trigger) < 1:
             raise serializers.ValidationError(
                 {"call_trigger_count": "Must be at least 1."}
+            )
+        sms_after = attrs.get(
+            "sms_trigger_after_calls",
+            getattr(self.instance, "sms_trigger_after_calls", None),
+        )
+        if sms_after is not None and int(sms_after) < 1:
+            raise serializers.ValidationError(
+                {"sms_trigger_after_calls": "Must be at least 1."}
+            )
+        if (
+            trigger is not None
+            and sms_after is not None
+            and int(sms_after) > int(trigger)
+        ):
+            raise serializers.ValidationError(
+                {
+                    "sms_trigger_after_calls": (
+                        "Must be less than or equal to call_trigger_count."
+                    )
+                }
             )
         timeframe = attrs.get(
             "reminder_timeframe_hours",

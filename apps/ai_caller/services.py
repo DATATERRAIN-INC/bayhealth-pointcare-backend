@@ -1081,6 +1081,125 @@ def save_call_decline_reason(*, retell_call_id="", reason="", call=None):
     return call, None
 
 
+def consecutive_not_attended_streak(patient) -> int:
+    """
+    Count consecutive not_attended outcomes for a patient from newest backwards.
+    Completed / callback (answered) outcomes reset the streak.
+    Queue / scheduled / paused / cancel / in_progress rows are skipped.
+    """
+    if patient is None:
+        return 0
+    outcome_statuses = {
+        Call.Status.NOT_ATTENDED,
+        Call.Status.COMPLETED,
+        Call.Status.CALLBACK,
+    }
+    streak = 0
+    for row in (
+        Call.objects.filter(patient=patient, status__in=outcome_statuses)
+        .order_by("-started_at", "-id")
+        .only("id", "status")
+        .iterator()
+    ):
+        if row.status == Call.Status.NOT_ATTENDED:
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def maybe_trigger_sms_after_missed_call(call):
+    """
+    When text SMS is enabled and consecutive not_attended hits
+    sms_trigger_after_calls, start adult or guardian SMS once for this streak.
+    """
+    if not call or call.status != Call.Status.NOT_ATTENDED:
+        return None
+
+    patient = call.patient
+    if not patient or patient.is_blocked:
+        return None
+
+    user = call.user or getattr(patient, "user", None)
+    if not user:
+        return None
+
+    settings_obj = CallerSettings.load(user)
+    if not settings_obj.text_sms_enabled:
+        return None
+
+    trigger_cap = max(1, int(settings_obj.call_trigger_count or 1))
+    sms_after = max(1, int(getattr(settings_obj, "sms_trigger_after_calls", None) or 1))
+    # Never require more misses than the call attempt cap allows.
+    sms_after = min(sms_after, trigger_cap)
+
+    streak = consecutive_not_attended_streak(patient)
+    if streak != sms_after:
+        return None
+
+    from apps.ai_sms.models import SmsConversation
+    from apps.ai_sms.services import (
+        sms_webhook_url,
+        start_minor_sms_conversation_for_patient,
+        start_sms_conversation_for_patient,
+    )
+
+    if SmsConversation.objects.filter(patient=patient, status="ongoing").exists():
+        dialer_logger.info(
+            "SMS_AUTO_SKIP patient_id=%s reason=ongoing_sms streak=%s",
+            patient.id,
+            streak,
+        )
+        return None
+
+    webhook = sms_webhook_url()
+    try:
+        if _is_minor(patient.dob):
+            result = start_minor_sms_conversation_for_patient(
+                patient.id,
+                user=user,
+                webhook_url=webhook,
+            )
+            flow = "guardian"
+        else:
+            result = start_sms_conversation_for_patient(
+                patient.id,
+                user=user,
+                webhook_url=webhook,
+            )
+            flow = "adult"
+    except Exception:
+        dialer_logger.exception(
+            "SMS_AUTO_FAILED patient_id=%s call_id=%s streak=%s",
+            patient.id,
+            call.id,
+            streak,
+        )
+        return None
+
+    if not result.get("ok"):
+        dialer_logger.warning(
+            "SMS_AUTO_FAILED patient_id=%s call_id=%s streak=%s err=%s",
+            patient.id,
+            call.id,
+            streak,
+            (result.get("error") or "")[:200],
+        )
+        return None
+
+    dialer_logger.info(
+        "SMS_AUTO_TRIGGERED patient_id=%s call_id=%s streak=%s "
+        "sms_after=%s flow=%s chat_id=%s",
+        patient.id,
+        call.id,
+        streak,
+        sms_after,
+        flow,
+        result.get("chat_id") or "",
+    )
+    return result
+
+
 def update_call_from_retell_payload(payload):
     """Update call status/transcript from Retell webhook or get-call payload."""
     if not isinstance(payload, dict):
@@ -1217,6 +1336,7 @@ def update_call_from_retell_payload(payload):
         and previous_status != Call.Status.NOT_ATTENDED
     ):
         schedule_reminder_for_missed_call(call)
+        maybe_trigger_sms_after_missed_call(call)
 
     return call, None
 
