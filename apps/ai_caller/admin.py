@@ -103,6 +103,7 @@ class CallerSettingsAdmin(admin.ModelAdmin):
         "timezone",
         "max_calls_per_run",
         "call_trigger_count",
+        "sms_trigger_after_calls",
         "reminder_timeframe_hours",
         "text_sms_enabled",
         "updated_at",
