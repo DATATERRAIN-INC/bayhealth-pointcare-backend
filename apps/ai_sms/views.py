@@ -116,9 +116,12 @@ class StartSmsConversationView(APIView):
         return Response(
             {
                 "patient_id": result.get("patient_id"),
+                "patient_name": result.get("patient_name") or "",
                 "chat_id": result["chat_id"],
                 "message_sid": result.get("message_sid") or "",
                 "status": result.get("status") or "ongoing",
+                "type": "SMS",
+                "started_at": result.get("started_at"),
                 "from_number": result.get("from_number") or None,
                 "phone_last4": result.get("phone_last4") or "",
                 "agent_id": result.get("agent_id") or None,
@@ -161,9 +164,12 @@ class StartMinorSmsConversationView(APIView):
         return Response(
             {
                 "patient_id": result.get("patient_id"),
+                "patient_name": result.get("patient_name") or "",
                 "chat_id": result["chat_id"],
                 "message_sid": result.get("message_sid") or "",
                 "status": result.get("status") or "ongoing",
+                "type": "SMS",
+                "started_at": result.get("started_at"),
                 "from_number": result.get("from_number") or None,
                 "phone_last4": result.get("phone_last4") or "",
                 "transfer_number": result.get("transfer_number") or "",
