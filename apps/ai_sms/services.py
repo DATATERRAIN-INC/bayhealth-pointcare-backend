@@ -1378,6 +1378,7 @@ def start_sms_conversation_for_patient(
         transfer_numbers=numbers,
         webhook_url=webhook_url,
         patient=patient,
+        actor=user or getattr(patient, "user", None),
     )
     if result.get("ok"):
         result["patient_id"] = patient.id
@@ -1422,6 +1423,7 @@ def start_minor_sms_conversation_for_patient(
         transfer_numbers=numbers,
         webhook_url=webhook_url,
         patient=patient,
+        actor=user or getattr(patient, "user", None),
     )
     if result.get("ok"):
         result["patient_id"] = patient.id
@@ -1442,6 +1444,7 @@ def start_sms_conversation(
     webhook_url: str = "",
     require_transfer: bool = True,
     patient: Optional[Patient] = None,
+    actor=None,
 ) -> Dict[str, Any]:
     _sid, _token, from_number, twilio_err = _twilio_ready()
     if twilio_err:
@@ -1511,9 +1514,12 @@ def start_sms_conversation(
         return {"ok": False, "error": sms_err, "status_code": 502}
 
     SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
+    actor_user = actor or getattr(patient, "user", None) if patient else actor
     conversation = SmsConversation.objects.create(
         chat_id=chat_id,
         patient=patient,
+        created_by=actor_user,
+        updated_by=actor_user,
         to_number=phone,
         from_number=from_number,
         patient_name=variables["patient_name"],
@@ -1540,6 +1546,8 @@ def start_sms_conversation(
         "provider": "twilio",
         "type": "SMS",
         "patient_name": conversation.patient_name,
+        "created_by": getattr(actor_user, "pk", None),
+        "updated_by": getattr(actor_user, "pk", None),
         "started_at": conversation.created_at.isoformat() if conversation.created_at else None,
         "message": "SMS conversation started through Twilio.",
     }
@@ -1557,6 +1565,7 @@ def start_minor_sms_conversation(
     transfer_numbers: Optional[List[str]] = None,
     webhook_url: str = "",
     patient: Optional[Patient] = None,
+    actor=None,
 ) -> Dict[str, Any]:
     _sid, _token, _adult_from, twilio_err = _twilio_ready()
     if twilio_err:
@@ -1600,9 +1609,12 @@ def start_minor_sms_conversation(
 
     chat_id = f"minor-{uuid.uuid4().hex}"
     SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
+    actor_user = actor or getattr(patient, "user", None) if patient else actor
     conversation = SmsConversation.objects.create(
         chat_id=chat_id,
         patient=patient,
+        created_by=actor_user,
+        updated_by=actor_user,
         to_number=phone,
         from_number=from_number,
         patient_name=patient_label,
@@ -1632,6 +1644,8 @@ def start_minor_sms_conversation(
         "type": "SMS",
         "flow": "minor",
         "patient_name": conversation.patient_name,
+        "created_by": getattr(actor_user, "pk", None),
+        "updated_by": getattr(actor_user, "pk", None),
         "started_at": conversation.created_at.isoformat() if conversation.created_at else None,
         "message": "Minor SMS conversation started through Twilio.",
     }

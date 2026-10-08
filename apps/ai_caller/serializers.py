@@ -24,6 +24,23 @@ def _normalize_country_code(value):
     return code
 
 
+def _recording_enabled_for(serializer) -> bool:
+    """True when the request user's CallerSettings.recording_enabled is on."""
+    cached = getattr(serializer, "_recording_enabled_cached", None)
+    if cached is not None:
+        return cached
+    request = getattr(serializer, "context", {}).get("request")
+    user = getattr(request, "user", None) if request else None
+    enabled = False
+    if user is not None and getattr(user, "is_authenticated", False):
+        try:
+            enabled = bool(CallerSettings.load(user).recording_enabled)
+        except Exception:
+            enabled = False
+    serializer._recording_enabled_cached = enabled
+    return enabled
+
+
 class PatientSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
     call_status = serializers.SerializerMethodField()
@@ -31,6 +48,8 @@ class PatientSerializer(serializers.ModelSerializer):
     retell_call_id = serializers.SerializerMethodField()
     duration_seconds = serializers.SerializerMethodField()
     patient_tries = serializers.SerializerMethodField()
+    recording_url = serializers.SerializerMethodField()
+    live_agent_recording_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Patient
@@ -53,6 +72,8 @@ class PatientSerializer(serializers.ModelSerializer):
             "call_id",
             "retell_call_id",
             "duration_seconds",
+            "recording_url",
+            "live_agent_recording_url",
             "patient_tries",
             "created_at",
             "updated_at",
@@ -67,6 +88,8 @@ class PatientSerializer(serializers.ModelSerializer):
             "call_id",
             "retell_call_id",
             "duration_seconds",
+            "recording_url",
+            "live_agent_recording_url",
             "patient_tries",
             "created_at",
             "updated_at",
@@ -95,6 +118,36 @@ class PatientSerializer(serializers.ModelSerializer):
             .first()
         )
         return latest or None
+
+    def _latest_call_recording_fields(self, obj):
+        if hasattr(obj, "_latest_recording_url") or hasattr(
+            obj, "_latest_live_agent_recording_url"
+        ):
+            return (
+                getattr(obj, "_latest_recording_url", None) or "",
+                getattr(obj, "_latest_live_agent_recording_url", None) or "",
+            )
+        latest = (
+            Call.objects.filter(patient=obj)
+            .order_by("-started_at", "-id")
+            .only("recording_url", "live_agent_recording_url")
+            .first()
+        )
+        if not latest:
+            return "", ""
+        return latest.recording_url or "", latest.live_agent_recording_url or ""
+
+    def get_recording_url(self, obj):
+        if not _recording_enabled_for(self):
+            return None
+        patient_url, _ = self._latest_call_recording_fields(obj)
+        return patient_url or None
+
+    def get_live_agent_recording_url(self, obj):
+        if not _recording_enabled_for(self):
+            return None
+        _, agent_url = self._latest_call_recording_fields(obj)
+        return agent_url or None
 
     def get_duration_seconds(self, obj):
         started_at = getattr(obj, "_latest_call_started_at", None)
@@ -246,6 +299,8 @@ class CallSerializer(serializers.ModelSerializer):
     duration_seconds = serializers.IntegerField(read_only=True)
     has_transcript = serializers.BooleanField(read_only=True)
     message_count = serializers.SerializerMethodField()
+    recording_url = serializers.SerializerMethodField()
+    live_agent_recording_url = serializers.SerializerMethodField()
     scheduled_at = serializers.SerializerMethodField()
     schedule_kind = serializers.SerializerMethodField()
     schedule_raw_time = serializers.SerializerMethodField()
@@ -273,6 +328,7 @@ class CallSerializer(serializers.ModelSerializer):
             "has_transcript",
             "message_count",
             "recording_url",
+            "live_agent_recording_url",
             "scheduled_at",
             "schedule_kind",
             "schedule_raw_time",
@@ -283,6 +339,16 @@ class CallSerializer(serializers.ModelSerializer):
 
     def get_message_count(self, obj):
         return len(obj.transcript or [])
+
+    def get_recording_url(self, obj):
+        if not _recording_enabled_for(self):
+            return None
+        return (obj.recording_url or "").strip() or None
+
+    def get_live_agent_recording_url(self, obj):
+        if not _recording_enabled_for(self):
+            return None
+        return (obj.live_agent_recording_url or "").strip() or None
 
     def _open_outreach(self, obj):
         return (

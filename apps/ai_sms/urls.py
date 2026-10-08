@@ -5,6 +5,7 @@ from apps.ai_sms.views import (
     SmsAgentDialBridgeStatusView,
     SmsAgentDialStatusView,
     SmsConversationDetailView,
+    SmsConversationListView,
     SmsWebhookView,
     StartMinorSmsConversationView,
     StartSmsConversationView,
@@ -20,6 +21,11 @@ urlpatterns = [
         "minor/outbound/",
         StartMinorSmsConversationView.as_view(),
         name="ai-sms-minor-outbound",
+    ),
+    path(
+        "conversations/",
+        SmsConversationListView.as_view(),
+        name="ai-sms-conversation-list",
     ),
     path(
         "conversations/<str:lookup>/",
