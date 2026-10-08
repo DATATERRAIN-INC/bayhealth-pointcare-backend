@@ -1511,7 +1511,7 @@ def start_sms_conversation(
         return {"ok": False, "error": sms_err, "status_code": 502}
 
     SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
-    SmsConversation.objects.create(
+    conversation = SmsConversation.objects.create(
         chat_id=chat_id,
         patient=patient,
         to_number=phone,
@@ -1538,6 +1538,9 @@ def start_sms_conversation(
         "phone_last4": _phone_last4(phone),
         "agent_id": chat_agent_id,
         "provider": "twilio",
+        "type": "SMS",
+        "patient_name": conversation.patient_name,
+        "started_at": conversation.created_at.isoformat() if conversation.created_at else None,
         "message": "SMS conversation started through Twilio.",
     }
 
@@ -1597,7 +1600,7 @@ def start_minor_sms_conversation(
 
     chat_id = f"minor-{uuid.uuid4().hex}"
     SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
-    SmsConversation.objects.create(
+    conversation = SmsConversation.objects.create(
         chat_id=chat_id,
         patient=patient,
         to_number=phone,
@@ -1626,7 +1629,10 @@ def start_minor_sms_conversation(
         "from_number": from_number,
         "phone_last4": _phone_last4(phone),
         "provider": "twilio",
+        "type": "SMS",
         "flow": "minor",
+        "patient_name": conversation.patient_name,
+        "started_at": conversation.created_at.isoformat() if conversation.created_at else None,
         "message": "Minor SMS conversation started through Twilio.",
     }
 
