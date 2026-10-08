@@ -195,6 +195,11 @@ class Call(models.Model):
 
     @property
     def duration_seconds(self):
+        """Full wall-clock call length: started_at → ended_at.
+
+        For warm transfers, ended_at is extended when the Twilio conference
+        ends so this covers Retell AI + live-agent talk (not Retell-only).
+        """
         if not self.started_at:
             return None
         end = self.ended_at or (timezone.now() if self.status == self.Status.IN_PROGRESS else None)

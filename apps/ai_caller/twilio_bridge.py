@@ -28,7 +28,6 @@ from apps.ai_caller.retell import _digits, normalize_phone
 from apps.ai_caller.transcript_merge import (
     save_humans_transcript_for_call,
     transcribe_mix_with_diarization,
-    transcribe_recording_bytes,
     transcribe_recording_detailed,
 )
 
@@ -196,21 +195,64 @@ def patch_session(session_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
     return save_session(latest)
 
 
+def _mix_items_are_split(mix_items: Any) -> bool:
+    """True when diarized mix has both patient and live_agent turns."""
+    if not isinstance(mix_items, list) or len(mix_items) < 2:
+        return False
+    speakers = {
+        str(i.get("speaker") or "")
+        for i in mix_items
+        if isinstance(i, dict) and str(i.get("text") or "").strip()
+    }
+    return {"patient", "live_agent"}.issubset(speakers)
+
+
 def _has_speaker_split(session: Dict[str, Any]) -> bool:
-    """True when we already have labeled patient + live_agent text."""
+    """True only for a real channel/diarized split — not mono leg text.
+
+    Patient inbound mono usually contains both voices; treating plain
+    patient+provider STT as a split caused mix skip and fused walls.
+    """
     s = session or {}
     if s.get("dual_channel_split") or s.get("diarized_from_patient_mono"):
         return True
-    if s.get("mix_diarized_items"):
-        return True
-    patient = str(s.get("patient_transcript") or "").strip()
-    provider = str(s.get("provider_transcript") or "").strip()
-    return bool(patient and provider)
+    return _mix_items_are_split(s.get("mix_diarized_items"))
 
 
-def _should_skip_mix(session: Dict[str, Any]) -> bool:
-    """Skip conference-mix STT only when a real speaker split already exists."""
-    return _has_speaker_split(session)
+def extend_call_ended_at(
+    session: Dict[str, Any],
+    *,
+    ended_at: Optional[datetime] = None,
+) -> None:
+    """Push Call.ended_at forward for full wall-clock duration.
+
+    Retell often ends when the AI transfers; the patient + live agent keep
+    talking on Twilio. Duration must be Retell start → last Twilio hangup
+    (not Retell-only, and not a naive sum of both legs).
+    """
+    from django.utils import timezone as dj_tz
+
+    from apps.ai_caller.models import Call
+
+    retell_call_id = str((session or {}).get("retell_call_id") or "").strip()
+    if not retell_call_id:
+        return
+    call = Call.objects.filter(retell_call_id=retell_call_id).first()
+    if not call:
+        return
+    end = ended_at or dj_tz.now()
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if call.ended_at and call.ended_at >= end:
+        return
+    call.ended_at = end
+    call.save(update_fields=["ended_at", "updated_at"])
+    wt_logger.info(
+        "TRANSFER_DURATION_EXTEND retell_call_id=%s ended_at=%s duration_seconds=%s",
+        retell_call_id,
+        end.isoformat(),
+        call.duration_seconds,
+    )
 
 
 def _sync_call_twilio_ids(
@@ -744,6 +786,10 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
     if conference_sid:
         session["conference_sid"] = conference_sid
         save_session(session)
+    # Conference over → live-agent talk ended; extend full-call duration.
+    if event in {"end", "conference-end"}:
+        extend_call_ended_at(session)
+        return
     if event == "join" and join_call:
         session = load_session(str(session.get("session_id") or "")) or session
         inbound_sid = str(session.get("call_sid") or "").strip()
@@ -869,21 +915,53 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
     provider = str(session.get("provider_transcript") or "")
     mix = ""
     mix_items = session.get("mix_diarized_items") or None
-    # Prefer a real speaker split (both legs or diarized mix).
-    if patient and provider:
-        mix = ""
-        mix_items = None
-    elif mix_items:
-        # Diarized conference mix beats a single-leg wall.
+    # Prefer diarized mix whenever it has both speakers — even if per-leg
+    # text exists. Per-leg mono often captures a fused wall and used to
+    # overwrite a good mix split (humans=1 after diarized=13).
+    patient_segments = session.get("patient_segments") or []
+    provider_segments = session.get("provider_segments") or []
+    dual_ok = bool(
+        session.get("dual_channel_split") or session.get("diarized_from_patient_mono")
+    )
+    if _mix_items_are_split(mix_items):
+        # Diarized mix wins — clear ALL leg inputs (text + segments).
+        # Leaving segments set used to make humans_items_from_texts ignore mix.
         patient = ""
         provider = ""
         mix = ""
-    elif not patient and not provider:
-        mix = str(session.get("humans_transcript") or "")
-    else:
-        # One leg only — keep it; do not attach undiarized mix wall.
+        patient_segments = []
+        provider_segments = []
+        wt_logger.info(
+            "TRANSFER_PERSIST_PREFER_MIX retell_call_id=%s turns=%s",
+            retell_call_id,
+            len(mix_items or []),
+        )
+    elif dual_ok and patient and provider:
         mix = ""
         mix_items = None
+    elif patient and provider and not dual_ok:
+        # Mono legs only — do not persist a fused interleave; wait for mix.
+        wt_logger.info(
+            "TRANSFER_PERSIST_WAIT_MIX retell_call_id=%s reason=mono_legs_only",
+            retell_call_id,
+        )
+        return
+    elif not patient and not provider:
+        mix = str(session.get("humans_transcript") or "")
+        mix_items = None
+    elif provider and not patient:
+        # Provider-only is safe (live agent inbound). Persist it.
+        mix = ""
+        mix_items = None
+        patient_segments = []
+    else:
+        # Patient-only mono is usually a fused two-person wall — wait for
+        # provider + mix diarize instead of flashing humans=1 in the UI.
+        wt_logger.info(
+            "TRANSFER_PERSIST_WAIT_MIX retell_call_id=%s reason=patient_only_mono",
+            retell_call_id,
+        )
+        return
     # Prefer S3 URLs we uploaded; fall back to Twilio media URLs.
     recording_url = (
         str(session.get("patient_recording_s3_url") or "")
@@ -921,8 +999,8 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
             recording_url=recording_url,
             live_agent_recording_url=live_agent_recording_url,
             twilio_call_sid=twilio_call_sid,
-            patient_segments=session.get("patient_segments") or [],
-            provider_segments=session.get("provider_segments") or [],
+            patient_segments=patient_segments,
+            provider_segments=provider_segments,
             patient_offset=patient_offset,
             provider_offset=provider_offset,
             mix_items=mix_items if isinstance(mix_items, list) else None,
@@ -968,7 +1046,7 @@ def _persist_mix_transcript(
     """Fallback only when per-speaker inbound recordings never appear."""
     session_id = str((session or {}).get("session_id") or "")
     session = load_session(session_id) or dict(session or {})
-    if _should_skip_mix(session):
+    if _has_speaker_split(session):
         wt_logger.info(
             "TRANSFER_MIX_SKIP session=%s reason=speaker_split_ready",
             session_id,
@@ -984,9 +1062,10 @@ def _persist_mix_transcript(
             session_id,
             (recording_url or "")[:160],
         )
+        return load_session(session_id) or session
     # Re-check after download wait — dual/per-leg STT may have finished.
     session = load_session(session_id) or session
-    if _should_skip_mix(session):
+    if _has_speaker_split(session):
         wt_logger.info(
             "TRANSFER_MIX_SKIP session=%s reason=speaker_split_ready_after_wait",
             session_id,
@@ -998,8 +1077,18 @@ def _persist_mix_transcript(
         leg="mix",
         recording_sid=recording_sid,
     )
+    latest_for_stt = load_session(session_id) or session
+    provider_anchor = str(latest_for_stt.get("provider_transcript") or "")
+    patient_anchor = str(latest_for_stt.get("patient_transcript") or "")
     diarized_items = (
-        transcribe_mix_with_diarization(audio, filename="mix.wav") if audio else []
+        transcribe_mix_with_diarization(
+            audio,
+            filename="mix.wav",
+            provider_text=provider_anchor,
+            patient_text=patient_anchor,
+        )
+        if audio
+        else []
     )
     # Never store an undiarized mixed wall as the humans transcript.
     if not diarized_items:
@@ -1052,12 +1141,45 @@ def _persist_mix_transcript(
 def _finalize_leg_persist(session_id: str, *, speaker: str = "") -> Dict[str, Any]:
     """Reload both legs from cache and write merged transcript once ready."""
     session = load_session(session_id) or {}
+    # Never let per-leg finalize clobber a completed diarized mix split.
+    if _mix_items_are_split(session.get("mix_diarized_items")):
+        if not session.get("db_persisted_complete"):
+            _persist_to_db(session)
+            patch_session(session_id, {"db_persisted_complete": True, "humans_saved": True})
+        return load_session(session_id) or session
     patient = str(session.get("patient_transcript") or "")
     provider = str(session.get("provider_transcript") or "")
     both_ready = bool(patient and provider)
     if not patient and not provider:
         return session
     if session.get("db_persisted_complete") and both_ready:
+        return session
+
+    dual_ok = bool(
+        session.get("dual_channel_split") or session.get("diarized_from_patient_mono")
+    )
+    # Mono patient+provider STT is not a reliable split — wait for mix diarize.
+    if both_ready and not dual_ok:
+        patient_recording = (
+            str(session.get("patient_recording_s3_url") or "")
+            or str(session.get("patient_recording_url") or "")
+        )
+        live_agent_recording = (
+            str(session.get("provider_recording_s3_url") or "")
+            or str(session.get("provider_recording_url") or "")
+        )
+        _sync_call_twilio_ids(
+            session,
+            recording_url=patient_recording,
+            live_agent_recording_url=live_agent_recording,
+        )
+        wt_logger.info(
+            "TRANSFER_WAIT_MIX session=%s leg=%s patient_chars=%s provider_chars=%s",
+            session_id,
+            speaker or "-",
+            len(patient),
+            len(provider),
+        )
         return session
 
     patient_recording = (
@@ -1072,13 +1194,9 @@ def _finalize_leg_persist(session_id: str, *, speaker: str = "") -> Dict[str, An
         "humans_transcript": _combined_speaker_transcript(patient, provider),
         "humans_saved": both_ready,
     }
-    if both_ready:
+    if both_ready and dual_ok:
         updates["call_status"] = "ended"
         updates["db_persisted_complete"] = True
-    # Stop poller spam once both legs were attempted (even if one STT empty).
-    if session.get("patient_saved") and session.get("provider_saved"):
-        updates["db_persisted_complete"] = True
-        updates["call_status"] = "ended"
     session = patch_session(session_id, updates)
     _sync_call_twilio_ids(
         session,
@@ -1086,7 +1204,7 @@ def _finalize_leg_persist(session_id: str, *, speaker: str = "") -> Dict[str, An
         live_agent_recording_url=live_agent_recording,
     )
     _persist_to_db(session)
-    if both_ready:
+    if both_ready and dual_ok:
         restore_inbound_voice_url(session)
         wt_logger.info(
             "TRANSFER_SUCCESS session=%s leg=%s patient_chars=%s provider_chars=%s both=1 "
@@ -1097,7 +1215,7 @@ def _finalize_leg_persist(session_id: str, *, speaker: str = "") -> Dict[str, An
             len(provider),
             str(session.get("call_sid") or session.get("dial_call_sid") or "-"),
         )
-    elif session.get("patient_saved") and session.get("provider_saved"):
+    elif session.get("patient_saved") and session.get("provider_saved") and dual_ok:
         wt_logger.warning(
             "TRANSFER_PARTIAL session=%s patient_chars=%s provider_chars=%s",
             session_id,
@@ -1119,6 +1237,15 @@ def persist_humans_transcript(
     session_id = str(session.get("session_id") or "")
     speaker = (leg or "").strip().lower()
     session = load_session(session_id) or session
+    # Stop webhook/poller re-entry once a real speaker split is persisted.
+    if session.get("db_persisted_complete") and (
+        _mix_items_are_split(session.get("mix_diarized_items"))
+        or (
+            session.get("patient_transcript")
+            and session.get("provider_transcript")
+        )
+    ):
+        return session
     if speaker == "mix":
         return _persist_mix_transcript(
             session,
@@ -1133,6 +1260,8 @@ def persist_humans_transcript(
     if session.get(f"{speaker}_saved") or (
         session.get(f"{speaker}_transcript") and session.get(f"{speaker}_stt_started")
     ):
+        if session.get("db_persisted_complete"):
+            return session
         return _finalize_leg_persist(session_id, speaker=speaker)
 
     # Another worker is already STT'ing this leg.
@@ -1218,9 +1347,18 @@ def persist_humans_transcript(
         detailed = transcribe_recording_detailed(audio, filename="patient.wav")
         text = str(detailed.get("text") or "")
         segments = detailed.get("segments") or []
-        diarized = transcribe_mix_with_diarization(audio, filename="patient_mix.wav")
-        speakers = {str(i.get("speaker") or "") for i in (diarized or [])}
-        if diarized and speakers & {"patient", "live_agent"} and len(speakers) >= 2:
+        latest_for_stt = load_session(session_id) or session
+        provider_anchor = str(latest_for_stt.get("provider_transcript") or "")
+        # Plain mono STT of this same file is a weak patient anchor only;
+        # provider-leg text is the reliable live-agent voice sample.
+        patient_anchor = str(latest_for_stt.get("patient_transcript") or text or "")
+        diarized = transcribe_mix_with_diarization(
+            audio,
+            filename="patient_mix.wav",
+            provider_text=provider_anchor,
+            patient_text=patient_anchor,
+        )
+        if _mix_items_are_split(diarized):
             patient_parts = [
                 str(i.get("text") or "").strip()
                 for i in diarized
@@ -1252,10 +1390,9 @@ def persist_humans_transcript(
                 }
             )
             wt_logger.info(
-                "TRANSFER_DIARIZE_FALLBACK session=%s turns=%s speakers=%s",
+                "TRANSFER_DIARIZE_FALLBACK session=%s turns=%s",
                 session_id,
                 len(diarized),
-                sorted(speakers),
             )
         else:
             leg_updates["patient_transcript"] = text
@@ -1320,12 +1457,10 @@ def _poll_twilio_recording(session_id: str) -> None:
         if not session:
             time.sleep(_POLL_INTERVAL_SECONDS)
             continue
-        if session.get("db_persisted_complete") or (
-            session.get("patient_transcript") and session.get("provider_transcript")
-        ):
-            if session.get("patient_transcript") and session.get("provider_transcript"):
-                if not session.get("db_persisted_complete"):
-                    _finalize_leg_persist(session_id, speaker="poll")
+        if session.get("db_persisted_complete"):
+            return
+        if _has_speaker_split(session):
+            _finalize_leg_persist(session_id, speaker="poll")
             return
         call_sid = str(session.get("call_sid") or "").strip()
         dial_sid = str(session.get("dial_call_sid") or "").strip()
@@ -1371,7 +1506,7 @@ def _poll_twilio_recording(session_id: str) -> None:
                 rec_leg = "patient"
             else:
                 rec_leg = "mix"
-            if rec_leg == "mix" and _should_skip_mix(session):
+            if rec_leg == "mix" and _has_speaker_split(session):
                 continue
             persist_humans_transcript(
                 session,
@@ -1384,13 +1519,11 @@ def _poll_twilio_recording(session_id: str) -> None:
                 patch_session(
                     session_id, {"processed_recording_sids": list(processed)}
                 )
-            session = load_session(session_id)
-            if session.get("db_persisted_complete") or (
-                session.get("patient_transcript")
-                and session.get("provider_transcript")
-            ):
-                if not session.get("db_persisted_complete"):
-                    _finalize_leg_persist(session_id, speaker="poll")
+            session = load_session(session_id) or {}
+            if session.get("db_persisted_complete"):
+                return
+            if _has_speaker_split(session):
+                _finalize_leg_persist(session_id, speaker="poll")
                 return
         time.sleep(_POLL_INTERVAL_SECONDS)
     logger.warning("Timed out waiting for two-human recording session=%s", session_id)

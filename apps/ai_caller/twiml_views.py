@@ -204,4 +204,9 @@ def warm_transfer_status(request):
         maybe_failover_on_agent_status(
             session, call_status=call_status, call_sid=call_sid
         )
+        # Patient host hangup ends the conference; extend full duration.
+        if call_status.strip().lower() == "completed":
+            from apps.ai_caller.twilio_bridge import extend_call_ended_at
+
+            extend_call_ended_at(session)
     return HttpResponse("ok")
