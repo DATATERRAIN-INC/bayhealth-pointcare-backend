@@ -2,8 +2,9 @@
 from django.http import HttpResponse
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
+from django.db.models import Q
 from rest_framework import status
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -12,7 +13,9 @@ from apps.ai_sms.models import SmsConversation
 from apps.ai_sms.serializers import (
     PlaceMinorSmsConversationSerializer,
     PlaceSmsConversationSerializer,
+    SmsConversationSerializer,
 )
+from common.pagination import CommonPagination
 from apps.ai_sms.services import (
     reply_to_inbound_sms,
     sms_webhook_url,
@@ -26,9 +29,17 @@ from apps.ai_sms.agent_dial import (
     handle_bridge_status,
     maybe_failover_on_agent_status,
 )
+from apps.users.authentication import CognitoBearerAuthentication
 from common.responses import error_response
 
 _EMPTY_TWIML = "<Response></Response>"
+
+
+def _request_actor(request):
+    user = getattr(request, "user", None)
+    if user is not None and getattr(user, "is_authenticated", False):
+        return user
+    return None
 
 
 def _sms_transcript_items(raw: str) -> list:
@@ -64,6 +75,56 @@ def _sms_transcript_items(raw: str) -> list:
     return items
 
 
+class SmsConversationListView(APIView):
+    """GET SMS conversations created by (or owned via patient of) the auth user."""
+
+    authentication_classes = [CognitoBearerAuthentication]
+    permission_classes = [IsAuthenticated]
+    renderer_classes = [JSONRenderer]
+
+    def get(self, request):
+        from apps.users.models import User
+
+        user = request.user
+        if not isinstance(user, User) or not getattr(user, "pk", None):
+            return error_response(
+                "Authentication required. Sign in again.",
+                status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # Filter by ids so we never hit auth.User vs users.User FK mismatches.
+        qs = (
+            SmsConversation.objects.filter(
+                Q(created_by_id=user.pk) | Q(patient__user_id=user.pk)
+            )
+            .select_related("patient", "created_by", "updated_by")
+            .distinct()
+            .order_by("-created_at", "-id")
+        )
+        status_filter = (request.query_params.get("status") or "").strip()
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        flow_filter = (request.query_params.get("flow") or "").strip()
+        if flow_filter:
+            qs = qs.filter(flow=flow_filter)
+
+        try:
+            paginator = CommonPagination()
+            page = paginator.paginate_queryset(qs, request, view=self)
+            data = SmsConversationSerializer(page, many=True).data
+            return paginator.get_paginated_response(data)
+        except ValueError:
+            return error_response(
+                "Unable to load SMS conversations for this account.",
+                status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            return error_response(
+                "Unable to load SMS conversations. Please try again.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
 @method_decorator(csrf_exempt, name="dispatch")
 class SmsConversationDetailView(APIView):
     """GET transcript only by chat_id or numeric id (voice-compatible shape)."""
@@ -90,7 +151,7 @@ class SmsConversationDetailView(APIView):
 class StartSmsConversationView(APIView):
     """Start an adult SMS conversation for a patient id from ai_caller_patient."""
 
-    authentication_classes = []
+    authentication_classes = [CognitoBearerAuthentication]
     permission_classes = [AllowAny]
     renderer_classes = [JSONRenderer]
 
@@ -102,6 +163,7 @@ class StartSmsConversationView(APIView):
         data = serializer.validated_data
         result = start_sms_conversation_for_patient(
             data["id"],
+            user=_request_actor(request),
             agent_id=data.get("agent_id") or "",
             webhook_url=sms_webhook_url()
             or request.build_absolute_uri("/api/ai-sms/webhook/"),
@@ -122,6 +184,8 @@ class StartSmsConversationView(APIView):
                 "status": result.get("status") or "ongoing",
                 "type": "SMS",
                 "started_at": result.get("started_at"),
+                "created_by": result.get("created_by"),
+                "updated_by": result.get("updated_by"),
                 "from_number": result.get("from_number") or None,
                 "phone_last4": result.get("phone_last4") or "",
                 "agent_id": result.get("agent_id") or None,
@@ -139,7 +203,7 @@ class StartSmsConversationView(APIView):
 class StartMinorSmsConversationView(APIView):
     """Start a guardian SMS for a patient id from ai_caller_patient."""
 
-    authentication_classes = []
+    authentication_classes = [CognitoBearerAuthentication]
     permission_classes = [AllowAny]
     renderer_classes = [JSONRenderer]
 
@@ -151,6 +215,7 @@ class StartMinorSmsConversationView(APIView):
         data = serializer.validated_data
         result = start_minor_sms_conversation_for_patient(
             data["id"],
+            user=_request_actor(request),
             webhook_url=sms_webhook_url()
             or request.build_absolute_uri("/api/ai-sms/webhook/"),
         )
@@ -165,6 +230,8 @@ class StartMinorSmsConversationView(APIView):
             {
                 "patient_id": result.get("patient_id"),
                 "patient_name": result.get("patient_name") or "",
+                "created_by": result.get("created_by"),
+                "updated_by": result.get("updated_by"),
                 "chat_id": result["chat_id"],
                 "message_sid": result.get("message_sid") or "",
                 "status": result.get("status") or "ongoing",

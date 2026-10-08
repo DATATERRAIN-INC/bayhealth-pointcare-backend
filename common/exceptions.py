@@ -19,7 +19,15 @@ def custom_exception_handler(exc, context):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if isinstance(exc, ValueError):
-            message = str(exc).strip() or "Invalid request."
+            raw = str(exc).strip() or "Invalid request."
+            lowered = raw.lower()
+            # Hide internal Django FK / model-instance errors from clients.
+            if "must be" in lowered and "instance" in lowered:
+                message = "Unable to load data for this account. Sign in again or contact support."
+            elif "expected a number" in lowered:
+                message = "Invalid request."
+            else:
+                message = raw
             return Response({"message": message}, status=status.HTTP_400_BAD_REQUEST)
         return None
 

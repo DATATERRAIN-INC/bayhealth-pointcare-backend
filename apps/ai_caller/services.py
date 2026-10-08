@@ -145,6 +145,10 @@ def get_patient_queryset(
         _latest_retell_call_id=Subquery(latest_call.values("retell_call_id")[:1]),
         _latest_call_started_at=Subquery(latest_call.values("started_at")[:1]),
         _latest_call_ended_at=Subquery(latest_call.values("ended_at")[:1]),
+        _latest_recording_url=Subquery(latest_call.values("recording_url")[:1]),
+        _latest_live_agent_recording_url=Subquery(
+            latest_call.values("live_agent_recording_url")[:1]
+        ),
         _has_in_progress=Exists(has_in_progress),
     ).prefetch_related(
         Prefetch(
