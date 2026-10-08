@@ -32,6 +32,7 @@ from apps.ai_caller.services import (
     update_call_from_retell_payload,
     upload_patients_from_file,
 )
+from apps.ai_caller.transcript_merge import transcript_for_api
 from common.excel import build_patient_template_bytes
 from common.pagination import CommonPagination
 from common.responses import error_response, message_response
@@ -164,7 +165,7 @@ class CallViewSet(viewsets.ModelViewSet):
             call = self.get_queryset().first()
             if not call:
                 return error_response("Call not found.", 404)
-            return Response({"transcript": call.transcript or []})
+            return Response({"transcript": transcript_for_api(call.transcript or [])})
         return super().list(request, *args, **kwargs)
 
     def update(self, request, *args, **kwargs):

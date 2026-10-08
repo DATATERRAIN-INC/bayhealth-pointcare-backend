@@ -22,9 +22,6 @@ _PROMPT_ECHO_MARKERS = (
     "do not invent",
     "ignore hold music",
 )
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-
-
 def _looks_like_prompt_echo(text: str) -> bool:
     lowered = (text or "").strip().lower()
     return any(marker in lowered for marker in _PROMPT_ECHO_MARKERS)
@@ -187,16 +184,117 @@ def transcribe_recording_detailed(
     return {"text": "", "segments": []}
 
 
-def transcribe_recording_bytes(audio: bytes, filename: str = "call.wav") -> str:
-    return str(transcribe_recording_detailed(audio, filename=filename).get("text") or "")
+def _token_set(text: str) -> set:
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / float(len(a | b))
+
+
+def _flip_patient_live_agent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    flipped = []
+    for item in items:
+        row = dict(item)
+        sp = str(row.get("speaker") or "")
+        if sp == "patient":
+            row["speaker"] = "live_agent"
+            row["name"] = "Live agent"
+        elif sp == "live_agent":
+            row["speaker"] = "patient"
+            row["name"] = "Patient"
+        flipped.append(row)
+    return flipped
+
+
+def remap_diarized_with_provider_anchor(
+    items: List[Dict[str, Any]],
+    provider_text: str = "",
+    patient_text: str = "",
+) -> List[Dict[str, Any]]:
+    """Align diarized clusters to patient / live_agent for any topic.
+
+    Uses Twilio leg STT as voice anchors (not appointment keywords):
+    - cluster closest to provider-leg text → live_agent
+    - cluster closest to patient-leg text → patient
+    Works for scheduling, general questions, callbacks, etc.
+    """
+    if not items:
+        return items
+    by_speaker: Dict[str, str] = {"patient": "", "live_agent": ""}
+    for item in items:
+        sp = str(item.get("speaker") or "")
+        if sp in by_speaker:
+            by_speaker[sp] = (
+                f"{by_speaker[sp]} {item.get('text') or ''}".strip()
+            )
+    patient_tok = _token_set(by_speaker["patient"])
+    agent_tok = _token_set(by_speaker["live_agent"])
+    if not patient_tok or not agent_tok:
+        return items
+
+    provider_tok = _token_set(provider_text)
+    patient_leg_tok = _token_set(patient_text)
+
+    # Prefer two-anchor assignment when both legs have text.
+    if len(provider_tok) >= 3 and len(patient_leg_tok) >= 3:
+        # Score: provider→agent + patient→patient  vs  swapped.
+        score_ok = _jaccard(provider_tok, agent_tok) + _jaccard(
+            patient_leg_tok, patient_tok
+        )
+        score_swap = _jaccard(provider_tok, patient_tok) + _jaccard(
+            patient_leg_tok, agent_tok
+        )
+        if score_swap > score_ok + 0.05:
+            logger.info(
+                "Remapping diarized speakers (two-leg anchors) "
+                "ok=%.3f swap=%.3f",
+                score_ok,
+                score_swap,
+            )
+            return _flip_patient_live_agent(items)
+        return items
+
+    # Provider-only anchor: matching cluster is always live_agent.
+    if len(provider_tok) >= 3:
+        patient_score = _jaccard(provider_tok, patient_tok)
+        agent_score = _jaccard(provider_tok, agent_tok)
+        if patient_score >= agent_score + 0.08 and patient_score >= 0.12:
+            logger.info(
+                "Remapping diarized speakers (provider→live_agent) "
+                "patient_score=%.3f agent_score=%.3f",
+                patient_score,
+                agent_score,
+            )
+            return _flip_patient_live_agent(items)
+        return items
+
+    # Patient-only anchor: matching cluster is always patient.
+    if len(patient_leg_tok) >= 3:
+        patient_score = _jaccard(patient_leg_tok, patient_tok)
+        agent_score = _jaccard(patient_leg_tok, agent_tok)
+        if agent_score >= patient_score + 0.08 and agent_score >= 0.12:
+            logger.info(
+                "Remapping diarized speakers (patient-leg→patient) "
+                "patient_score=%.3f agent_score=%.3f",
+                patient_score,
+                agent_score,
+            )
+            return _flip_patient_live_agent(items)
+    return items
 
 
 def transcribe_mix_with_diarization(
-    audio: bytes, filename: str = "mix.wav"
+    audio: bytes,
+    filename: str = "mix.wav",
+    provider_text: str = "",
+    patient_text: str = "",
 ) -> List[Dict[str, Any]]:
     """
     Best-effort speaker turns from a mixed recording.
-    Returns human transcript items (may be empty).
+    Topic-agnostic: works for any patient ↔ live-agent conversation.
     """
     key = _openai_key()
     if not key or not audio:
@@ -213,15 +311,17 @@ def transcribe_mix_with_diarization(
     for model in models:
         if "diarize" not in model:
             continue
+        # OpenAI now requires chunking_strategy for diarization models.
         data = {
             "model": model,
             "response_format": "diarized_json",
+            "chunking_strategy": "auto",
         }
         try:
             resp = requests.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {key}"},
-                files={"file": (filename, audio)},
+                files={"file": (filename, audio, "audio/wav")},
                 data=data,
                 timeout=180,
             )
@@ -239,29 +339,45 @@ def transcribe_mix_with_diarization(
             raw_segments = _parse_diarized_segments(payload)
             if not raw_segments:
                 continue
-            return _diarized_segments_to_items(raw_segments)
+            items = _diarized_segments_to_items(raw_segments)
+            return remap_diarized_with_provider_anchor(
+                items,
+                provider_text=provider_text,
+                patient_text=patient_text,
+            )
         except Exception:
             logger.exception("Diarized transcription failed model=%s", model)
     return []
 
 
 def _map_diarized_speaker(raw: str, speaker_map: Dict[str, str]) -> str:
+    """Map diarization labels onto patient / live_agent only (2-party transfer)."""
     label = (raw or "").strip()
     if not label:
         return "unknown"
     if label in speaker_map:
         return speaker_map[label]
     lowered = label.lower().replace(" ", "_")
-    if lowered in {"speaker_0", "a", "spk_0", "0", "speaker0"}:
+    if lowered in {"speaker_0", "a", "spk_0", "0", "speaker0", "patient"}:
         assigned = "patient"
-    elif lowered in {"speaker_1", "b", "spk_1", "1", "speaker1"}:
+    elif lowered in {
+        "speaker_1",
+        "b",
+        "spk_1",
+        "1",
+        "speaker1",
+        "live_agent",
+        "agent",
+        "provider",
+    }:
         assigned = "live_agent"
     elif len(speaker_map) == 0:
         assigned = "patient"
-    elif len(speaker_map) == 1:
+    elif "live_agent" not in speaker_map.values():
         assigned = "live_agent"
     else:
-        assigned = f"speaker_{len(speaker_map) + 1}"
+        # Extra clusters on a 2-party call → attach to live_agent.
+        assigned = "live_agent"
     speaker_map[label] = assigned
     return assigned
 
@@ -274,40 +390,29 @@ def _diarized_segments_to_items(segments: List[Dict[str, Any]]) -> List[Dict[str
         if not text:
             continue
         speaker = _map_diarized_speaker(str(seg.get("speaker") or ""), speaker_map)
+        if speaker not in {"patient", "live_agent"}:
+            speaker = "live_agent"
         items.append(
             {
                 "speaker": speaker,
                 "text": text,
                 "segment": "human",
+                "name": _speaker_display_name(speaker),
                 "at": round(float(seg.get("start") or 0.0), 3),
             }
         )
     return _collapse_adjacent_same_speaker(items)
 
 
-def _segments_from_plain_text(text: str) -> List[Dict[str, Any]]:
-    """Fallback: split a speaker blob into sentence-ish turns (no real timestamps)."""
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return []
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(cleaned) if p and p.strip()]
-    if not parts:
-        parts = [cleaned]
-    segments = []
-    cursor = 0.0
-    for part in parts:
-        # Fake sequential offsets so patient/provider can still be interleaved
-        # roughly if both sides only have plain text (better than one wall).
-        duration = max(1.5, min(12.0, len(part.split()) * 0.35))
-        segments.append(
-            {
-                "start": cursor,
-                "end": cursor + duration,
-                "text": part,
-            }
-        )
-        cursor += duration
-    return segments
+def _speaker_display_name(speaker: str) -> str:
+    sp = (speaker or "").strip().lower()
+    if sp in {"patient", "user"}:
+        return "Patient"
+    if sp in {"live_agent", "provider"}:
+        return "Live agent"
+    if sp in {"agent", "ai", "ai_agent"}:
+        return "AI agent"
+    return "Live agent" if sp else "Patient"
 
 
 def _labeled_speaker_item(speaker: str, text: str, at=None) -> Optional[Dict[str, Any]]:
@@ -318,6 +423,7 @@ def _labeled_speaker_item(speaker: str, text: str, at=None) -> Optional[Dict[str
         "speaker": speaker,
         "text": cleaned,
         "segment": "human",
+        "name": _speaker_display_name(speaker),
         "at": at,
     }
 
@@ -448,10 +554,19 @@ def humans_items_from_texts(
     Build human transcript items.
 
     Priority:
-    1) Per-leg patient/provider text or segments (always speaker-labeled)
-    2) Diarized mix_items
+    1) Diarized mix_items with both speakers (most reliable for mono legs)
+    2) Per-leg patient/provider text or segments
     3) Raw mix_text as speaker=unknown (last resort only)
     """
+    if mix_items:
+        mix_speakers = {
+            str(i.get("speaker") or "")
+            for i in mix_items
+            if isinstance(i, dict) and str(i.get("text") or "").strip()
+        }
+        if {"patient", "live_agent"}.issubset(mix_speakers):
+            return list(mix_items)
+
     has_legs = bool(
         (patient_text or "").strip()
         or (provider_text or "").strip()
@@ -459,7 +574,6 @@ def humans_items_from_texts(
         or (provider_segments or [])
     )
     if has_legs:
-        # Never fall through to unlabeled mix when per-leg audio exists.
         return interleave_speaker_segments(
             patient_segments=patient_segments,
             provider_segments=provider_segments,
@@ -507,6 +621,44 @@ def merge_ai_and_humans(ai_items, humans_items) -> List[Dict[str, Any]]:
     return list(tag_ai_segment(ai_items or [])) + list(humans_items or [])
 
 
+def _display_name_for_transcript_row(item: Dict[str, Any]) -> str:
+    """UI label: AI agent vs Live agent vs Patient.
+
+    Prefer explicit `name` when already set. Never treat all human
+    segments as Live agent — patient turns are also segment=human.
+    """
+    existing = str(item.get("name") or "").strip()
+    if existing in {"AI agent", "Live agent", "Patient"}:
+        return existing
+    speaker = str(item.get("speaker") or "").strip().lower()
+    segment = str(item.get("segment") or "").strip().lower()
+    if speaker in {"patient", "user"}:
+        return "Patient"
+    if speaker in {"live_agent", "provider"}:
+        return "Live agent"
+    if segment == "human":
+        return "Live agent"
+    return "AI agent"
+
+
+def transcript_for_api(items) -> List[Dict[str, Any]]:
+    """Public transcript rows: no `at`, plus display `name` for the UI."""
+    cleaned: List[Dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            key: value
+            for key, value in item.items()
+            if key not in {"at", "name"}
+        }
+        if not row:
+            continue
+        row["name"] = _display_name_for_transcript_row(row)
+        cleaned.append(row)
+    return cleaned
+
+
 def save_humans_transcript_for_call(
     *,
     retell_call_id: str,
@@ -514,8 +666,8 @@ def save_humans_transcript_for_call(
     provider_text: str = "",
     mix_text: str = "",
     recording_url: str = "",
+    live_agent_recording_url: str = "",
     twilio_call_sid: str = "",
-    session_id: str = "",  # legacy kwarg; ignored for DB storage
     patient_segments: Optional[List[Dict[str, Any]]] = None,
     provider_segments: Optional[List[Dict[str, Any]]] = None,
     patient_offset: float = 0.0,
@@ -544,7 +696,7 @@ def save_humans_transcript_for_call(
         mix_items=mix_items,
     )
     if not humans:
-        # Still persist Twilio Call SID / recording if we have them.
+        # Still persist Twilio Call SID / recording URLs if we have them.
         update_fields = []
         sid = (twilio_call_sid or "").strip()
         if sid and call.warm_transfer_session_id != sid:
@@ -553,14 +705,47 @@ def save_humans_transcript_for_call(
         if recording_url and recording_url != (call.recording_url or ""):
             call.recording_url = recording_url[:1024]
             update_fields.append("recording_url")
+        if live_agent_recording_url and live_agent_recording_url != (
+            call.live_agent_recording_url or ""
+        ):
+            call.live_agent_recording_url = live_agent_recording_url[:1024]
+            update_fields.append("live_agent_recording_url")
         if update_fields:
             update_fields.append("updated_at")
             call.save(update_fields=update_fields)
         return call
 
-    call.live_agent_transcript = humans
+    existing = call.live_agent_transcript or []
+    existing_speakers = {
+        str(i.get("speaker") or "") for i in existing if isinstance(i, dict)
+    }
+    new_speakers = {str(i.get("speaker") or "") for i in humans}
+    existing_split = {"patient", "live_agent"}.issubset(existing_speakers)
+    new_split = {"patient", "live_agent"}.issubset(new_speakers)
+    # Never replace a good patient+live_agent split with a single wall.
+    if existing and existing_split and not new_split:
+        logger.info(
+            "Keeping existing split humans transcript call_id=%s "
+            "(new had speakers=%s)",
+            call_id,
+            sorted(new_speakers),
+        )
+        humans = existing
+    elif new_split:
+        # Always accept a real split (mix/diarize may refine labels).
+        call.live_agent_transcript = humans
+    elif not existing:
+        call.live_agent_transcript = humans
+    else:
+        if len(humans) > len(existing):
+            call.live_agent_transcript = humans
+        else:
+            humans = existing
+
     if recording_url:
         call.recording_url = recording_url[:1024]
+    if live_agent_recording_url:
+        call.live_agent_recording_url = live_agent_recording_url[:1024]
     sid = (twilio_call_sid or "").strip()
     if sid:
         call.warm_transfer_session_id = sid[:64]
@@ -569,6 +754,7 @@ def save_humans_transcript_for_call(
         update_fields=[
             "live_agent_transcript",
             "recording_url",
+            "live_agent_recording_url",
             "warm_transfer_session_id",
             "transcript",
             "updated_at",

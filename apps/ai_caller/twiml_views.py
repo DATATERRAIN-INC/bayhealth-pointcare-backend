@@ -75,9 +75,9 @@ def warm_transfer_inbound(request):
         )
     session["status"] = "inbound_from_retell"
     save_session(session)
-    if session.get("call_sid"):
-        inbound_speaker = str(session.get("inbound_speaker") or "patient")
-        start_leg_recording(session, str(session.get("call_sid") or ""), inbound_speaker)
+    # Do NOT start patient recording here — Twilio returns 21220 (not eligible)
+    # while the call is still being redirected into the conference. Recording
+    # starts on conference join (see warm_transfer_conference_status).
     start_coordinator_leg(session)
     return _xml(inbound_connect_twiml(session))
 
@@ -204,4 +204,9 @@ def warm_transfer_status(request):
         maybe_failover_on_agent_status(
             session, call_status=call_status, call_sid=call_sid
         )
+        # Patient host hangup ends the conference; extend full duration.
+        if call_status.strip().lower() == "completed":
+            from apps.ai_caller.twilio_bridge import extend_call_ended_at
+
+            extend_call_ended_at(session)
     return HttpResponse("ok")

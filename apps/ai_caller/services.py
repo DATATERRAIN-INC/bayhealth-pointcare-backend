@@ -1242,8 +1242,11 @@ def update_call_from_retell_payload(payload):
     )
     if started_at:
         call.started_at = started_at
+    # Never shrink ended_at — Twilio warm-transfer may end after Retell
+    # leaves, and that later hangup is the true full-call end.
     if ended_at:
-        call.ended_at = ended_at
+        if not call.ended_at or ended_at > call.ended_at:
+            call.ended_at = ended_at
     elif not call.ended_at and (
         call.status in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED}
         or (

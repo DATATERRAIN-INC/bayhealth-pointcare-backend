@@ -133,6 +133,18 @@ class SpeakerSeparationTests(unittest.TestCase):
         self.assertEqual(items, mix_items)
         self.assertTrue(assert_speakers_separated(items))
 
+    def test_diarized_mix_beats_fused_leg_text(self):
+        mix_items = [
+            {"speaker": "patient", "text": "Book me today", "segment": "human", "at": 0.1},
+            {"speaker": "live_agent", "text": "4:30 works", "segment": "human", "at": 1.2},
+        ]
+        items = humans_items_from_texts(
+            patient_text="fused wall of both voices talking",
+            provider_text="agent snippet",
+            mix_items=mix_items,
+        )
+        self.assertEqual(items, mix_items)
+
     def test_merge_keeps_ai_then_human(self):
         humans = labeled_leg_items(
             patient_text="I need help",
@@ -196,6 +208,9 @@ class PersistToCallTests(unittest.TestCase):
             patient_offset=100.0,
             provider_offset=100.0,
             recording_url="https://s3.example.com/warm-transfer-recordings/patient.wav",
+            live_agent_recording_url=(
+                "https://s3.example.com/warm-transfer-recordings/provider.wav"
+            ),
             twilio_call_sid="CAfdf3f0de1aa3fad3010bca21bf9d2c27",
         )
         self.assertIs(saved, call)
@@ -211,6 +226,10 @@ class PersistToCallTests(unittest.TestCase):
         self.assertIn(call.transcript[1]["speaker"], {"patient", "live_agent"})
         self.assertEqual(
             call.warm_transfer_session_id, "CAfdf3f0de1aa3fad3010bca21bf9d2c27"
+        )
+        self.assertEqual(
+            call.live_agent_recording_url,
+            "https://s3.example.com/warm-transfer-recordings/provider.wav",
         )
         call.save.assert_called_once()
 

@@ -176,7 +176,10 @@ class Call(models.Model):
     transcript = models.JSONField(default=list, blank=True)
     retell_transcript = models.JSONField(default=list, blank=True)
     live_agent_transcript = models.JSONField(default=list, blank=True)
+    # Patient (inbound) warm-transfer recording URL (S3 preferred).
     recording_url = models.CharField(max_length=1024, blank=True, default="")
+    # Live-agent / provider warm-transfer recording URL (S3 preferred).
+    live_agent_recording_url = models.CharField(max_length=1024, blank=True, default="")
     # Twilio Call SID for the warm-transfer patient leg (CA...).
     warm_transfer_session_id = models.CharField(max_length=64, blank=True, default="")
     started_at = models.DateTimeField(null=True, blank=True, default=timezone.now)
@@ -192,6 +195,11 @@ class Call(models.Model):
 
     @property
     def duration_seconds(self):
+        """Full wall-clock call length: started_at → ended_at.
+
+        For warm transfers, ended_at is extended when the Twilio conference
+        ends so this covers Retell AI + live-agent talk (not Retell-only).
+        """
         if not self.started_at:
             return None
         end = self.ended_at or (timezone.now() if self.status == self.Status.IN_PROGRESS else None)
