@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from typing import Optional
+
 from django.http import HttpResponse
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
@@ -26,6 +28,7 @@ from apps.ai_sms.services import (
 from apps.ai_sms.agent_dial import (
     agent_answer_twiml,
     conversation_by_chat_id,
+    handle_agent_dial_recording,
     handle_bridge_status,
     maybe_failover_on_agent_status,
 )
@@ -68,11 +71,82 @@ def _sms_transcript_items(raw: str) -> list:
             {
                 "at": None,
                 "text": body,
-                "segment": "ai",
+                "segment": "ai" if speaker == "agent" else "human",
                 "speaker": speaker,
+                "name": (
+                    "AI agent"
+                    if speaker == "agent"
+                    else "Patient"
+                    if speaker == "patient"
+                    else "Unknown"
+                ),
             }
         )
     return items
+
+
+def _live_call_transcript_items(raw) -> list:
+    """Normalize stored live-call JSON turns (patient / live_agent)."""
+    items = []
+    for row in raw or []:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = str(row.get("speaker") or "").strip().lower()
+        if speaker in {"provider"}:
+            speaker = "live_agent"
+        if speaker not in {"patient", "live_agent"}:
+            continue
+        items.append(
+            {
+                "at": row.get("at"),
+                "text": text,
+                "segment": "human",
+                "speaker": speaker,
+                "name": "Patient" if speaker == "patient" else "Live agent",
+            }
+        )
+    return items
+
+
+def _recording_url_for_conversation(conversation, request) -> Optional[str]:
+    """Full bridge mix URL, or None when recording is disabled."""
+    from apps.ai_caller.models import CallerSettings
+    from apps.users.models import User
+
+    user = getattr(request, "user", None)
+    if not isinstance(user, User) or not getattr(user, "is_authenticated", False):
+        user = getattr(conversation, "created_by", None)
+    enabled = True
+    if isinstance(user, User) and getattr(user, "pk", None):
+        try:
+            enabled = bool(CallerSettings.load(user).recording_enabled)
+        except Exception:
+            enabled = True
+    if not enabled:
+        return None
+    return (conversation.recording_url or "").strip() or None
+
+
+def _conversation_transcript_payload(conversation, request=None):
+    recording_url = (
+        _recording_url_for_conversation(conversation, request)
+        if request is not None
+        else ((conversation.recording_url or "").strip() or None)
+    )
+    # One timeline: SMS (agent/patient) then live-call (patient/live_agent).
+    # Speakers already distinguish AI agent vs Patient vs Live agent.
+    transcript = _sms_transcript_items(conversation.transcript or "")
+    transcript.extend(
+        _live_call_transcript_items(conversation.live_call_transcript or [])
+    )
+    return {
+        "chat_id": conversation.chat_id,
+        "transcript": transcript,
+        "recording_url": recording_url,
+    }
 
 
 class SmsConversationListView(APIView):
@@ -102,7 +176,7 @@ class SmsConversationListView(APIView):
             .order_by("-created_at", "-id")
         )
 
-        # ?chat_id=... → structured transcript for that conversation.
+        # ?chat_id=... → SMS + live-call transcript / recordings for that chat.
         chat_id = (request.query_params.get("chat_id") or "").strip()
         if chat_id:
             conversation = qs.filter(chat_id=chat_id).first()
@@ -112,10 +186,7 @@ class SmsConversationListView(APIView):
                     status.HTTP_404_NOT_FOUND,
                 )
             return Response(
-                {
-                    "chat_id": conversation.chat_id,
-                    "transcript": _sms_transcript_items(conversation.transcript or ""),
-                },
+                _conversation_transcript_payload(conversation, request),
                 status=status.HTTP_200_OK,
             )
 
@@ -164,10 +235,7 @@ class SmsConversationDetailView(APIView):
         if conversation is None:
             return error_response("SMS conversation not found.", status.HTTP_404_NOT_FOUND)
         return Response(
-            {
-                "chat_id": conversation.chat_id,
-                "transcript": _sms_transcript_items(conversation.transcript or ""),
-            },
+            _conversation_transcript_payload(conversation, request),
             status=status.HTTP_200_OK,
         )
 
@@ -358,4 +426,26 @@ class SmsAgentDialStatusView(APIView):
             call_status=call_status,
             call_sid=call_sid,
         )
+        return HttpResponse(status=204)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SmsAgentDialRecordingView(APIView):
+    """Twilio recording callback after SMS live-agent ↔ patient Dial ends."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request, chat_id: str):
+        conversation = conversation_by_chat_id(chat_id)
+        if conversation is None:
+            return HttpResponse(status=204)
+        recording_url = (request.POST.get("RecordingUrl") or "").strip()
+        recording_sid = (request.POST.get("RecordingSid") or "").strip()
+        if recording_url:
+            handle_agent_dial_recording(
+                conversation,
+                recording_url=recording_url,
+                recording_sid=recording_sid,
+            )
         return HttpResponse(status=204)

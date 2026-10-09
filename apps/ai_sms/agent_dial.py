@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import List, Optional
 from xml.sax.saxutils import escape
 
@@ -100,17 +101,29 @@ def agent_answer_twiml(conversation: SmsConversation) -> str:
         f"Connecting you now with {patient} about {service}. Please hold."
     )
     action = ""
+    record_attrs = ""
     if base and conversation.chat_id:
+        chat = escape(conversation.chat_id)
         action = (
             f' action="{escape(base)}/api/ai-sms/agent-dial/bridge-status/'
-            f'{escape(conversation.chat_id)}/" method="POST"'
+            f'{chat}/" method="POST"'
+        )
+        # Dual-channel: parent=live agent, child=patient → separate STT legs.
+        rec_cb = (
+            f"{escape(base)}/api/ai-sms/agent-dial/recording/{chat}/"
+        )
+        record_attrs = (
+            f' record="record-from-answer-dual"'
+            f' recordingStatusCallback="{rec_cb}"'
+            f' recordingStatusCallbackEvent="completed"'
+            f' recordingStatusCallbackMethod="POST"'
         )
     caller_id = escape(from_number) if from_number else escape(patient_phone)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         f'<Say voice="{_voice()}">{escape(whisper)}</Say>'
-        f'<Dial callerId="{caller_id}" timeout="45"{action}>'
+        f'<Dial callerId="{caller_id}" timeout="45"{action}{record_attrs}>'
         f"<Number>{escape(patient_phone)}</Number>"
         "</Dial>"
         "</Response>"
@@ -380,3 +393,102 @@ def maybe_start_agent_dial_after_reply(
 
 def conversation_by_chat_id(chat_id: str) -> Optional[SmsConversation]:
     return SmsConversation.objects.filter(chat_id=(chat_id or "").strip()).first()
+
+
+def handle_agent_dial_recording(
+    conversation: SmsConversation,
+    *,
+    recording_url: str,
+    recording_sid: str = "",
+) -> None:
+    """Kick off async download + dual-channel STT for the patient/live-agent bridge."""
+    url = (recording_url or "").strip()
+    if not url or not conversation:
+        return
+    chat_id = (conversation.chat_id or "").strip()
+    threading.Thread(
+        target=_persist_agent_dial_recording,
+        args=(chat_id, url, (recording_sid or "").strip()),
+        daemon=True,
+    ).start()
+
+
+def _persist_agent_dial_recording(
+    chat_id: str, recording_url: str, recording_sid: str = ""
+) -> None:
+    """Download Dial dual-channel audio, STT each leg, store URLs + split transcript."""
+    from apps.ai_caller.transcript_merge import (
+        interleave_speaker_segments,
+        transcribe_recording_detailed,
+    )
+    from apps.ai_caller.twilio_bridge import (
+        _download_twilio_recording,
+        _upload_recording_audio,
+        split_stereo_wav,
+    )
+
+    conversation = conversation_by_chat_id(chat_id)
+    if conversation is None:
+        return
+
+    audio = _download_twilio_recording(recording_url)
+    if not audio:
+        logger.error(
+            "SMS dial recording download empty chat=%s url=%s",
+            chat_id,
+            recording_url[:160],
+        )
+        return
+
+    # Store one mix URL (both sides). Split channels only for STT labels.
+    mix_s3 = _upload_recording_audio(
+        audio,
+        retell_call_id=chat_id,
+        leg="sms_live_call",
+        recording_sid=recording_sid,
+    )
+
+    # Dial dual-channel: channel 1 (left) = parent/live agent, channel 2 (right) = patient.
+    agent_audio, patient_audio = split_stereo_wav(audio)
+    if not patient_audio:
+        patient_audio = audio
+        agent_audio = b""
+
+    patient_detailed = (
+        transcribe_recording_detailed(patient_audio or audio, filename="sms_patient.wav")
+        if (patient_audio or audio)
+        else {"text": "", "segments": []}
+    )
+    agent_detailed = (
+        transcribe_recording_detailed(agent_audio, filename="sms_live_agent.wav")
+        if agent_audio
+        else {"text": "", "segments": []}
+    )
+
+    items = interleave_speaker_segments(
+        patient_segments=patient_detailed.get("segments") or [],
+        provider_segments=agent_detailed.get("segments") or [],
+        patient_text=str(patient_detailed.get("text") or ""),
+        provider_text=str(agent_detailed.get("text") or ""),
+    )
+    for row in items:
+        if isinstance(row, dict) and not row.get("name"):
+            sp = str(row.get("speaker") or "")
+            row["name"] = "Patient" if sp == "patient" else "Live agent"
+
+    conversation = conversation_by_chat_id(chat_id) or conversation
+    conversation.recording_url = (mix_s3 or recording_url)[:1024]
+    conversation.live_call_transcript = items
+    conversation.save(
+        update_fields=[
+            "recording_url",
+            "live_call_transcript",
+            "updated_at",
+        ]
+    )
+    logger.info(
+        "SMS dial recording saved chat=%s humans=%s recording_url=%s",
+        chat_id,
+        len(items),
+        bool(conversation.recording_url),
+    )

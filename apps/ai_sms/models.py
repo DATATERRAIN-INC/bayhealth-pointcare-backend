@@ -44,6 +44,18 @@ class SmsConversation(models.Model):
     status = models.CharField(max_length=32, default="ongoing")
     step = models.CharField(max_length=32, default="identity")
     transcript = models.TextField(blank=True)
+    # SMS → live-agent voice bridge (one mix recording of both sides).
+    recording_url = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="Full patient + live-agent bridge call recording.",
+    )
+    live_call_transcript = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Speaker-split voice turns: patient / live_agent.",
+    )
     last_inbound_sid = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
