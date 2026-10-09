@@ -13,7 +13,7 @@ from apps.ai_sms.models import SmsConversation
 from apps.ai_sms.serializers import (
     PlaceMinorSmsConversationSerializer,
     PlaceSmsConversationSerializer,
-    SmsConversationSerializer,
+    SmsConversationListSerializer,
 )
 from common.pagination import CommonPagination
 from apps.ai_sms.services import (
@@ -101,6 +101,24 @@ class SmsConversationListView(APIView):
             .distinct()
             .order_by("-created_at", "-id")
         )
+
+        # ?chat_id=... → structured transcript for that conversation.
+        chat_id = (request.query_params.get("chat_id") or "").strip()
+        if chat_id:
+            conversation = qs.filter(chat_id=chat_id).first()
+            if conversation is None:
+                return error_response(
+                    "SMS conversation not found.",
+                    status.HTTP_404_NOT_FOUND,
+                )
+            return Response(
+                {
+                    "chat_id": conversation.chat_id,
+                    "transcript": _sms_transcript_items(conversation.transcript or ""),
+                },
+                status=status.HTTP_200_OK,
+            )
+
         status_filter = (request.query_params.get("status") or "").strip()
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -111,7 +129,7 @@ class SmsConversationListView(APIView):
         try:
             paginator = CommonPagination()
             page = paginator.paginate_queryset(qs, request, view=self)
-            data = SmsConversationSerializer(page, many=True).data
+            data = SmsConversationListSerializer(page, many=True).data
             return paginator.get_paginated_response(data)
         except ValueError:
             return error_response(
@@ -127,22 +145,29 @@ class SmsConversationListView(APIView):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class SmsConversationDetailView(APIView):
-    """GET transcript only by chat_id or numeric id (voice-compatible shape)."""
+    """GET transcript by path or ?chat_id= query param (voice-compatible shape)."""
 
-    authentication_classes = []
+    authentication_classes = [CognitoBearerAuthentication]
     permission_classes = [AllowAny]
     renderer_classes = [JSONRenderer]
 
-    def get(self, request, lookup: str):
+    def get(self, request, lookup: str = ""):
+        chat_id = (request.query_params.get("chat_id") or "").strip()
+        lookup = (lookup or "").strip()
         conversation = None
-        if lookup.isdigit():
+        if chat_id:
+            conversation = conversation_by_chat_id(chat_id)
+        elif lookup.isdigit():
             conversation = SmsConversation.objects.filter(pk=int(lookup)).first()
-        if conversation is None:
+        elif lookup:
             conversation = conversation_by_chat_id(lookup)
         if conversation is None:
             return error_response("SMS conversation not found.", status.HTTP_404_NOT_FOUND)
         return Response(
-            {"transcript": _sms_transcript_items(conversation.transcript or "")},
+            {
+                "chat_id": conversation.chat_id,
+                "transcript": _sms_transcript_items(conversation.transcript or ""),
+            },
             status=status.HTTP_200_OK,
         )
 
