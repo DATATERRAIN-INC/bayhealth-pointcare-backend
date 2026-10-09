@@ -3,6 +3,7 @@ from django.urls import path
 from apps.ai_sms.views import (
     SmsAgentDialAnswerView,
     SmsAgentDialBridgeStatusView,
+    SmsAgentDialRecordingView,
     SmsAgentDialStatusView,
     SmsConversationDetailView,
     SmsConversationListView,
@@ -51,5 +52,10 @@ urlpatterns = [
         "agent-dial/status/<str:chat_id>/",
         SmsAgentDialStatusView.as_view(),
         name="ai-sms-agent-dial-status",
+    ),
+    path(
+        "agent-dial/recording/<str:chat_id>/",
+        SmsAgentDialRecordingView.as_view(),
+        name="ai-sms-agent-dial-recording",
     ),
 ]
