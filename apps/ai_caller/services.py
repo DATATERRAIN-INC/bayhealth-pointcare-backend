@@ -541,6 +541,47 @@ def _resolve_live_agent_number(user):
     return numbers[0] if numbers else ""
 
 
+# Stock machine greetings — Twilio default Voice URL, carrier/iOS voicemail, etc.
+_NON_HUMAN_ANSWER_MARKERS = (
+    # Twilio default / trial
+    "configure your number's voice url",
+    "configure your numbers voice url",
+    "configure your number’s voice url",  # curly apostrophe
+    "to change this message",
+    "you have reached the twilio trial",
+    "this is a twilio trial account",
+    # Carrier / iOS / Android voicemail
+    "has been forwarded to voicemail",
+    "forwarded to voice mail",
+    "forwarded to voicemail",
+    "the person you're trying to reach is not available",
+    "the person you are trying to reach is not available",
+    "at the tone, please record your message",
+    "at the tone please record your message",
+    "when you have finished recording, you may hang up",
+    "when you have finished recording you may hang up",
+    "please leave a message after the tone",
+    "please leave your message after the tone",
+    "leave a message after the beep",
+    "is not available. at the tone",
+    "mailbox is full",
+    "voice mailbox",
+)
+
+
+def _transcript_has_non_human_answer(items) -> bool:
+    """True when audio is Twilio default / voicemail — not a real patient."""
+    for item in items or []:
+        if not isinstance(item, dict):
+            text = str(item or "")
+        else:
+            text = str(item.get("text") or "")
+        lowered = text.lower()
+        if any(marker in lowered for marker in _NON_HUMAN_ANSWER_MARKERS):
+            return True
+    return False
+
+
 def _map_retell_status(raw_status, *, disconnection_reason="", event=""):
     status = (raw_status or "").strip().lower()
     reason = (disconnection_reason or "").strip().lower()
@@ -1292,6 +1333,21 @@ def update_call_from_retell_payload(payload):
             call.transcript = merge_ai_and_humans(
                 ai_items, call.live_agent_transcript or []
             )
+
+    # Twilio default Voice URL / carrier-iOS voicemail "answers" but is not a
+    # real patient. Treat as not_attended when those stock phrases appear.
+    if (
+        previous_status != Call.Status.CALLBACK
+        and call.status == Call.Status.COMPLETED
+        and _transcript_has_non_human_answer(
+            call.retell_transcript or call.transcript or []
+        )
+    ):
+        call.status = Call.Status.NOT_ATTENDED
+        dialer_logger.info(
+            "CALL_NON_HUMAN_ANSWER retell_call_id=%s -> not_attended",
+            call_id,
+        )
 
     update_fields = [
         "status",
