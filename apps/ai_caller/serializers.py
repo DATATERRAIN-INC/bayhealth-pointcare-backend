@@ -24,6 +24,20 @@ def _normalize_country_code(value):
     return code
 
 
+def _letters_only_name(value, *, field_label: str, required: bool = True):
+    """Allow letters and spaces only — no digits or symbols."""
+    name = " ".join((value or "").split())
+    if not name:
+        if required:
+            raise serializers.ValidationError(f"{field_label} is required.")
+        return ""
+    if any(not part.isalpha() for part in name.split(" ")):
+        raise serializers.ValidationError(
+            f"{field_label} can only contain letters (no numbers or symbols)."
+        )
+    return name
+
+
 class PatientSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
     call_status = serializers.SerializerMethodField()
@@ -186,6 +200,15 @@ class PatientSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         data["upload_file_key"] = build_s3_url(instance.upload_file_key)
         return data
+
+    def validate_first_name(self, value):
+        return _letters_only_name(value, field_label="First name", required=True)
+
+    def validate_last_name(self, value):
+        return _letters_only_name(value, field_label="Last name", required=False)
+
+    def validate_doctor(self, value):
+        return _letters_only_name(value, field_label="Doctor name", required=True)
 
     def validate_dob(self, value):
         from common.excel import parse_patient_dob
@@ -438,29 +461,48 @@ class CallerSettingsSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Invalid timezone.")
         return tz_name
 
+    def validate_max_calls_per_run(self, value):
+        if value is None or int(value) < 1:
+            raise serializers.ValidationError("Must be a positive number greater than 0.")
+        return value
+
+    def validate_call_trigger_count(self, value):
+        if value is None or int(value) < 1:
+            raise serializers.ValidationError("Must be a positive number greater than 0.")
+        return value
+
+    def validate_sms_trigger_after_calls(self, value):
+        if value is None or int(value) < 1:
+            raise serializers.ValidationError("Must be a positive number greater than 0.")
+        return value
+
+    def validate_reminder_timeframe_hours(self, value):
+        if value is None or int(value) < 1:
+            raise serializers.ValidationError("Must be a positive number greater than 0.")
+        if int(value) > 24 * 30:
+            raise serializers.ValidationError(
+                "Must be 720 hours (30 days) or less."
+            )
+        return value
+
     def validate(self, attrs):
         start = attrs.get("start_time", getattr(self.instance, "start_time", None))
         end = attrs.get("end_time", getattr(self.instance, "end_time", None))
         if start and end and start >= end:
             raise serializers.ValidationError(
-                {"end_time": "End time must be after start time."}
+                {
+                    "start_time": "Start time must be earlier than end time.",
+                    "end_time": "End time must be later than start time.",
+                }
             )
         trigger = attrs.get(
             "call_trigger_count",
             getattr(self.instance, "call_trigger_count", None),
         )
-        if trigger is not None and int(trigger) < 1:
-            raise serializers.ValidationError(
-                {"call_trigger_count": "Must be at least 1."}
-            )
         sms_after = attrs.get(
             "sms_trigger_after_calls",
             getattr(self.instance, "sms_trigger_after_calls", None),
         )
-        if sms_after is not None and int(sms_after) < 1:
-            raise serializers.ValidationError(
-                {"sms_trigger_after_calls": "Must be at least 1."}
-            )
         if (
             trigger is not None
             and sms_after is not None
@@ -473,24 +515,6 @@ class CallerSettingsSerializer(serializers.ModelSerializer):
                     )
                 }
             )
-        timeframe = attrs.get(
-            "reminder_timeframe_hours",
-            getattr(self.instance, "reminder_timeframe_hours", None),
-        )
-        if timeframe is not None:
-            hours = int(timeframe)
-            if hours < 1:
-                raise serializers.ValidationError(
-                    {"reminder_timeframe_hours": "Must be at least 1 hour."}
-                )
-            if hours > 24 * 30:
-                raise serializers.ValidationError(
-                    {
-                        "reminder_timeframe_hours": (
-                            "Must be 720 hours (30 days) or less."
-                        )
-                    }
-                )
         return attrs
 
     def update(self, instance, validated_data):
