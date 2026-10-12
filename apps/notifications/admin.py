@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from apps.notifications.models import Notification
+from apps.notifications.models import Channel, Notification, Scope
 
 
 @admin.register(Notification)
@@ -11,3 +11,16 @@ class NotificationAdmin(admin.ModelAdmin):
     ordering = ("-created_at",)
     readonly_fields = ("created_at",)
     raw_id_fields = ("user", "created_by", "updated_by")
+
+
+@admin.register(Scope)
+class ScopeAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "is_active", "created_at")
+    search_fields = ("name",)
+
+
+@admin.register(Channel)
+class ChannelAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "scope", "is_active", "created_at")
+    list_filter = ("scope", "is_active")
+    search_fields = ("name",)
