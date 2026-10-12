@@ -10,6 +10,21 @@ class SmsConversation(models.Model):
         on_delete=models.SET_NULL,
         related_name="sms_conversations",
     )
+    # Use apps.users.User (same as Patient), not django.contrib.auth.User.
+    created_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="sms_conversations_created",
+        null=True,
+        blank=True,
+    )
+    updated_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        related_name="sms_conversations_updated",
+        null=True,
+        blank=True,
+    )
     to_number = models.CharField(max_length=32, db_index=True)
     from_number = models.CharField(max_length=32)
     patient_name = models.CharField(max_length=120, blank=True)
@@ -29,8 +44,21 @@ class SmsConversation(models.Model):
     status = models.CharField(max_length=32, default="ongoing")
     step = models.CharField(max_length=32, default="identity")
     transcript = models.TextField(blank=True)
+    # SMS → live-agent voice bridge (one mix recording of both sides).
+    recording_url = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="Full patient + live-agent bridge call recording.",
+    )
+    live_call_transcript = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Speaker-split voice turns: patient / live_agent.",
+    )
     last_inbound_sid = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]

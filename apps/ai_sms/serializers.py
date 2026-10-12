@@ -19,13 +19,20 @@ class PlaceMinorSmsConversationSerializer(serializers.Serializer):
 
 
 class SmsConversationSerializer(serializers.ModelSerializer):
-    patient_id = serializers.IntegerField(source="patient.id", read_only=True, allow_null=True)
+    """Full conversation row (detail / internal use)."""
+
+    patient_id = serializers.IntegerField(read_only=True, allow_null=True)
+    created_by = serializers.IntegerField(source="created_by_id", read_only=True, allow_null=True)
+    updated_by = serializers.IntegerField(source="updated_by_id", read_only=True, allow_null=True)
 
     class Meta:
         model = SmsConversation
         fields = [
+            "id",
             "chat_id",
             "patient_id",
+            "created_by",
+            "updated_by",
             "to_number",
             "from_number",
             "patient_name",
@@ -39,5 +46,23 @@ class SmsConversationSerializer(serializers.ModelSerializer):
             "transfer_number",
             "transfer_status",
             "transcript",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class SmsConversationListSerializer(serializers.ModelSerializer):
+    """Lean list payload for the conversations index API."""
+
+    patient_id = serializers.IntegerField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = SmsConversation
+        fields = [
+            "id",
+            "chat_id",
+            "patient_id",
+            "patient_name",
+            "status",
             "created_at",
         ]
