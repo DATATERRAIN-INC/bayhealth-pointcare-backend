@@ -8,7 +8,7 @@ def create_notification(*, event_type, title, message="", metadata=None, user=No
     Common entrypoint — call this from patient CRUD, Celery, uploads, etc.
     Returns the created Notification.
     """
-    return Notification.objects.create(
+    notification = Notification.objects.create(
         user=user,
         created_by=user,
         updated_by=user,
@@ -17,6 +17,10 @@ def create_notification(*, event_type, title, message="", metadata=None, user=No
         message=(message or "").strip(),
         metadata=metadata or {},
     )
+    from apps.notifications.mqtt import publish_app_notification
+
+    publish_app_notification(getattr(user, "pk", None), notification)
+    return notification
 
 
 def _patient_user(patient):

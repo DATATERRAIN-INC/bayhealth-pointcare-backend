@@ -12,3 +12,4 @@ celery==5.3.6
 redis==5.0.8
 backports.zoneinfo==0.2.1; python_version < "3.9"
 twilio==8.13.0
+git+https://github.com/DATATERRAIN-INC/synccast-pkg.git@v0.10.0

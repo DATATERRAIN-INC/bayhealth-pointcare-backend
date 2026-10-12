@@ -1,5 +1,7 @@
 from django.db import models
 from django.utils import timezone
+from synccast.models.channel import AbstractSyncCastChannel
+from synccast.models.scope import AbstractSyncCastScope
 
 
 class NotificationEvent(models.TextChoices):
@@ -45,3 +47,35 @@ class Notification(models.Model):
 
     def __str__(self):
         return f"{self.event_type}: {self.title}"
+
+
+class Scope(AbstractSyncCastScope):
+    """SyncCast scope. AI caller queue uses name ``ai_calls``."""
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class Channel(AbstractSyncCastChannel):
+    """SyncCast channel under a scope. Queue channels: in_progress, waiting."""
+
+    scope = models.ForeignKey(
+        Scope,
+        on_delete=models.CASCADE,
+        related_name="channels",
+    )
+
+    class Meta:
+        ordering = ["scope_id", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "name"],
+                name="notifications_channel_scope_name_uniq",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.scope.name}/{self.name}"

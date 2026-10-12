@@ -206,6 +206,15 @@ WARM_TRANSFER_ENABLED = os.getenv("WARM_TRANSFER_ENABLED", "false").lower() in (
     "yes",
 )
 
+# SyncCast MQTT (same client as Grid Social). Publishing stays off until a feature calls it.
+MQTT_APP_ID = os.getenv("MQTT_APP_ID", "")
+MQTT_APP_SECRET = os.getenv("MQTT_APP_SECRET", "")
+MQTT_THROTTLE = os.getenv("MQTT_THROTTLE", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Dialer / outbound call decision logs (separate folder)
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)

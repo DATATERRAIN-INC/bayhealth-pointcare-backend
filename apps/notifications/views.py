@@ -1,11 +1,97 @@
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from apps.notifications.models import Notification
+from apps.notifications.models import Channel, Notification, Scope
+from apps.notifications.mqtt import publish_app_notification, topics_for_user
 from apps.notifications.serializers import NotificationSerializer
 from common.pagination import CommonPagination
-from common.responses import message_response
+from common.responses import error_response, message_response
+
+
+class MqttMessageAPIView(APIView):
+    """List every MQTT topic this user should subscribe to.
+
+    Path: ``notifications/get-topics/``.
+    """
+
+    def get(self, request):
+        topics = topics_for_user(request.user)
+        message = "Notifications retrieved." if topics else "No Messages found."
+        return Response(
+            {
+                "status": "success",
+                "result": {
+                    "message": message,
+                    "data": topics,
+                },
+            }
+        )
+
+
+class ScopeAPIView(APIView):
+    """Create a SyncCast scope. Same role as Grid Social insert-scope."""
+
+    def post(self, request):
+        name = str(request.data.get("name") or "").strip()
+        if not name:
+            return error_response("Name is required.")
+        scope, created = Scope.objects.get_or_create(
+            name=name,
+            defaults={
+                "description": str(request.data.get("description") or "").strip(),
+                "is_active": True,
+            },
+        )
+        return Response(
+            {
+                "message": "Scope created successfully."
+                if created
+                else "Scope already exists.",
+                "data": {
+                    "id": scope.id,
+                    "name": scope.name,
+                    "description": scope.description,
+                },
+            },
+            status=201 if created else 200,
+        )
+
+
+class ChannelAPIView(APIView):
+    """Create a SyncCast channel under a scope. Same role as Grid Social insert-channel."""
+
+    def post(self, request):
+        name = str(request.data.get("name") or "").strip()
+        scope_id = request.data.get("scope")
+        if not name or not scope_id:
+            return error_response("Name and scope are required.")
+        scope = Scope.objects.filter(pk=scope_id).first()
+        if scope is None:
+            return error_response("Scope not found.", 404)
+        channel, created = Channel.objects.get_or_create(
+            scope=scope,
+            name=name,
+            defaults={
+                "description": str(request.data.get("description") or "").strip(),
+                "is_active": True,
+            },
+        )
+        return Response(
+            {
+                "message": "Channel created successfully."
+                if created
+                else "Channel already exists.",
+                "data": {
+                    "id": channel.id,
+                    "name": channel.name,
+                    "scope": scope.id,
+                    "description": channel.description,
+                },
+            },
+            status=201 if created else 200,
+        )
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -50,6 +136,7 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
             notification.is_read = True
             notification.updated_by = request.user
             notification.save(update_fields=["is_read", "updated_by"])
+            publish_app_notification(notification.user_id, notification)
         return message_response("Notification marked as read.")
 
     @action(detail=False, methods=["post"], url_path="mark-all-read")
@@ -57,4 +144,5 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
         updated = Notification.objects.filter(
             user=request.user, is_read=False
         ).update(is_read=True, updated_by=request.user)
+        publish_app_notification(request.user.pk)
         return message_response(f"Marked {updated} notification(s) as read.")

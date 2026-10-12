@@ -690,6 +690,7 @@ def _claim_queued_call(call, *, actor=None):
     """
     if call is None:
         return False
+    previous_status = call.status
     updated = Call.objects.filter(
         pk=call.pk,
         status__in=[Call.Status.QUEUED, Call.Status.SCHEDULED],
@@ -703,6 +704,9 @@ def _claim_queued_call(call, *, actor=None):
     )
     if updated:
         call.refresh_from_db()
+        from apps.notifications.mqtt import publish_call_change
+
+        publish_call_change(call, previous_status)
         return True
     return False
 
@@ -723,7 +727,8 @@ def _release_claimed_call(call):
     if call is None:
         return
     restore = _release_status_for_call(call)
-    Call.objects.filter(pk=call.pk, status=Call.Status.IN_PROGRESS).filter(
+    previous_status = call.status
+    updated = Call.objects.filter(pk=call.pk, status=Call.Status.IN_PROGRESS).filter(
         Q(retell_call_id__isnull=True) | Q(retell_call_id="")
     ).update(
         status=restore,
@@ -731,6 +736,10 @@ def _release_claimed_call(call):
         updated_at=timezone.now(),
     )
     call.refresh_from_db()
+    if updated:
+        from apps.notifications.mqtt import publish_call_change
+
+        publish_call_change(call, previous_status)
 
 
 def _cleanup_orphan_queued_calls(patient, *, keep_call_id=None):
