@@ -292,6 +292,8 @@ def get_call_queryset(
             "created_at",
             "id",
         )
+    else:
+        queryset = queryset.order_by("-id")
 
     return queryset
 
