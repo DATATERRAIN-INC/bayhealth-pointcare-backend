@@ -188,7 +188,7 @@ class Call(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-started_at", "-id"]
+        ordering = ["-id"]
 
     def __str__(self):
         return f"Call #{self.id} ({self.status})"
