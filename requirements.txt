@@ -13,3 +13,10 @@ redis==5.0.8
 backports.zoneinfo==0.2.1; python_version < "3.9"
 twilio==8.13.0
 git+https://github.com/DATATERRAIN-INC/synccast-pkg.git@v0.10.0
+# Pointcare live agent (pc_liveagent)
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+anthropic==0.69.0
+playwright==1.55.0
+pydantic==2.11.9
+httpx==0.28.1

@@ -20,3 +20,8 @@ apps/ai_caller/data/
 
 **/migrations/*.py
 !**/migrations/__init__.py
+# Pointcare live agent (local Chrome profiles / session clones)
+chrome_profile/**
+!chrome_profile/README.txt
+chrome_profile_session/
+venv313/
