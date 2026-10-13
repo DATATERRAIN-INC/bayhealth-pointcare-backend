@@ -27,6 +27,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "apps.ai_caller.apps.AiCallerConfig",
     "apps.ai_sms.apps.AiSmsConfig",
+    "apps.ai_pointcare.apps.AiPointcareConfig",
     "apps.users.apps.UsersConfig",
     "apps.notifications.apps.NotificationsConfig",
 ]
@@ -109,6 +110,12 @@ RETELL_VOICE = os.getenv("RETELL_VOICE", "")
 RETELL_MAX_DURATION_MINUTES = int(os.getenv("RETELL_MAX_DURATION_MINUTES") or 8)
 RETELL_SSL_VERIFY = os.getenv("RETELL_SSL_VERIFY", "true").lower() in ("1", "true", "yes")
 RETELL_TRANSFER_NUMBER = os.getenv("RETELL_TRANSFER_NUMBER", "")
+# Dedicated Retell agent for Medi-Cal renewal calls. Leave blank to create/find
+# "BACH Medi-Cal Renewal State Flow" so the care-call agent is not overwritten.
+AI_POINTCARE_RETELL_AGENT_ID = os.getenv("AI_POINTCARE_RETELL_AGENT_ID", "")
+MEDICAL_RENEWAL_VIDEO_URL = os.getenv("MEDICAL_RENEWAL_VIDEO_URL", "")
+MEDICAL_RENEWAL_TOLL_FREE_NUMBER = os.getenv("MEDICAL_RENEWAL_TOLL_FREE_NUMBER", "")
+MEDICAL_RENEWAL_SMS_COLLECT_NUMBER = os.getenv("MEDICAL_RENEWAL_SMS_COLLECT_NUMBER", "")
 # With call screening on, prefer noise-cancellation (not background-speech mode).
 # Options: noise-cancellation | noise-and-background-speech-cancellation | no-denoise
 RETELL_DENOISING_MODE = os.getenv("RETELL_DENOISING_MODE", "noise-cancellation")
