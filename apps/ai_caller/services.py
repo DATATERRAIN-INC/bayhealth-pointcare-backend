@@ -59,7 +59,7 @@ def _patient_has_call_status(*statuses):
 def _filter_patients_by_call_status(queryset, call_status):
     """
     Filter patients by effective call_status (same priority as PatientSerializer):
-    in_progress > paused > scheduled > queued > latest call status.
+    in_progress > waiting > paused > scheduled > queued > latest call status.
     """
     statuses = _parse_status_list(call_status)
     if not statuses or "all" in statuses:
@@ -71,11 +71,13 @@ def _filter_patients_by_call_status(queryset, call_status):
         return queryset.none()
 
     has_in_progress = _patient_has_call_status(Call.Status.IN_PROGRESS)
+    has_waiting = _patient_has_call_status(Call.Status.WAITING)
     has_paused = _patient_has_call_status(Call.Status.PAUSED)
     has_scheduled = _patient_has_call_status(Call.Status.SCHEDULED)
     has_queued = _patient_has_call_status(Call.Status.QUEUED)
     has_open_dial = _patient_has_call_status(
         Call.Status.IN_PROGRESS,
+        Call.Status.WAITING,
         Call.Status.PAUSED,
         Call.Status.SCHEDULED,
         Call.Status.QUEUED,
@@ -85,12 +87,20 @@ def _filter_patients_by_call_status(queryset, call_status):
     for status in statuses:
         if status == Call.Status.IN_PROGRESS:
             match |= Q(_has_in_progress=True) | has_in_progress
+        elif status == Call.Status.WAITING:
+            match |= has_waiting & ~has_in_progress
         elif status == Call.Status.PAUSED:
-            match |= has_paused & ~has_in_progress
+            match |= has_paused & ~has_in_progress & ~has_waiting
         elif status == Call.Status.SCHEDULED:
-            match |= has_scheduled & ~has_in_progress & ~has_paused
+            match |= has_scheduled & ~has_in_progress & ~has_waiting & ~has_paused
         elif status == Call.Status.QUEUED:
-            match |= has_queued & ~has_in_progress & ~has_paused & ~has_scheduled
+            match |= (
+                has_queued
+                & ~has_in_progress
+                & ~has_waiting
+                & ~has_paused
+                & ~has_scheduled
+            )
         else:
             # completed / not_attended / callback — latest status, no open dial row
             match |= (
@@ -832,6 +842,7 @@ def _prepare_warm_transfer_bridge(*, patient, dial_number, live_agent_numbers):
             "live_agent_numbers": numbers,
             "inbound_speaker": "patient",
             "dial_speaker": "provider",
+            "user_id": getattr(patient, "user_id", None),
         },
     )
 
@@ -1291,8 +1302,24 @@ def update_call_from_retell_payload(payload):
         event=event,
     )
     # Keep callback if patient already asked to be called later on this call.
+    # While the patient is still on the Twilio transfer (on the line with the
+    # agent, or waiting for one), Retell's "call ended" must not drop them
+    # out of the live-agent queue.
+    stay_on_transfer = False
+    try:
+        from apps.ai_caller.twilio_bridge import transfer_call_should_stay_open
+
+        stay_on_transfer = transfer_call_should_stay_open(call_id)
+    except Exception:
+        stay_on_transfer = False
     if previous_status == Call.Status.CALLBACK:
         call.status = Call.Status.CALLBACK
+    elif stay_on_transfer:
+        call.status = (
+            Call.Status.WAITING
+            if previous_status == Call.Status.WAITING
+            else Call.Status.IN_PROGRESS
+        )
     else:
         call.status = mapped_status
 
@@ -1304,6 +1331,10 @@ def update_call_from_retell_payload(payload):
     )
     if started_at:
         call.started_at = started_at
+    # The patient is still on the transfer. Don't freeze duration at the
+    # moment Retell handed the call off.
+    if stay_on_transfer:
+        ended_at = None
     # Never shrink ended_at — Twilio warm-transfer may end after Retell
     # leaves, and that later hangup is the true full-call end.
     if ended_at:

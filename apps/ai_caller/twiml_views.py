@@ -14,21 +14,27 @@ from apps.ai_caller.twilio_bridge import (
     ask_callback_twiml,
     callback_scheduled_twiml,
     callback_unclear_twiml,
+    admit_patient_to_agent,
+    agent_join_allowed,
     conference_wait_twiml,
     connect_twiml,
+    connecting_twiml,
     declined_twiml,
     dial_status_twiml,
     handle_conference_status,
+    hold_twiml,
     inbound_connect_twiml,
     is_affirmative,
     is_negative,
-    load_pending_session,
     load_session,
     maybe_failover_on_agent_status,
     next_agent_twiml,
     participant_join_twiml,
     persist_humans_transcript,
+    release_agent_slot,
+    resolve_inbound_session,
     save_session,
+    set_transfer_call_status,
     schedule_callback_from_warm_transfer_speech,
     speak_now_twiml,
     start_coordinator_leg,
@@ -43,18 +49,11 @@ def _xml(body: str) -> HttpResponse:
 
 
 def _session(request):
+    """Load the session named on this webhook. Never the latest pending one."""
     session_id = (
         request.GET.get("session_id") or request.POST.get("session_id") or ""
     ).strip()
     session = load_session(session_id) if session_id else {}
-    if not session:
-        session = load_pending_session()
-    call_sid = (request.POST.get("CallSid") or "").strip()
-    if session and call_sid and not session.get("call_sid"):
-        session["call_sid"] = call_sid
-        save_session(session)
-        # Persist Twilio CA... Call SID on Call.warm_transfer_session_id.
-        _sync_call_twilio_ids(session)
     return session
 
 
@@ -71,20 +70,49 @@ def warm_transfer_answer(request):
 
 @csrf_exempt
 @require_POST
+def _place_with_agent_or_wait(session):
+    """Dial the live agent for one patient. Leave the others as waiting calls."""
+    decision = admit_patient_to_agent(session)
+    session = load_session(str(session.get("session_id") or "")) or session
+    if decision == "active":
+        session["status"] = "connecting"
+        save_session(session)
+        set_transfer_call_status(session, "in_progress")
+        start_coordinator_leg(session)
+    else:
+        session["status"] = "waiting_for_agent"
+        save_session(session)
+        set_transfer_call_status(session, "waiting")
+    return session
+
+
 def warm_transfer_inbound(request):
-    """Retell transferred person A onto our Twilio number. Dial and record B."""
-    session = _session(request)
+    """Retell transferred one patient onto our Twilio number.
+
+    Each patient stays in their own conference. Only one is dialed through
+    to the live agent; the others are marked waiting.
+    """
+    session = resolve_inbound_session(
+        call_sid=(request.POST.get("CallSid") or "").strip(),
+        from_number=(request.POST.get("From") or "").strip(),
+        to_number=(request.POST.get("To") or "").strip(),
+        caller=(request.POST.get("Caller") or "").strip(),
+        called=(request.POST.get("Called") or "").strip(),
+    )
     if not session:
         logger.warning("Warm-transfer inbound with no session")
         return _xml(
             '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
         )
+    if request.POST.get("CallSid"):
+        session["call_sid"] = request.POST.get("CallSid")
+        _sync_call_twilio_ids(session)
     session["status"] = "inbound_from_retell"
     save_session(session)
     # Do NOT start patient recording here — Twilio returns 21220 (not eligible)
     # while the call is still being redirected into the conference. Recording
     # starts on conference join (see warm_transfer_conference_status).
-    start_coordinator_leg(session)
+    _place_with_agent_or_wait(session)
     return _xml(inbound_connect_twiml(session))
 
 
@@ -103,9 +131,7 @@ def warm_transfer_gather(request):
         save_session(session)
         return _xml(declined_twiml())
     if is_affirmative(speech, digits):
-        session["status"] = "connecting"
-        save_session(session)
-        start_coordinator_leg(session)
+        _place_with_agent_or_wait(session)
         return _xml(connect_twiml(session))
     retries = int(session.get("gather_retries") or 0)
     if retries < 1:
@@ -120,17 +146,25 @@ def warm_transfer_gather(request):
 @csrf_exempt
 @require_POST
 def warm_transfer_join(request):
+    """Live agent enters only the active patient's conference."""
     session = _session(request)
-    if not session:
+    call_sid = (request.POST.get("CallSid") or "").strip()
+    if not agent_join_allowed(session, call_sid):
+        logger.warning(
+            "Rejected agent join session=%s call=%s state=%s",
+            (session or {}).get("session_id"),
+            call_sid or "-",
+            (session or {}).get("queue_state"),
+        )
         return _xml(
             '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
         )
-    if request.POST.get("CallSid"):
-        session["dial_call_sid"] = request.POST.get("CallSid")
+    if call_sid:
+        session["dial_call_sid"] = call_sid
         save_session(session)
         start_leg_recording(
             session,
-            str(session.get("dial_call_sid") or ""),
+            call_sid,
             str(session.get("dial_speaker") or "provider"),
         )
     return _xml(participant_join_twiml(session))
@@ -154,6 +188,20 @@ def warm_transfer_wait(request):
 def warm_transfer_next_agent(request):
     """Played into the conference when failing over to the next live agent."""
     return _xml(next_agent_twiml())
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_hold(request):
+    """Played to a patient who is waiting because the agent is with someone else."""
+    return _xml(hold_twiml())
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_connecting(request):
+    """Played when a waiting patient is about to be connected."""
+    return _xml(connecting_twiml())
 
 
 @csrf_exempt
@@ -230,12 +278,16 @@ def warm_transfer_dial_status(request):
     session = _session(request)
     if session:
         session["dial_status"] = status
-        dial_sid = (request.POST.get("DialCallSid") or "").strip()
-        if dial_sid:
-            session["dial_call_sid"] = dial_sid
+        dial_sid = (request.POST.get("DialCallSid") or request.POST.get("CallSid") or "").strip()
+        current_dial = str(session.get("dial_call_sid") or "")
+        # A backup agent's old call must not replace the agent now in this conference.
+        if dial_sid and current_dial and dial_sid != current_dial:
+            return _xml(
+                '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+            )
         save_session(session)
         if maybe_failover_on_agent_status(
-            session, call_status=status, call_sid=dial_sid
+            session, call_status=status, call_sid=dial_sid or current_dial
         ):
             # Keep patient on the line; next agent is being dialed.
             return _xml(
@@ -270,15 +322,26 @@ def warm_transfer_status(request):
     call_sid = (request.POST.get("CallSid") or "").strip()
     if session:
         session["call_status"] = call_status
-        if call_sid and not session.get("call_sid"):
+        patient_sid = str(session.get("call_sid") or "")
+        dial_sid = str(session.get("dial_call_sid") or "")
+        # The agent leg must not be stored as the patient's call.
+        if call_sid and not patient_sid and call_sid != dial_sid:
             session["call_sid"] = call_sid
+            patient_sid = call_sid
         save_session(session)
         maybe_failover_on_agent_status(
             session, call_status=call_status, call_sid=call_sid
         )
-        # Patient host hangup ends the conference; extend full duration.
+        # Patient host hangup ends the conference; extend full duration
+        # and let the next waiting patient through.
         if call_status.strip().lower() == "completed":
             from apps.ai_caller.twilio_bridge import extend_call_ended_at
 
-            extend_call_ended_at(session)
+            patient_sid = str(session.get("call_sid") or "")
+            dial_sid = str(session.get("dial_call_sid") or "")
+            # Only the patient leaving ends this conference. An agent hangup
+            # must not pull the next waiting patient into this room.
+            if patient_sid and call_sid == patient_sid and call_sid != dial_sid:
+                extend_call_ended_at(session)
+                release_agent_slot(session)
     return HttpResponse("ok")
