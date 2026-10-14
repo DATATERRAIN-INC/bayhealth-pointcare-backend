@@ -1,0 +1,46 @@
+# Nginx: proxy Pointcare Live Agent (FastAPI on 127.0.0.1:8001).
+# Root cause of public /form-filler/... Django 404: these paths were hitting
+# Gunicorn/Django (8000) instead of pointcare-liveagent (8001).
+#
+# Include inside the HTTPS server block for bach.gapincare-backend.socialroots-dev.net
+# (or copy the location blocks into the site config), then:
+#   sudo nginx -t && sudo systemctl reload nginx
+
+# Retell Custom LLM WebSocket
+location /llm-websocket/ {
+    proxy_pass http://127.0.0.1:8001;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+
+# Retell webhooks (live agent)
+location /webhooks/retell {
+    proxy_pass http://127.0.0.1:8001;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+
+# Form-filler session + Chrome focus page (must NOT go to Django)
+location /form-filler/ {
+    proxy_pass http://127.0.0.1:8001;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+
+# Optional: FastAPI root / OpenAPI for ops checks
+# location = /liveagent/ {
+#     proxy_pass http://127.0.0.1:8001/;
+#     proxy_set_header Host $host;
+#     proxy_set_header X-Forwarded-Proto $scheme;
+# }

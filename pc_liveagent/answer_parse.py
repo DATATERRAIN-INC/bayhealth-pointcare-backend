@@ -22,12 +22,14 @@ from .live_form import (
     _age_option_labels,
     _choice_phrase,
     _extract_age_numbers,
+    _income_period_choice,
     _is_no,
     _is_yes,
     _map_age_label,
     _map_income_range_label,
     _map_relationship_label,
     _map_special_condition_labels,
+    _resolve_income_period_label,
     _spoken_has_age_range_connector,
     classify_yes_no,
 )
@@ -492,12 +494,18 @@ def resolve_answer(
         )
 
     if answer_type == "income_period" or step == "income_when":
-        if re.search(r"\b(bi[-\s]?week|every two weeks?|two weeks?|fortnight)\b", text, re.I):
-            return ResolveResult(answer="Bi-weekly", detail="income_period")
-        if re.search(r"\bmonth", text, re.I):
-            return ResolveResult(answer="Monthly", detail="income_period")
-        if re.search(r"\b(year|annual)", text, re.I):
-            return ResolveResult(answer="Annual", detail="income_period")
+        resolved = _resolve_income_period_label(text, options)
+        if not resolved:
+            canonical = _income_period_choice(text)
+            if canonical in {"Annual", "Monthly", "Bi-weekly"}:
+                # No visible options yet — accept canonical mapping.
+                if not options:
+                    resolved = canonical
+                else:
+                    # Options present but none matched (e.g. STT near-miss on chip).
+                    resolved = ""
+        if resolved:
+            return ResolveResult(answer=resolved, detail="income_period")
         return ResolveResult(
             clarify=_options_clarify(
                 step,
@@ -851,8 +859,11 @@ def validate_claude_result(
                 mapped = _map_income_range_label(candidate, options)
                 matched = mapped if mapped in options else None
             elif answer_type == "income_period" or step == "income_when":
-                period = _choice_phrase(candidate)
-                matched = _match_option_against_list(period, options)
+                matched = _resolve_income_period_label(candidate, options) or None
+                if not matched:
+                    period = _income_period_choice(candidate)
+                    if period in {"Annual", "Monthly", "Bi-weekly"}:
+                        matched = _match_option_against_list(period, options)
             elif step == "special":
                 mapped_list = _special_condition_matches(candidate, options)
                 if len(mapped_list) == 1:

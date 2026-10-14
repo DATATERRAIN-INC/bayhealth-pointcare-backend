@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from playwright.async_api import Browser, Page, async_playwright
 from .config import (
     CHROME_AGENT_DATA,
     CHROME_CHANNEL,
+    CHROME_NO_SANDBOX,
     CHROME_PROFILE_DIR,
     CHROME_PROFILE_DIRECTORY,
     CHROME_SOURCE_PROFILE_DIR,
@@ -36,18 +38,104 @@ _browser: Browser | None = None
 _lock = asyncio.Lock()
 
 
-def _chrome_executable() -> str:
-    if CHROME_CHANNEL.lower() in ("chrome", "google-chrome", ""):
-        roots = [
-            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")),
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")),
-            Path(os.environ.get("LOCALAPPDATA", "")),
+def _is_executable_file(path: Path) -> bool:
+    """True when path is an existing executable file (not a directory)."""
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def _chrome_candidates_windows() -> list[Path]:
+    roots = [
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")),
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")),
+        Path(os.environ.get("LOCALAPPDATA", "")),
+    ]
+    out: list[Path] = []
+    for root in roots:
+        if not str(root):
+            continue
+        out.append(root / "Google" / "Chrome" / "Application" / "chrome.exe")
+    return out
+
+
+def _chrome_candidates_linux() -> list[Path]:
+    """Ordered Google Chrome candidates for Ubuntu/Debian-style hosts."""
+    out: list[Path] = []
+    for name in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
+        found = shutil.which(name)
+        if found:
+            out.append(Path(found))
+    out.extend(
+        [
+            Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/google-chrome-stable"),
+            Path("/usr/bin/chromium-browser"),
+            Path("/usr/bin/chromium"),
+            Path("/snap/bin/chromium"),
         ]
-        for root in roots:
-            path = root / "Google" / "Chrome" / "Application" / "chrome.exe"
-            if path.is_file():
-                return str(path)
-    raise RuntimeError("Google Chrome was not found. Install Chrome or set CHROME_CHANNEL.")
+    )
+    return out
+
+
+def _chrome_executable() -> str:
+    """Resolve the Chrome binary for the current OS.
+
+    Prefers ``CHROME_EXECUTABLE`` when set. For channel chrome/google-chrome,
+    searches platform-specific install locations. Other ``CHROME_CHANNEL`` values
+    (msedge, chromium, chrome-beta, …) remain Playwright channel names and are
+    not resolved here — callers that need a path must set ``CHROME_EXECUTABLE``.
+    """
+    explicit = (os.environ.get("CHROME_EXECUTABLE") or "").strip().strip('"').strip("'")
+    if explicit:
+        path = Path(explicit).expanduser()
+        if _is_executable_file(path):
+            logger.info("Using CHROME_EXECUTABLE=%s", path)
+            return str(path)
+        raise RuntimeError(
+            f"CHROME_EXECUTABLE is set to {explicit!r} but that path is not an "
+            "executable file. Install Chrome or correct CHROME_EXECUTABLE."
+        )
+
+    channel = (CHROME_CHANNEL or "chrome").strip().lower()
+    # Backward compatible: empty / chrome / google-chrome → system Google Chrome.
+    if channel not in ("chrome", "google-chrome", ""):
+        # Non-path channels (e.g. msedge) are not resolved as filesystem paths.
+        raise RuntimeError(
+            f"CHROME_CHANNEL={CHROME_CHANNEL!r} is not a path-based Chrome install. "
+            "Install Google Chrome, set CHROME_CHANNEL=chrome, or set "
+            "CHROME_EXECUTABLE to the full browser binary path."
+        )
+
+    candidates = (
+        _chrome_candidates_windows()
+        if sys.platform == "win32"
+        else _chrome_candidates_linux()
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_executable_file(candidate):
+            logger.info("Resolved Chrome executable=%s platform=%s", candidate, sys.platform)
+            return key
+
+    searched = ", ".join(str(p) for p in candidates[:8]) or "(none)"
+    logger.error(
+        "Google Chrome executable not found platform=%s channel=%s searched=%s",
+        sys.platform,
+        CHROME_CHANNEL,
+        searched,
+    )
+    raise RuntimeError(
+        "Google Chrome was not found. On Linux install google-chrome-stable and "
+        "ensure /usr/bin/google-chrome is on PATH, or set CHROME_EXECUTABLE to the "
+        "full binary path. On Windows install Chrome or set CHROME_EXECUTABLE / "
+        "CHROME_CHANNEL."
+    )
 
 
 def _cdp_up(url: str | None = None) -> bool:
@@ -71,7 +159,11 @@ def _profile_really_locked(user_data_dir: Path) -> bool:
 def _chrome_processes_running() -> bool:
     if sys.platform != "win32":
         try:
-            out = subprocess.check_output(["pgrep", "-x", "chrome"], stderr=subprocess.DEVNULL)
+            # Process name is usually "chrome" even when launched as google-chrome.
+            out = subprocess.check_output(
+                ["pgrep", "-f", "chrome"],
+                stderr=subprocess.DEVNULL,
+            )
             return bool(out.strip())
         except Exception:
             return False
@@ -257,12 +349,26 @@ def _kill_chrome_using(user_data_dir: Path) -> None:
 
 
 def _chrome_using(user_data_dir: Path) -> bool:
+    """True when a Chrome process was started with this --user-data-dir."""
+    needle = str(user_data_dir)
     if sys.platform != "win32":
-        return _chrome_processes_running()
-    needle = str(user_data_dir).replace("'", "''")
+        try:
+            out = subprocess.check_output(
+                ["ps", "-eo", "args="],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            for line in out.splitlines():
+                low = line.lower()
+                if "chrome" in low and needle in line:
+                    return True
+            return False
+        except Exception:
+            return False
+    needle_ps = needle.replace("'", "''")
     script = (
         "@(Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-        f"Where-Object {{ $_.CommandLine -like '*{needle}*' }}).Count"
+        f"Where-Object {{ $_.CommandLine -like '*{needle_ps}*' }}).Count"
     )
     try:
         out = subprocess.check_output(
@@ -301,9 +407,11 @@ def _launch_chrome(user_data_dir: Path, profile_directory: str, start_url: str =
     # Pass each flag as its own argv item (no PowerShell). Spaces in
     # "User Data" / "Profile 4" must stay inside one argument or Chrome
     # opens a fresh empty profile.
+    # Bind CDP to localhost only — never expose the debugging port publicly.
     args = [
         exe,
         f"--remote-debugging-port={CDP_PORT}",
+        "--remote-debugging-address=127.0.0.1",
         f"--user-data-dir={str(user_data_dir)}",
         f"--profile-directory={profile_directory}",
         "--no-first-run",
@@ -313,12 +421,20 @@ def _launch_chrome(user_data_dir: Path, profile_directory: str, start_url: str =
         "--hide-crash-restore-bubble",
         "--disable-blink-features=AutomationControlled",
         "--disable-features=FedCm,AutofillServerCommunication",
-        start_url or "about:blank",
     ]
+    if sys.platform != "win32":
+        # Common on EC2/containers where /dev/shm is small.
+        args.append("--disable-dev-shm-usage")
+    if CHROME_NO_SANDBOX:
+        # Opt-in only (some locked-down Linux hosts require it).
+        args.append("--no-sandbox")
+        logger.warning("Launching Chrome with --no-sandbox (CHROME_NO_SANDBOX=true)")
     if HEADLESS:
         args.append("--headless=new")
+    args.append(start_url or "about:blank")
     logger.info(
-        "Launching agent Chrome folder=%s start_url=%s debug_port=%s",
+        "Launching agent Chrome exe=%s folder=%s start_url=%s debug_port=%s",
+        exe,
         user_data_dir,
         start_url or "about:blank",
         CDP_PORT,
@@ -349,10 +465,14 @@ async def _wait_for_cdp(user_data_dir: Path, timeout_s: float = 40) -> None:
                 CDP_URL = candidate
                 return
         await asyncio.sleep(0.25)
+    hint = (
+        "Close the agent Chrome window (or run pc_liveagent/open_agent_chrome.bat), then retry."
+        if sys.platform == "win32"
+        else "Stop any stale agent Chrome on this host, confirm CHROME_EXECUTABLE, then retry."
+    )
     raise RuntimeError(
         f"Chrome did not open remote debugging on port {CDP_PORT}. "
-        f"Agent Chrome folder: {user_data_dir}. "
-        "Close the agent Chrome window (or run pc_liveagent\\open_agent_chrome.bat), then retry."
+        f"Agent Chrome folder: {user_data_dir}. {hint}"
     )
 
 

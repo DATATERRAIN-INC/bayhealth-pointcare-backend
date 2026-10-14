@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,19 +15,49 @@ ANTHROPIC_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "low").strip() or "low"
 ANTHROPIC_TIMEOUT_S = float(os.environ.get("ANTHROPIC_TIMEOUT_S", "1.5"))
 ANTHROPIC_MIN_CONFIDENCE = float(os.environ.get("ANTHROPIC_MIN_CONFIDENCE", "0.72"))
 CHROME_CHANNEL = os.environ.get("CHROME_CHANNEL", "chrome").strip()
+# Optional absolute path to chrome/google-chrome (preferred on Linux EC2).
+CHROME_EXECUTABLE = os.environ.get("CHROME_EXECUTABLE", "").strip()
+# Opt-in: some locked-down Linux hosts need --no-sandbox. Keep off by default.
+CHROME_NO_SANDBOX = os.environ.get("CHROME_NO_SANDBOX", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 HEADLESS = os.environ.get("HEADLESS", "false").lower() in ("true", "1", "yes")
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "25"))
 PORT = int(os.environ.get("PORT", "8001"))
+# Public HTTPS origin used in chrome_url / open_url (preferred over request Host).
+PUBLIC_BASE_URL = (
+    os.environ.get("PUBLIC_BASE_URL", "").strip()
+    or os.environ.get("FORM_FILLER_PUBLIC_BASE_URL", "").strip()
+).rstrip("/")
 USE_SYSTEM_CHROME_PROFILE = os.environ.get("USE_SYSTEM_CHROME_PROFILE", "true").lower() in (
     "true",
     "1",
     "yes",
 )
 
-SYSTEM_CHROME_USER_DATA = Path(
-    os.environ.get("CHROME_USER_DATA")
-    or (Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data")
-)
+
+def _default_system_chrome_user_data() -> Path:
+    if os.environ.get("CHROME_USER_DATA"):
+        return Path(os.environ["CHROME_USER_DATA"]).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+    # Linux / macOS typical Chromium user-data roots.
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    return Path.home() / ".config" / "google-chrome"
+
+
+def _default_agent_data_root() -> Path:
+    if os.environ.get("CHROME_AGENT_DATA"):
+        return Path(os.environ["CHROME_AGENT_DATA"]).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", str(ROOT))) / "PointcareAgentChrome"
+    return Path.home() / ".cache" / "PointcareAgentChrome"
+
+
+SYSTEM_CHROME_USER_DATA = _default_system_chrome_user_data()
 
 
 def _last_chrome_profile() -> str:
@@ -87,10 +118,7 @@ CHROME_CLONE_DIR = Path(os.environ.get("CHROME_CLONE_DIR") or (ROOT / "chrome_pr
 
 # Chrome 136+ refuses remote debugging on its default "User Data" folder, so the
 # agent runs the profile from its own folder (seeded once from CHROME_PROFILE_PATH).
-CHROME_AGENT_DATA_ROOT = Path(
-    os.environ.get("CHROME_AGENT_DATA")
-    or (Path(os.environ.get("LOCALAPPDATA", str(ROOT))) / "PointcareAgentChrome")
-)
+CHROME_AGENT_DATA_ROOT = _default_agent_data_root()
 # One agent clone per source profile so changing CHROME_PROFILE_PATH actually switches.
 _agent_profile_key = "".join(
     ch if ch.isalnum() or ch in ("-", "_") else "_"

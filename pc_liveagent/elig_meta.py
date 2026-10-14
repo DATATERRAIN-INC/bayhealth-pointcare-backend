@@ -75,6 +75,7 @@ ELIG_FIELD_META: dict[str, FieldMeta] = {
     "income_range": _meta("income_range"),
     "special": _meta("choice"),
     "special_person": _meta("text"),
+    "special_more": _meta("yes_no"),
     "babies_count": _meta("text"),
     "due_date": _meta("text", required=None, can_skip=False),
     "programs": _meta("yes_no"),

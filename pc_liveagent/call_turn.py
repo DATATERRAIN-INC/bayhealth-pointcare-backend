@@ -76,6 +76,7 @@ _SLOW_ELIG_STEPS = frozenset(
         "income_range",
         "special",
         "special_person",
+        "special_more",
         "programs",
     }
 )
@@ -662,6 +663,12 @@ async def begin_speech(call_id: str) -> str:
 
 def _eligibility_question_for_session(session: Any) -> str:
     step = (session.elig_step if session else "") or "marital"
+    if session is not None:
+        from .live_form import _spoken_question_for_step
+
+        return _spoken_question_for_step(session, step) or ELIG_QUESTIONS.get(
+            "marital", ""
+        )
     return ELIG_QUESTIONS.get(step) or ELIG_QUESTIONS.get("marital", "")
 
 
@@ -1424,7 +1431,14 @@ async def _repeat_with_context(call_id: str, ctrl: CallController) -> str:
                 )
             )
         labels = await peek_choice_labels(call_id)
-        return format_question(step, options=labels or None)
+        question = format_question(step, options=labels or None)
+        from .live_form import _section_context_for_step
+
+        context = _section_context_for_step(step)
+        if context and step.startswith(("spouse_", "child_")):
+            # Explain section context without restarting or losing answers.
+            return f"{context} {question}"
+        return question
     if phase == "closing":
         return ctrl.last_speech or CLOSING
     return ctrl.last_speech or f"{CALL_PURPOSE} Could you say that again?"
