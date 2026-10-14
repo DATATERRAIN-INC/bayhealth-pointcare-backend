@@ -106,6 +106,15 @@ class PatientSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         )
+        extra_kwargs = {
+            "dob": {"required": False, "allow_null": True},
+            "doctor": {"required": False, "allow_blank": True, "allow_null": True},
+            "service_name": {
+                "required": False,
+                "allow_blank": True,
+                "allow_null": True,
+            },
+        }
 
     def get_call_id(self, obj):
         value = getattr(obj, "_latest_call_id", None)
@@ -259,11 +268,15 @@ class PatientSerializer(serializers.ModelSerializer):
         return _letters_only_name(value, field_label="Last name", required=False)
 
     def validate_doctor(self, value):
-        return _letters_only_name(value, field_label="Doctor name", required=True)
+        # Allow any text (including periods/symbols); optional for bulk upload.
+        text = (value or "").strip()
+        return text[:120] if text else ""
 
     def validate_dob(self, value):
         from common.excel import parse_patient_dob
 
+        if value in (None, ""):
+            return None
         # DRF DateField may already give a date; still re-check bounds.
         if isinstance(value, str):
             parsed = parse_patient_dob(value)
@@ -279,22 +292,23 @@ class PatientSerializer(serializers.ModelSerializer):
         return value
 
     def to_internal_value(self, data):
-        if isinstance(data, dict) and "dob" in data and data.get("dob") not in (None, ""):
-            from common.excel import parse_patient_dob
+        if isinstance(data, dict) and "dob" in data:
+            raw_dob = data.get("dob")
+            if raw_dob in (None, ""):
+                data = {**data, "dob": None}
+            else:
+                from common.excel import parse_patient_dob
 
-            parsed = parse_patient_dob(data.get("dob"))
-            if parsed:
-                data = {**data, "dob": parsed.isoformat()}
+                parsed = parse_patient_dob(raw_dob)
+                if parsed:
+                    data = {**data, "dob": parsed.isoformat()}
         return super().to_internal_value(data)
 
     def validate_country_code(self, value):
         return _normalize_country_code(value)
 
     def validate_service_name(self, value):
-        name = (value or "").strip()
-        if not name:
-            raise serializers.ValidationError("Service name is required.")
-        return name
+        return (value or "").strip()[:120]
 
 
 class PatientUploadSerializer(serializers.Serializer):
