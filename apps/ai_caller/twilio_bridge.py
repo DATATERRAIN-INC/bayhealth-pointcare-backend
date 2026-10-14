@@ -396,11 +396,34 @@ def conference_name(session_id: str) -> str:
     return f"care-wt-{session_id}"[:40]
 
 
+def _ring_url() -> str:
+    """Audio played to the patient while the live agent line is ringing."""
+    configured = (getattr(settings, "WARM_TRANSFER_RING_URL", "") or "").strip()
+    if configured:
+        return configured
+    # Twilio Client outgoing ringtone — works as a transfer ringback.
+    return "https://sdk.twilio.com/js/client/sounds/releases/1.0.0/outgoing.mp3"
+
+
+def conference_wait_twiml() -> str:
+    """Conference waitUrl: loop ring tone until the live agent joins."""
+    ring = escape(_ring_url())
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Play loop="0">{ring}</Play>'
+        "</Response>"
+    )
+
+
 def join_conference_twiml(session: Dict[str, Any], *, is_host: bool) -> str:
     session_id = str(session.get("session_id") or "")
     conf = escape(conference_name(session_id))
     status_cb = escape(
         _abs_url("/api/ai-call/twilio/warm-transfer/conference-status/", session_id)
+    )
+    wait_url = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/wait/", session_id)
     )
     mix_cb = escape(
         _abs_url(
@@ -422,7 +445,8 @@ def join_conference_twiml(session: Dict[str, Any], *, is_host: bool) -> str:
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Dial>"
-        f'<Conference beep="false" waitUrl="" startConferenceOnEnter="true" '
+        f'<Conference beep="false" waitUrl="{wait_url}" waitMethod="POST" '
+        f'startConferenceOnEnter="true" '
         f'endConferenceOnExit="{end_on_exit}" {record_attrs}'
         f'statusCallback="{status_cb}" statusCallbackEvent="start join end" '
         f'statusCallbackMethod="POST">{conf}</Conference>'
@@ -460,6 +484,100 @@ def speak_now_twiml() -> str:
         f"{_say('You can speak now.')}"
         "</Response>"
     )
+
+
+def next_agent_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('That agent is unavailable. I am connecting you to the next agent now. Please hold.')}"
+        "</Response>"
+    )
+
+
+def ask_callback_twiml(session: Dict[str, Any]) -> str:
+    session_id = str((session or {}).get("session_id") or "")
+    gather_url = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/callback-gather/", session_id)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('I am sorry, none of our enrollment agents are available right now. What day and time works best for a callback?')}"
+        f'<Gather input="speech" timeout="8" speechTimeout="auto" '
+        f'action="{gather_url}" method="POST">'
+        f"{_say('For example, you can say tomorrow at 3 PM, or Friday morning.')}"
+        "</Gather>"
+        f"{_say('Sorry, I did not catch a time. We will follow up another day. Goodbye.')}"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def callback_scheduled_twiml(when_text: str = "") -> str:
+    when = (when_text or "").strip()
+    if when:
+        line = (
+            f"Got it. I have scheduled your callback for {when}. "
+            "Thank you for your time. Goodbye."
+        )
+    else:
+        line = (
+            "Got it. I have scheduled your callback. "
+            "Thank you for your time. Goodbye."
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say(line)}"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def callback_unclear_twiml(session: Dict[str, Any]) -> str:
+    session_id = str((session or {}).get("session_id") or "")
+    gather_url = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/callback-gather/", session_id)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('Sorry, I did not catch that. Please tell me a day and time for your callback.')}"
+        f'<Gather input="speech" timeout="8" speechTimeout="auto" '
+        f'action="{gather_url}" method="POST"></Gather>'
+        f"{_say('We will follow up another day. Goodbye.')}"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def announce_next_agent(session: Dict[str, Any]) -> None:
+    """Tell the patient on the conference that we are dialing the next live agent."""
+    session = dict(session or {})
+    conference_sid = str(session.get("conference_sid") or "").strip()
+    session_id = str(session.get("session_id") or "")
+    if not conference_sid or not session_id:
+        return
+    client = _twilio_client()
+    if client is None:
+        return
+    try:
+        client.conferences(conference_sid).update(
+            announce_url=_abs_url(
+                "/api/ai-call/twilio/warm-transfer/next-agent/", session_id
+            ),
+            announce_method="POST",
+        )
+        logger.info(
+            "Announced next-agent failover session=%s conf=%s",
+            session_id,
+            conference_sid,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to announce next-agent failover session=%s", session_id
+        )
 
 
 def start_coordinator_leg(session: Dict[str, Any]) -> None:
@@ -551,7 +669,9 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
         )
         session["status"] = "agent_unreachable"
         save_session(session)
-        return False
+        # Ask the patient for a callback time (no more agents left).
+        offer_agent_unreachable_callback(session)
+        return True
 
     previous = numbers[idx] if idx < len(numbers) else session.get("transfer_number")
     nxt = numbers[next_idx]
@@ -606,8 +726,97 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
                 session_id,
             )
 
+    # Patient is already in the conference — announce before dialing the next agent.
+    announce_next_agent(session)
     start_coordinator_leg(session)
     return True
+
+
+def offer_agent_unreachable_callback(session: Dict[str, Any]) -> bool:
+    """
+    When no live agent answers, redirect the patient leg to ask for a callback time.
+    Returns True when the redirect (or prior offer) is in progress.
+    """
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    session_id = str(session.get("session_id") or "")
+    if not session_id:
+        return False
+    if session.get("callback_offer_started") or session.get("status") in {
+        "agent_unreachable_ask_callback",
+        "callback_scheduled",
+    }:
+        return True
+
+    patient_sid = str(session.get("call_sid") or "").strip()
+    session["status"] = "agent_unreachable_ask_callback"
+    session["callback_offer_started"] = True
+    save_session(session)
+
+    dialer_logger = logging.getLogger("ai_caller.dialer")
+    dialer_logger.info(
+        "AGENT_UNREACHABLE_ASK_CALLBACK session=%s patient_sid=%s",
+        session_id,
+        patient_sid or "-",
+    )
+
+    client = _twilio_client()
+    if client is None or not patient_sid:
+        logger.warning(
+            "Cannot ask callback — missing twilio client or patient call_sid session=%s",
+            session_id,
+        )
+        return False
+    try:
+        client.calls(patient_sid).update(
+            url=_abs_url(
+                "/api/ai-call/twilio/warm-transfer/ask-callback/", session_id
+            ),
+            method="POST",
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to redirect patient for callback ask session=%s", session_id
+        )
+        return False
+
+
+def schedule_callback_from_warm_transfer_speech(
+    session: Dict[str, Any], *, speech: str
+) -> tuple:
+    """
+    Parse spoken callback time and create ScheduledOutreach.
+    Returns (ok, message_for_patient, error).
+    """
+    from apps.ai_caller.models import Call
+    from apps.ai_caller.scheduling import schedule_callback_request
+
+    session = dict(session or {})
+    raw = (speech or "").strip()
+    if not raw:
+        return False, "", "empty"
+
+    retell_call_id = str(session.get("retell_call_id") or "").strip()
+    patient_sid = str(session.get("call_sid") or "").strip()
+    call = None
+    if retell_call_id:
+        call = Call.objects.filter(retell_call_id=retell_call_id).first()
+    if not call and patient_sid:
+        call = Call.objects.filter(warm_transfer_session_id=patient_sid).first()
+    if not call:
+        return False, "", "call_not_found"
+
+    row, error = schedule_callback_request(call=call, raw_time_text=raw)
+    if error or not row:
+        return False, "", error or "schedule_failed"
+
+    when = (getattr(row, "raw_time_text", None) or raw).strip()
+    session["status"] = "callback_scheduled"
+    session["callback_raw_time"] = when
+    save_session(session)
+    return True, when, ""
 
 
 def maybe_failover_on_agent_status(
@@ -629,7 +838,28 @@ def maybe_failover_on_agent_status(
         return False
     if session.get("spoke_now") or session.get("status") == "connected":
         return False
-    return failover_to_next_live_agent(session, reason=status)
+    if session.get("callback_offer_started") or session.get("status") in {
+        "agent_unreachable_ask_callback",
+        "callback_scheduled",
+    }:
+        return True
+
+    numbers = [
+        str(n).strip()
+        for n in (
+            session.get("transfer_numbers") or session.get("live_agent_numbers") or []
+        )
+        if str(n).strip()
+    ]
+    # Single agent (or empty list): no failover target — ask for callback.
+    if len(numbers) < 2:
+        session["status"] = "agent_unreachable"
+        save_session(session)
+        return offer_agent_unreachable_callback(session)
+
+    if failover_to_next_live_agent(session, reason=status):
+        return True
+    return offer_agent_unreachable_callback(session)
 
 
 def start_leg_recording(session: Dict[str, Any], call_sid: str, leg: str) -> None:

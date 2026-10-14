@@ -11,6 +11,10 @@ from django.views.decorators.http import require_POST
 from apps.ai_caller.twilio_bridge import (
     _sync_call_twilio_ids,
     answer_twiml,
+    ask_callback_twiml,
+    callback_scheduled_twiml,
+    callback_unclear_twiml,
+    conference_wait_twiml,
     connect_twiml,
     declined_twiml,
     dial_status_twiml,
@@ -21,9 +25,11 @@ from apps.ai_caller.twilio_bridge import (
     load_pending_session,
     load_session,
     maybe_failover_on_agent_status,
+    next_agent_twiml,
     participant_join_twiml,
     persist_humans_transcript,
     save_session,
+    schedule_callback_from_warm_transfer_speech,
     speak_now_twiml,
     start_coordinator_leg,
     start_leg_recording,
@@ -134,6 +140,72 @@ def warm_transfer_join(request):
 @require_POST
 def warm_transfer_speak_now(request):
     return _xml(speak_now_twiml())
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_wait(request):
+    """Ringback for the patient while waiting for the live agent to join."""
+    return _xml(conference_wait_twiml())
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_next_agent(request):
+    """Played into the conference when failing over to the next live agent."""
+    return _xml(next_agent_twiml())
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_ask_callback(request):
+    """Ask the patient for a callback time when no live agent answered."""
+    session = _session(request)
+    if not session:
+        return _xml(
+            '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+        )
+    return _xml(ask_callback_twiml(session))
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_callback_gather(request):
+    """Capture spoken callback time and schedule the outreach call."""
+    session = _session(request)
+    if not session:
+        return _xml(
+            '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+        )
+    speech = (request.POST.get("SpeechResult") or "").strip()
+    ok, when, error = schedule_callback_from_warm_transfer_speech(
+        session, speech=speech
+    )
+    if ok:
+        return _xml(callback_scheduled_twiml(when))
+
+    retries = int(session.get("callback_gather_retries") or 0)
+    if retries < 1 and error != "call_not_found":
+        session["callback_gather_retries"] = retries + 1
+        save_session(session)
+        return _xml(callback_unclear_twiml(session))
+
+    logger.warning(
+        "Warm-transfer callback gather failed session=%s error=%s speech=%r",
+        session.get("session_id"),
+        error,
+        speech[:120],
+    )
+    return _xml(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        '<Say voice="Polly.Joanna" language="en-US">'
+        "I am sorry, I could not schedule that callback right now. "
+        "We will follow up another day. Goodbye."
+        "</Say>"
+        "<Hangup/>"
+        "</Response>"
+    )
 
 
 @csrf_exempt
