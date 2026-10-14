@@ -68,6 +68,26 @@ urlpatterns = [
         name="twilio-warm-transfer-speak-now",
     ),
     path(
+        "twilio/warm-transfer/wait/",
+        twiml_views.warm_transfer_wait,
+        name="twilio-warm-transfer-wait",
+    ),
+    path(
+        "twilio/warm-transfer/next-agent/",
+        twiml_views.warm_transfer_next_agent,
+        name="twilio-warm-transfer-next-agent",
+    ),
+    path(
+        "twilio/warm-transfer/ask-callback/",
+        twiml_views.warm_transfer_ask_callback,
+        name="twilio-warm-transfer-ask-callback",
+    ),
+    path(
+        "twilio/warm-transfer/callback-gather/",
+        twiml_views.warm_transfer_callback_gather,
+        name="twilio-warm-transfer-callback-gather",
+    ),
+    path(
         "twilio/warm-transfer/conference-status/",
         twiml_views.warm_transfer_conference_status,
         name="twilio-warm-transfer-conference-status",
