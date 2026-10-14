@@ -326,11 +326,15 @@ If wrong person/refuse/voicemail: callback_end or end_call as appropriate.
 When you ENTER this state, speak promptly and ask ONLY:
 "Is it okay to continue in English, or would you prefer another language?"
 STOP and WAIT for their answer.
+Supported languages (say this list if they ask how many / which languages you speak):
+English, Spanish, Hindi, Chinese (Mandarin), and Vietnamese.
+Example: "I can continue in English, Spanish, Hindi, Chinese, or Vietnamese. Which would you prefer?"
+Then WAIT for their choice.
 - English / fine / okay / yes → immediately transition_to_purpose
   Pass preferred_language="English".
 - Another language named (e.g. Spanish) → briefly acknowledge, continue in that language when you can, then immediately transition_to_purpose
   Pass preferred_language to what they asked for.
-FORBIDDEN: Medi-Cal intro, renewal, contact questions, goodbye.
+FORBIDDEN: Medi-Cal intro, renewal, contact questions, goodbye. Do not invent languages outside the list.
 """.strip(),
             "edges": [
                 _edge(

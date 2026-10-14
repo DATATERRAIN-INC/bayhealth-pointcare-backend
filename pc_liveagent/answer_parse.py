@@ -26,7 +26,10 @@ from .live_form import (
     _is_yes,
     _map_age_label,
     _map_income_range_label,
+    _map_relationship_label,
+    _map_special_condition_labels,
     _spoken_has_age_range_connector,
+    classify_yes_no,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,9 @@ _FAST_PATH_DETAILS = frozenset(
         "marital_single",
         "marital_option",
         "spouse_role",
+        "relationship_mapped",
+        "special_mapped",
+        "special_multi",
         "age_mapped",
         "age_free",  # clear spoken age; Playwright opens chips and verifies
         "income_period",
@@ -163,12 +169,154 @@ def is_email_choice(text: str) -> bool:
     lowered = (text or "").lower()
     if is_google_choice(lowered):
         return False
-    return bool(re.search(r"\bemail\b", lowered))
+    # Go-back / wrong-email corrections mention "email" but are not choosing email SSO.
+    if re.search(
+        r"\b("
+        r"go\s*-?\s*back|goback|"
+        r"wrong\s+e-?mail|incorrect\s+e-?mail|entered\s+the\s+wrong|"
+        r"different\s+e-?mail|change\s+(the\s+)?e-?mail|"
+        r"not\s+(my\s+)?e-?mail"
+        r")\b",
+        lowered,
+    ):
+        return False
+    return bool(re.search(r"\be-?mail\b", lowered))
+
+
+def is_apple_choice(text: str) -> bool:
+    lowered = (text or "").lower()
+    if is_google_choice(lowered) or re.search(r"\bemail\b", lowered):
+        return False
+    return bool(re.search(r"\bapple\b", lowered))
+
+
+_EMAIL_ADDR_RE = re.compile(
+    r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+    re.I,
+)
+
+# Lead-ins Retell often prefixes before the address itself.
+_EMAIL_LEADIN_RE = re.compile(
+    r"^(?:(?:so|okay|ok|um|uh|well)\s+)?"
+    r"(?:"
+    r"(?:my|the|our)?\s*e-?mail(?:\s+address)?\s+is|"
+    r"(?:my|the)?\s*e-?mail(?:\s+address)?\s*(?:should be|will be|to use)?|"
+    r"it(?:'s| is)|use|"
+    r"sign\s*in\s+with|"
+    r"log\s*in\s+with"
+    r")\s+",
+    re.I,
+)
+
+# Spoken digits Retell may emit instead of "003" (including glued "zerozerothree").
+_EMAIL_DIGIT_WORDS: tuple[tuple[str, str], ...] = (
+    ("zero", "0"),
+    ("nought", "0"),
+    ("oh", "0"),
+    ("one", "1"),
+    ("two", "2"),
+    ("three", "3"),
+    ("four", "4"),
+    ("five", "5"),
+    ("six", "6"),
+    ("seven", "7"),
+    ("eight", "8"),
+    ("nine", "9"),
+)
+_EMAIL_DIGIT_ALT = "|".join(
+    sorted((w for w, _ in _EMAIL_DIGIT_WORDS), key=len, reverse=True)
+)
+# Glued/spaced digit runs not embedded inside other letters.
+_EMAIL_DIGIT_RUN_RE = re.compile(
+    rf"(?<![a-z])(?:(?:{_EMAIL_DIGIT_ALT})\s*)+(?![a-z])",
+    re.I,
+)
+
+
+def _spoken_digits_to_chars(text: str) -> str:
+    """Convert spoken digit words to characters; keep non-digit text intact."""
+
+    def _run_to_digits(match: re.Match[str]) -> str:
+        chunk = match.group(0).lower()
+        digits: list[str] = []
+        pos = 0
+        ordered = sorted(_EMAIL_DIGIT_WORDS, key=lambda item: -len(item[0]))
+        while pos < len(chunk):
+            while pos < len(chunk) and chunk[pos].isspace():
+                pos += 1
+            if pos >= len(chunk):
+                break
+            hit = False
+            for word, digit in ordered:
+                if chunk.startswith(word, pos):
+                    digits.append(digit)
+                    pos += len(word)
+                    hit = True
+                    break
+            if not hit:
+                return match.group(0)
+        return "".join(digits) if digits else match.group(0)
+
+    # e.g. "zero zero three" / "zerozerothree" → "003"
+    return _EMAIL_DIGIT_RUN_RE.sub(_run_to_digits, text or "")
+
+
+def normalize_spoken_email(text: str) -> str:
+    """Turn spoken email phrasing into a compact address candidate.
+
+    Handles common ASR variants (at / at the rate / dot / period / underscore /
+    hyphen / spoken digits) and spacing. Does not invent missing characters
+    (e.g. will not insert @ between bare 'name gmail.com').
+    """
+    spoken = (text or "").strip()
+    if not spoken:
+        return ""
+    spoken = _EMAIL_LEADIN_RE.sub("", spoken).strip()
+    # Digits before collapsing spaces so "zero zero three" / "zerozerothree" → 003.
+    spoken = _spoken_digits_to_chars(spoken)
+    # Multi-word tokens first so "at the rate" is not partially eaten by "at".
+    spoken = re.sub(r"\s+at\s+the\s+rate(?:\s+of)?\s+", "@", spoken, flags=re.I)
+    spoken = re.sub(r"\bat\s+the\s+rate(?:\s+of)?\b", "@", spoken, flags=re.I)
+    spoken = re.sub(r"\s+underscore\s+", "_", spoken, flags=re.I)
+    spoken = re.sub(r"\bunderscore\b", "_", spoken, flags=re.I)
+    spoken = re.sub(r"\s+(?:hyphen|dash)\s+", "-", spoken, flags=re.I)
+    spoken = re.sub(r"\b(?:hyphen|dash)\b", "-", spoken, flags=re.I)
+    spoken = re.sub(r"\s+at\s+", "@", spoken, flags=re.I)
+    spoken = re.sub(r"\s+(?:dot|period)\s+", ".", spoken, flags=re.I)
+    spoken = re.sub(r"\b(?:dot|period)\b", ".", spoken, flags=re.I)
+    # "g mail" / "g-mail" → gmail (domain spelling, not a new character guess).
+    spoken = re.sub(r"\bg\s*-?\s*mail\b", "gmail", spoken, flags=re.I)
+    # Drop remaining whitespace and common ASR trailing punctuation.
+    spoken = re.sub(r"\s+", "", spoken)
+    spoken = spoken.strip(".,;:!?\"'()[]")
+    return spoken
 
 
 def extract_email(text: str) -> str:
-    match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text or "", re.I)
-    return match.group(0) if match else ""
+    """Extract a usable email from typed or spoken Retell transcripts."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    match = _EMAIL_ADDR_RE.search(raw)
+    if match:
+        return match.group(0).lower()
+
+    # Strip lead-in then search again before collapsing (keeps domain dots intact).
+    stripped = _EMAIL_LEADIN_RE.sub("", raw).strip()
+    match = _EMAIL_ADDR_RE.search(stripped)
+    if match:
+        return match.group(0).lower()
+
+    compact = normalize_spoken_email(raw)
+    match = _EMAIL_ADDR_RE.search(compact)
+    if match:
+        return match.group(0).lower()
+
+    # If collapse glued a lead-in, search for the rightmost email-shaped token.
+    matches = _EMAIL_ADDR_RE.findall(compact)
+    if matches:
+        return matches[-1].lower()
+    return ""
 
 
 def _with_full_question(step: str, clarify: str, *, options: list[str] | None = None) -> str:
@@ -275,13 +423,16 @@ def resolve_answer(
         )
 
     if answer_type == "yes_no" or step in YES_NO_ELIG_STEPS:
-        if _is_no(text):
+        yn = classify_yes_no(text)
+        if yn == "no":
             return ResolveResult(answer="No", detail="no")
-        if _is_yes(text):
+        if yn == "yes":
             return ResolveResult(answer="Yes", detail="yes")
-        if _CLEAR_YES_NO.match(text):
+        # Bare single-token Yes/No only — never peel the first word off a mixed phrase.
+        if len((text or "").split()) == 1 and _CLEAR_YES_NO.match(text):
+            token = (text or "").strip().lower().rstrip(".!,")
             return ResolveResult(
-                answer=("No" if text.lower().startswith("n") else "Yes"),
+                answer=("No" if token.startswith("n") else "Yes"),
                 detail="yes_no_clear",
             )
         return ResolveResult(
@@ -417,6 +568,26 @@ def resolve_answer(
             detail="spouse_role_unclear",
         )
 
+    if step in ("child_rel", "person_rel"):
+        rel_opts = options or [
+            "Child",
+            "Stepchild",
+            "Grandchild",
+            "Foster Child",
+            "Other",
+        ]
+        mapped_rel = _map_relationship_label(text, list(rel_opts))
+        if mapped_rel:
+            return ResolveResult(answer=mapped_rel, detail="relationship_mapped")
+        return ResolveResult(
+            clarify=_options_clarify(
+                step,
+                list(rel_opts),
+                "Please say the relationship, like Child, Stepchild, or Grandchild.",
+            ),
+            detail="relationship_unclear",
+        )
+
     if step == "special_person":
         # Member assignment only — never treat condition chips as the person.
         if re.search(
@@ -494,6 +665,35 @@ def resolve_answer(
                 ),
                 detail="choice_got_name_phrase",
             )
+        if step in ("child_rel", "person_rel"):
+            mapped_rel = _map_relationship_label(text, choice_opts)
+            if mapped_rel:
+                return ResolveResult(answer=mapped_rel, detail="relationship_mapped")
+            return ResolveResult(
+                clarify=_options_clarify(
+                    step,
+                    choice_opts or options,
+                    "Please say the relationship, like Child, Stepchild, or Grandchild.",
+                ),
+                detail="relationship_unclear",
+            )
+        if step == "special":
+            mapped_special = _map_special_condition_labels(text, choice_opts)
+            if len(mapped_special) == 1:
+                return ResolveResult(
+                    answer=mapped_special[0], detail="special_mapped"
+                )
+            if len(mapped_special) > 1:
+                # Multi-select: keep the spoken utterance; Playwright maps again.
+                return ResolveResult(answer=text, detail="special_multi")
+            return ResolveResult(
+                clarify=_options_clarify(
+                    step,
+                    choice_opts or options,
+                    "Please say which condition applies, or none of the above.",
+                ),
+                detail="special_unclear",
+            )
         exact = [label for label in choice_opts if label.lower() == lowered]
         if len(exact) == 1:
             return ResolveResult(answer=exact[0], detail="choice_exact")
@@ -502,38 +702,9 @@ def resolve_answer(
             for label in choice_opts
             if label.lower() in lowered or lowered in label.lower()
         ]
-        # Special conditions: "disabled" → "Someone is disabled (SSDI)".
-        if step == "special" and len(contains) != 1:
-            cue_hits = [
-                label
-                for label in choice_opts
-                if (
-                    ("disabled" in lowered and "disabled" in label.lower())
-                    or ("blind" in lowered and "blind" in label.lower())
-                    or ("pregnant" in lowered and "pregnant" in label.lower())
-                    or (
-                        "breast" in lowered
-                        and "cancer" in lowered
-                        and "breast" in label.lower()
-                    )
-                    or (
-                        "cervical" in lowered
-                        and "cancer" in lowered
-                        and "cervical" in label.lower()
-                    )
-                    or ("foster" in lowered and "foster" in label.lower())
-                    or (
-                        re.search(r"\bnone\b", lowered)
-                        and "none of the above" in label.lower()
-                    )
-                )
-            ]
-            if len(cue_hits) == 1:
-                contains = cue_hits
         if len(contains) == 1:
             return ResolveResult(answer=contains[0], detail="choice_contains")
-        if re.search(r"\b(first|1st|option one|option 1)\b", lowered) and choice_opts:
-            return ResolveResult(answer=choice_opts[0], detail="choice_first")
+        # Never silently pick the first option on ambiguous speech.
         return ResolveResult(
             clarify=_options_clarify(
                 step, choice_opts or options, "Please say which option applies."
@@ -590,41 +761,8 @@ def _match_option_against_list(
 
 
 def _special_condition_matches(spoken: str, options: list[str]) -> list[str]:
-    """Map spoken special-condition cues onto visible labels (unique hits)."""
-    text = re.sub(r"[.!?…]+$", "", (spoken or "").strip().lower())
-    if not text or not options:
-        return []
-    hits: list[str] = []
-    for label in options:
-        low = label.lower()
-        if not re.search(
-            r"someone is |someone has |someone was |none of the above|"
-            r"pregnant|cancer|blind|disabled|foster",
-            low,
-        ):
-            continue
-        if text == low or text in low or low in text:
-            hits.append(label)
-            continue
-        if "disabled" in text and "disabled" in low:
-            hits.append(label)
-        elif "blind" in text and "blind" in low:
-            hits.append(label)
-        elif "pregnant" in text and "pregnant" in low:
-            hits.append(label)
-        elif "breast" in text and "cancer" in text and "breast" in low:
-            hits.append(label)
-        elif "cervical" in text and "cancer" in text and "cervical" in low:
-            hits.append(label)
-        elif "foster" in text and "foster" in low:
-            hits.append(label)
-        elif re.search(r"\bnone\b", text) and "none of the above" in low:
-            hits.append(label)
-    out: list[str] = []
-    for label in hits:
-        if label not in out:
-            out.append(label)
-    return out
+    """Map spoken special-condition cues onto visible labels (shared with Playwright)."""
+    return _map_special_condition_labels(spoken, options or [])
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:

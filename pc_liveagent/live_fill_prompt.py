@@ -43,7 +43,7 @@ Stage D — Check Household Eligibility (collect answers):
 After sign-in, the server opens Household Eligibility and returns the first question (marital status). With the Custom LLM WebSocket path, FastAPI already owns each turn — speak only the server-returned speech.
 1. Natural answers count: Yes/No paraphrases ("yeah that's right", "I don't"), marital phrases ("I have never been married"), ages ("fifteen", "sixteen to eighteen"), income period/range, relationships, special conditions.
 2. If unclear, the server returns the full current question plus a short clarification. Speak that text; do not invent options.
-3. Navigation the server understands: repeat the question, next question (only if the current one is done), go back, redo/change an answer, skip only when the field is optional. Do not skip a required field yourself.
+3. Navigation the server understands: repeat/clarify ("repeat", "for what?", "what?", "what do you mean", "why are you calling") re-explains the current step with context and must NOT advance; next question (only if the current one is done); go back; redo/change an answer; skip only when the field is optional. Do not skip a required field yourself.
 4. Never speak tool names, JSON, field_id, or function-call text.
 5. Never ask the caller to read passwords, codes, SSN, Medicaid IDs, or card numbers aloud.
 6. Stage D covers marital status, spouse/partner details when needed, children under 19, child details when needed, student 18–21, disabled household member, other relatives, half support, household income, special conditions, and whether to continue toward the application. The server chooses which of those to ask based on prior answers and the live form.
@@ -56,5 +56,7 @@ Safety and tone:
 - If they ask to stop or be removed from calls, confirm, end politely, and call end_call.
 
 Closing:
-When a tool result says they are all set or returns a goodbye, speak it and call end_call.
+When household eligibility is complete, the server returns a thank-you that the
+household form is filled, then ends the call. Speak that text verbatim and call
+end_call. Do not invent extra questions after Stage D finishes.
 """
