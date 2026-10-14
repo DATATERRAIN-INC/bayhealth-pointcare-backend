@@ -2351,8 +2351,15 @@ def prepare_retell_bridge(
         original = {}
     if not isinstance(original, dict):
         original = {}
-    if not str(current_url).startswith(inbound_url):
-        if not original:
+    # Never treat a warm-transfer webhook (any tunnel) as the "original"
+    # production voice URL — restoring that later causes Twilio app errors.
+    current_is_wt = "/twilio/warm-transfer/inbound" in str(current_url)
+    needs_voice_update = (
+        str(current_url).rstrip("/") != inbound_url.rstrip("/")
+        or str(current_method).upper() != "POST"
+    )
+    if needs_voice_update:
+        if not original and current_url and not current_is_wt:
             original = {"voice_url": current_url, "voice_method": current_method}
             try:
                 _session_cache().set(
@@ -2362,6 +2369,11 @@ def prepare_retell_bridge(
                 logger.exception("Failed to remember original Twilio voice URL")
         try:
             incoming.update(voice_url=inbound_url, voice_method="POST")
+            logger.info(
+                "Twilio voice URL refreshed to current BACKEND_URL inbound=%s (was %s)",
+                inbound_url,
+                current_url,
+            )
         except Exception as exc:
             logger.exception("Failed to point Twilio number at warm-transfer inbound")
             return {
@@ -2369,8 +2381,14 @@ def prepare_retell_bridge(
                 "error": f"Failed to prepare Twilio recorder: {exc}",
                 "status_code": 502,
             }
-    previous_url = original.get("voice_url", current_url)
-    previous_method = original.get("voice_method", current_method)
+    previous_url = original.get("voice_url") or (
+        "" if current_is_wt else current_url
+    )
+    if "/warm-transfer/inbound" in str(previous_url):
+        previous_url = ""
+    previous_method = original.get("voice_method") or (
+        current_method if not current_is_wt else "POST"
+    )
 
     numbers = [
         str(n).strip()
