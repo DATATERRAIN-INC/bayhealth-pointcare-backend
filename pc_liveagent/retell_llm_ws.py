@@ -18,13 +18,15 @@ from fastapi import WebSocket, WebSocketDisconnect
 from .call_turn import (
     SSO_BUSY,
     begin_speech,
+    classify_transcript_turn,
     deliver_first_eligibility_question,
     get_controller,
-    latest_user_utterance,
+    mark_transcript_turn_handled,
     process_user_turn,
     recover_pending_outbound,
     sync_controller_to_eligibility,
 )
+from .call_trace import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ async def speak_now(
     content: str,
     *,
     interrupt_id: int | None = None,
+    end_call: bool = False,
 ) -> bool:
     """Proactively speak via agent_interrupt (Retell Custom LLM protocol).
 
@@ -63,19 +66,22 @@ async def speak_now(
         )
         return False
     iid = int(interrupt_id) if interrupt_id is not None else 1
-    payload = {
+    payload: dict[str, Any] = {
         "response_type": "agent_interrupt",
         "interrupt_id": iid,
         "content": text,
         "content_complete": True,
         "no_interruption_allowed": True,
     }
+    if end_call:
+        payload["end_call"] = True
     try:
         await _send(ws, payload)
         logger.info(
-            "agent_interrupt sent call_id=%s interrupt_id=%s speech=%r",
+            "agent_interrupt sent call_id=%s interrupt_id=%s end=%s speech=%r",
             call_id,
             iid,
+            end_call,
             text[:80],
         )
         return True
@@ -180,11 +186,58 @@ async def handle_retell_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 transcript = request.get("transcript") or request.get("transcript_object")
                 if not isinstance(transcript, list):
                     transcript = request.get("transcript_with_tool_calls")
-                utterance = latest_user_utterance(
-                    transcript if isinstance(transcript, list) else []
+                if not isinstance(transcript, list):
+                    transcript = []
+
+                decision = classify_transcript_turn(
+                    ctrl_r, transcript, response_id=response_id
+                )
+                utterance = (
+                    decision.utterance if decision.dedupe == "process" else ""
+                )
+                trace_event(
+                    call_id,
+                    "ws_transcript_classified",
+                    response_id=response_id,
+                    interaction=interaction,
+                    transcript_kind=decision.transcript_kind,
+                    dedupe=decision.dedupe,
+                    user_index=decision.user_index,
+                    utterance=(decision.utterance or "")[:80],
+                    phase=ctrl_r.phase,
                 )
 
+                # Same response_id twice, or cumulative tip unchanged: no new command.
+                if decision.dedupe in ("duplicate_response_id", "stale_tip"):
+                    mark_transcript_turn_handled(
+                        ctrl_r, decision, response_id=response_id
+                    )
+                    speech = ctrl_r.last_speech or "Are you still there?"
+                    await _send(
+                        websocket,
+                        {
+                            "response_type": "response",
+                            "response_id": response_id,
+                            "content": speech,
+                            "content_complete": True,
+                        },
+                    )
+                    logger.info(
+                        "Custom LLM WS replied call_id=%s response_id=%s phase=%s "
+                        "detail=%s end=%s speech=%r",
+                        call_id,
+                        response_id,
+                        ctrl_r.phase,
+                        decision.dedupe,
+                        False,
+                        speech[:100],
+                    )
+                    continue
+
                 if interaction == "reminder_required" and not utterance:
+                    mark_transcript_turn_handled(
+                        ctrl_r, decision, response_id=response_id
+                    )
                     ctrl = await get_controller(call_id)
                     if ctrl.sso_in_progress:
                         speech = SSO_BUSY
@@ -219,7 +272,10 @@ async def handle_retell_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     )
                     continue
 
-                # Track newest response_id; discard work if superseded mid-flight.
+                # Genuine new user tip (or empty response_required) — process once.
+                mark_transcript_turn_handled(
+                    ctrl_r, decision, response_id=response_id
+                )
                 my_id = response_id
                 result = await process_user_turn(
                     call_id,

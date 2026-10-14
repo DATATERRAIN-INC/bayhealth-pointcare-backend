@@ -37,9 +37,28 @@ _REPEAT_RE = re.compile(
     r")\b",
     re.I,
 )
+# Context / confusion asks — re-explain current step; do not advance the flow.
+_CONTEXT_RE = re.compile(
+    r"(?:"
+    r"^\s*(?:what|huh|pardon|come\s+again|sorry|excuse\s+me)\s*[?.!]?\s*$|"
+    r"\bfor\s+what\b|"
+    r"\bwhat\s+for\b|"
+    r"\bwhat(?:'s|s|\s+is)\s+this(?:\s+(?:for|about))?\b|"
+    r"\bwhat(?:'s|s|\s+is)\s+(?:the\s+)?(?:call|this\s+call)\s+about\b|"
+    r"\bwhat do you mean\b|"
+    r"\bwhy\s+(?:are\s+you|did\s+you)\s+call(?:ing)?\b|"
+    r"\bwho\s+(?:is\s+this|are\s+you)\b|"
+    r"\bcan you explain\b|"
+    r"\bexplain\s+(?:that|this|please)\b|"
+    r"\bi\s+(?:don't|do\s+not)\s+understand\b"
+    r")",
+    re.I,
+)
 _GO_BACK_RE = re.compile(
     r"\b("
-    r"go\s+back(?:\s+one\s+step)?|"
+    r"go\s*-?\s*back(?:\s+one\s+step)?|"
+    r"goback|"
+    r"go\s+backwards?|"
     r"previous\s+question|"
     r"back\s+(?:up|one\s+step|a\s+step)|"
     r"last\s+question\s+again"
@@ -132,6 +151,6 @@ def detect_control_intent(utterance: str) -> ControlIntent:
         return ControlIntent("change", target=target)
     if _REDO_RE.search(text):
         return ControlIntent("redo")
-    if _REPEAT_RE.search(text):
+    if _REPEAT_RE.search(text) or _CONTEXT_RE.search(text):
         return ControlIntent("repeat")
     return ControlIntent("none")

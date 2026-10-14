@@ -127,46 +127,82 @@ YES_NO_ELIG_STEPS = frozenset(
 )
 
 
-def _is_no(answer: str) -> bool:
+def classify_yes_no(answer: str) -> str | None:
+    """Return 'yes', 'no', or None when mixed/ambiguous (clarify — do not guess)."""
     text = (answer or "").strip().lower()
-    if re.match(r"^(no|nope|nah|negative)\b", text):
-        return True
+    if not text:
+        return None
+    # Navigation / control is never a Yes/No answer.
+    if re.search(
+        r"\b(go\s*back|goback|previous question|next question|repeat|"
+        r"say that again|skip)\b",
+        text,
+    ):
+        return None
+
+    starts_yes = bool(re.match(r"^(yes|yeah|yep|yup|yee|yea)\b", text))
+    starts_no = bool(re.match(r"^(no|nope|nah|negative)\b", text))
+    if starts_yes and starts_no:
+        return None
+    # Leading Yes with a later No cue (or contradiction) → clarify.
+    if starts_yes:
+        rest = text.split(None, 1)[1] if " " in text else ""
+        if rest and re.search(r"\b(no|nope|nah|not really|never)\b", rest):
+            return None
+        # ASR often drops the apostrophe ("dont" / "do not").
+        if rest and re.search(r"\bi (do not|don'?t|dont)\b", rest):
+            return None
+        return "yes"
+    if starts_no:
+        rest = text.split(None, 1)[1] if " " in text else ""
+        if rest and re.search(r"\b(yes|yeah|yep|yup)\b", rest):
+            return None
+        return "no"
+
     if re.search(
         r"\b("
         r"(i|he|she|they|we) said no|"
-        r"no i (do not|don't|do)|"
-        r"i (do not|don't)|"
         r"none of (those|them|the above)|"
         r"not really|no thanks"
         r")\b",
         text,
     ):
-        return True
-    return False
+        if re.search(r"\b(yes|yeah|yep|yup)\b", text):
+            return None
+        return "no"
+    # Bare negation without a leading Yes — conservative "I don't" / "I do not".
+    if re.search(r"^(i (do not|don'?t|dont))\b", text):
+        return "no"
 
-
-def _is_yes(answer: str) -> bool:
-    if _is_no(answer):
-        return False
-    text = (answer or "").strip().lower()
-    if re.match(r"^(yes|yeah|yep|yup|yee|yea)\b", text):
-        return True
     if re.search(
         r"\b("
         r"that(?:'s|s)?\s+right|"
         r"that(?:'s|s)?\s+correct|"
-        r"correct|"
-        r"i do\b|"
-        r"i have\b|"
-        r"sure(?:\s+do)?|"
-        r"absolutely|"
-        r"of course|"
         r"affirmative"
         r")\b",
         text,
     ):
-        return True
-    return False
+        if re.search(r"\b(no|not|don't|do not|never)\b", text):
+            return None
+        return "yes"
+    if re.search(r"\b((i|he|she|they|we) said yes)\b", text):
+        return "yes"
+    # Soft affirmations only when no negation is present.
+    if re.search(r"\b(i do|i have|sure(?:\s+do)?|absolutely|of course)\b", text):
+        if re.search(r"\b(no|not|don't|do not|never)\b", text):
+            return None
+        return "yes"
+    if re.fullmatch(r"correct[.!]?", text):
+        return "yes"
+    return None
+
+
+def _is_no(answer: str) -> bool:
+    return classify_yes_no(answer) == "no"
+
+
+def _is_yes(answer: str) -> bool:
+    return classify_yes_no(answer) == "yes"
 
 def _is_partnered(answer: str) -> bool:
     text = (answer or "").lower()
@@ -252,7 +288,10 @@ def _after_clicked(session: LiveFormSession, answer: str) -> str:
     nxt = _next_elig_step(session, answer)
     session.elig_step = nxt
     if not nxt:
-        return "You're all set. Thank you. Goodbye."
+        return (
+            "I've finished filling your household eligibility form. "
+            "Thank you for your time. Goodbye."
+        )
     return ELIG_QUESTIONS[nxt]
 
 
@@ -420,16 +459,16 @@ def _is_sso_label(text: str) -> bool:
 
 
 def _normalize_email(text: str) -> str:
-    spoken = (text or "").strip()
-    spoken = re.sub(r"\s+at\s+", "@", spoken, flags=re.I)
-    spoken = re.sub(r"\s+dot\s+", ".", spoken, flags=re.I)
-    spoken = re.sub(r"\s+", "", spoken)
-    return spoken
+    """Delegate to answer_parse (lazy import avoids circular import at load)."""
+    from .answer_parse import normalize_spoken_email
+
+    return normalize_spoken_email(text)
 
 
 def _extract_email(text: str) -> str:
-    match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", _normalize_email(text))
-    return match.group(0).lower() if match else ""
+    from .answer_parse import extract_email as _extract_email_shared
+
+    return _extract_email_shared(text)
 
 
 def _front_page(session: LiveFormSession) -> Page:
@@ -619,6 +658,349 @@ async def _begin_eligibility(session: LiveFormSession, page: Page) -> str:
     session.last_result = None
     logger.info("Eligibility open url=%s step=%s", page.url, session.elig_step)
     return "ASK: " + ELIG_QUESTIONS[session.elig_step]
+
+
+# Spoken guidance for native email auth — never request passwords/codes aloud.
+EMAIL_SECURE_COMPLETE = (
+    "Please finish signing in in the Pointcare window on this computer. "
+    "I will not ask you to say a password or verification code. "
+    "I'll continue when you're signed in."
+)
+EMAIL_VERIFY_LINK = (
+    "Please open the verification link we sent to your email, finish verifying "
+    "in the Pointcare window, then come back. I will not ask you to read a code "
+    "aloud. I'll continue when you're signed in."
+)
+EMAIL_PASSWORD_SECURE = (
+    "Please finish creating or entering your password in the Pointcare window. "
+    "I will not ask you to say it. I'll continue when you're signed in."
+)
+EMAIL_OTP_SECURE = (
+    "Please enter the verification code in the Pointcare window on this computer. "
+    "I will not ask you to say the code. I'll continue when you're signed in."
+)
+EMAIL_SECURE_RETRY = (
+    "I could not finish the email sign-in yet. Please complete any steps in the "
+    "Pointcare window, or say go back to try a different email, Google, or Apple."
+)
+
+
+def spoken_for_auth_screen(screen: str) -> str:
+    """One clear instruction for the current secure auth step (no secrets aloud)."""
+    key = (screen or "").strip().lower()
+    if key == "need_confirm":
+        return EMAIL_VERIFY_LINK
+    if key == "need_password":
+        return EMAIL_PASSWORD_SECURE
+    if key in ("need_otp", "need_mobile"):
+        return EMAIL_OTP_SECURE
+    return EMAIL_SECURE_COMPLETE
+
+
+async def _detect_auth_screen(page: Page) -> str:
+    """Classify the current Pointcare auth UI without logging secrets."""
+    if await _already_signed_in(page):
+        return "signed_in"
+    try:
+        body = (await page.locator("body").inner_text(timeout=2500)).lower()
+    except Exception:
+        body = ""
+    try:
+        has_password = await page.locator("input[type='password']:visible").count() > 0
+    except Exception:
+        has_password = False
+    try:
+        has_email = await page.locator("input[type='email']:visible").count() > 0
+    except Exception:
+        has_email = False
+    try:
+        has_tel = await page.locator("input[type='tel']:visible").count() > 0
+    except Exception:
+        has_tel = False
+
+    # Prefer verify-link / inbox screens before password (copy often mentions both).
+    if any(
+        needle in body
+        for needle in (
+            "confirm your email",
+            "check your email",
+            "verify your email",
+            "verification link",
+            "verify link",
+            "sent you an email",
+            "sent an email",
+            "check your inbox",
+            "magic link",
+            "click the link",
+            "open the link",
+            "we emailed you",
+            "email we sent",
+        )
+    ):
+        return "need_confirm"
+    if has_password or "create a password" in body or "enter your password" in body:
+        return "need_password"
+    if any(
+        needle in body
+        for needle in (
+            "verification code",
+            "one-time",
+            "enter the code",
+            "security code",
+            "otp",
+        )
+    ):
+        return "need_otp"
+    if has_tel or any(
+        needle in body for needle in ("mobile number", "phone number", "verify your phone")
+    ):
+        return "need_mobile"
+    if has_email:
+        return "need_email"
+    return "unknown"
+
+
+async def _email_field_matches(page: Page, email: str) -> bool:
+    wanted = (email or "").strip().lower()
+    if not wanted:
+        return False
+    try:
+        return bool(
+            await page.evaluate(
+                """(want) => {
+                  const nodes = [...document.querySelectorAll('input')];
+                  return nodes.some((el) => {
+                    const type = (el.getAttribute('type') || 'text').toLowerCase();
+                    const name = (
+                      (el.getAttribute('name') || '') +
+                      (el.getAttribute('id') || '') +
+                      (el.getAttribute('placeholder') || '') +
+                      (el.getAttribute('autocomplete') || '')
+                    ).toLowerCase();
+                    const isEmail =
+                      type === 'email' || name.includes('email') || type === 'text';
+                    if (!isEmail) return false;
+                    return ((el.value || '').trim().toLowerCase()).includes(want);
+                  });
+                }""",
+                wanted,
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _ensure_native_email_form(page: Page) -> None:
+    """Reveal the native email input if Pointcare shows an email CTA first."""
+    try:
+        if await page.locator("input[type='email']:visible").count():
+            return
+    except Exception:
+        pass
+    patterns = (
+        r"continue with email",
+        r"sign\s*in with email",
+        r"use email",
+        r"^email$",
+        r"email address",
+    )
+    for pattern in patterns:
+        try:
+            btn = page.get_by_role("button", name=re.compile(pattern, re.I)).first
+            if await btn.count() and await btn.is_visible():
+                label = (await btn.inner_text()).strip().lower()
+                if "google" in label or "apple" in label:
+                    continue
+                await btn.click(timeout=4000)
+                await page.wait_for_timeout(500)
+                if await page.locator("input[type='email']:visible").count():
+                    return
+        except Exception:
+            continue
+
+
+async def _click_continue_if_present(page: Page) -> bool:
+    for action in ("continue", "next", "submit"):
+        try:
+            await _click_action(page, action)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _sign_in_with_email(session: LiveFormSession, email: str) -> dict[str, Any]:
+    """Fill native Pointcare email, advance Continue, wait for secure auth or eligibility.
+
+    Never collects passwords or OTPs from the caller — those stay in the browser window.
+    """
+    page = session.page
+    if page is None:
+        raise RuntimeError("form page not ready")
+    address = _extract_email(email) or _normalize_email(email)
+    if not address or "@" not in address:
+        return {
+            "ok": False,
+            "auth_screen": "need_email",
+            "spoken": "What email address should I use?",
+            "error": "invalid_email",
+        }
+
+    if session.signed_in and session.elig_step:
+        screen = await _eligibility_screen(page)
+        recovered = _screen_first_step(screen, session)
+        session.elig_step = recovered
+        return {
+            "ok": True,
+            "auth_screen": "signed_in",
+            "spoken": "ASK: " + ELIG_QUESTIONS[recovered],
+            "step": recovered,
+        }
+    if await _already_signed_in(page):
+        spoken = await _begin_eligibility(session, page)
+        return {"ok": True, "auth_screen": "signed_in", "spoken": spoken, "step": "marital"}
+
+    # Preserve Google chooser path if a Google popup is already open.
+    popup = session.popup or _provider_popup(page)
+    if popup is not None and "accounts.google." in (popup.url or ""):
+        session.popup = popup
+        msg = await _sign_in_with_provider(session, "Continue with Google", address)
+        return {
+            "ok": True,
+            "auth_screen": "google_popup",
+            "spoken": msg if str(msg).startswith("ASK:") else "ASK: " + str(msg),
+            "action": "sso",
+        }
+
+    await _ensure_native_email_form(page)
+    spec = get_field("email")
+    labels = spec.labels if spec else ("email", "email address")
+    placeholders = spec.placeholders if spec else ("email",)
+    input_types = spec.input_types if spec else ("email", "text")
+
+    await _fill_text(page, labels, placeholders, input_types, address)
+    if not await _email_field_matches(page, address):
+        logger.warning("Native email fill not verified call_id=%s", session.call_id)
+        return {
+            "ok": False,
+            "auth_screen": "need_email",
+            "spoken": EMAIL_SECURE_RETRY,
+            "error": "email_not_filled",
+        }
+
+    # Store that we filled email without logging the address.
+    session.filled["email"] = address
+    session.history.append(
+        {"field_id": "email", "value": "[redacted]", "action": "fill", "ok": True}
+    )
+    clicked = await _click_continue_if_present(page)
+    logger.info(
+        "Native email filled call_id=%s continue_clicked=%s",
+        session.call_id,
+        clicked,
+    )
+    try:
+        await page.wait_for_timeout(900)
+    except Exception:
+        pass
+
+    # Poll briefly: either we land on eligibility or a secure auth screen.
+    last_screen = "unknown"
+    for attempt in range(40):
+        if await _already_signed_in(page):
+            spoken = await _begin_eligibility(session, page)
+            return {
+                "ok": True,
+                "auth_screen": "signed_in",
+                "spoken": spoken,
+                "step": session.elig_step or "marital",
+            }
+        last_screen = await _detect_auth_screen(page)
+        if last_screen in ("need_password", "need_otp", "need_mobile", "need_confirm"):
+            logger.info(
+                "Native email auth awaiting secure step call_id=%s screen=%s attempt=%s",
+                session.call_id,
+                last_screen,
+                attempt,
+            )
+            # Keep polling briefly — caller completes password/link in Chrome.
+            if attempt >= 4:
+                return {
+                    "ok": True,
+                    "auth_screen": last_screen,
+                    "spoken": spoken_for_auth_screen(last_screen),
+                    "awaiting_secure": True,
+                }
+        elif last_screen == "need_email" and attempt >= 6:
+            return {
+                "ok": False,
+                "auth_screen": "need_email",
+                "spoken": EMAIL_SECURE_RETRY,
+                "error": "still_on_email",
+            }
+        try:
+            await page.wait_for_timeout(500)
+        except Exception:
+            break
+
+    if await _already_signed_in(page):
+        spoken = await _begin_eligibility(session, page)
+        return {
+            "ok": True,
+            "auth_screen": "signed_in",
+            "spoken": spoken,
+            "step": session.elig_step or "marital",
+        }
+
+    logger.warning(
+        "Native email auth incomplete call_id=%s screen=%s",
+        session.call_id,
+        last_screen,
+    )
+    return {
+        "ok": True,
+        "auth_screen": last_screen or "unknown",
+        "spoken": spoken_for_auth_screen(last_screen or "unknown"),
+        "awaiting_secure": True,
+    }
+
+
+async def poll_email_auth_until_signed_in(
+    call_id: str, *, max_attempts: int = 90
+) -> dict[str, Any] | None:
+    """Background poll while the caller finishes password/OTP in the browser."""
+    session = await get_session(call_id)
+    if session is None or session.page is None:
+        return None
+    page = session.page
+    for _ in range(max_attempts):
+        try:
+            if session.signed_in and session.elig_step:
+                return {
+                    "ok": True,
+                    "auth_screen": "signed_in",
+                    "spoken": "ASK: " + ELIG_QUESTIONS.get(session.elig_step, ""),
+                    "step": session.elig_step,
+                }
+            if await _already_signed_in(page):
+                async with session.lock:
+                    spoken = await _begin_eligibility(session, page)
+                return {
+                    "ok": True,
+                    "auth_screen": "signed_in",
+                    "spoken": spoken,
+                    "step": session.elig_step or "marital",
+                }
+        except Exception:
+            logger.exception("email auth poll failed call_id=%s", call_id)
+            return None
+        await asyncio.sleep(1.0)
+    return {
+        "ok": False,
+        "auth_screen": "timeout",
+        "spoken": EMAIL_SECURE_RETRY,
+        "error": "auth_timeout",
+    }
 
 
 async def _on_marital_status(page: Page) -> bool:
@@ -980,6 +1362,131 @@ async def _click_cta(page: Page, label: str, allow_sso: bool = False, attempts: 
     raise RuntimeError(f"Could not click {label!r} after retries: {last_exc}")
 
 
+async def _clear_email_inputs_on_page(page: Page) -> None:
+    try:
+        await page.evaluate(
+            """() => {
+              const boxes = [...document.querySelectorAll('input')].filter((el) => {
+                const type = (el.getAttribute('type') || 'text').toLowerCase();
+                const name = (
+                  (el.getAttribute('name') || '') +
+                  (el.getAttribute('id') || '') +
+                  (el.getAttribute('placeholder') || '') +
+                  (el.getAttribute('autocomplete') || '')
+                ).toLowerCase();
+                return type === 'email' || name.includes('email');
+              });
+              for (const el of boxes) {
+                el.value = '';
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              return boxes.length;
+            }"""
+        )
+    except Exception:
+        pass
+
+
+async def _on_sign_in_chooser(page: Page) -> bool:
+    """True when Google / Apple / email sign-in options are available."""
+    try:
+        visible = (await _visible_button_text(page)).lower()
+    except Exception:
+        visible = ""
+    if "continue with google" in visible or "continue with apple" in visible:
+        return True
+    if "google" in visible and ("apple" in visible or "email" in visible):
+        return True
+    return False
+
+
+async def _click_sign_in_back_control(page: Page) -> bool:
+    """Click common Pointcare controls that leave verify/password back to chooser."""
+    patterns = (
+        r"use (a )?different email",
+        r"change email",
+        r"edit email",
+        r"use another email",
+        r"sign in another way",
+        r"other (sign[- ]?in )?options",
+        r"try another method",
+        r"^back$",
+        r"go back",
+        r"previous",
+    )
+    for pattern in patterns:
+        for role in ("button", "link"):
+            try:
+                loc = page.get_by_role(role, name=re.compile(pattern, re.I)).first
+                if await loc.count() and await loc.is_visible():
+                    label = (await loc.inner_text()).strip().lower()
+                    if "google" in label or "apple" in label:
+                        continue
+                    await loc.click(timeout=3000)
+                    await page.wait_for_timeout(600)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+async def clear_native_email_input(call_id: str) -> bool:
+    """Clear visible email inputs after go-back so a corrected address can be typed."""
+    session = await get_session(call_id)
+    if session is None or session.page is None:
+        return False
+    page = session.page
+    try:
+        await _clear_email_inputs_on_page(page)
+        session.filled.pop("email", None)
+        logger.info("Cleared native email input call_id=%s", call_id)
+        return True
+    except Exception:
+        logger.exception("clear_native_email_input evaluate failed call_id=%s", call_id)
+        return False
+
+
+async def reset_email_sign_in_ui(call_id: str) -> bool:
+    """After go-back: leave verify/password screens and land on Google/Apple/email chooser."""
+    session = await get_session(call_id)
+    if session is None or session.page is None:
+        return False
+    page = session.page
+    try:
+        for _ in range(5):
+            if await _on_sign_in_chooser(page):
+                await _clear_email_inputs_on_page(page)
+                session.filled.pop("email", None)
+                session.popup = None
+                logger.info(
+                    "Email sign-in UI reset to chooser call_id=%s url=%s",
+                    call_id,
+                    page.url,
+                )
+                return True
+            if await _click_sign_in_back_control(page):
+                continue
+            try:
+                await page.go_back(timeout=4000)
+                await page.wait_for_timeout(700)
+            except Exception:
+                break
+        # Last resort: clear whatever email field is visible on the current page.
+        await _clear_email_inputs_on_page(page)
+        session.filled.pop("email", None)
+        session.popup = None
+        logger.warning(
+            "Email sign-in UI reset partial call_id=%s url=%s",
+            call_id,
+            page.url,
+        )
+        return await _on_sign_in_chooser(page)
+    except Exception:
+        logger.exception("reset_email_sign_in_ui failed call_id=%s", call_id)
+        return False
+
+
 async def promote_signed_in_to_eligibility(call_id: str) -> str | None:
     """If the browser is already signed in, open Stage D and return the first question.
 
@@ -1016,6 +1523,70 @@ async def get_session(call_id: str) -> LiveFormSession | None:
         return _sessions.get(call_id)
 
 
+async def describe_live_browser(
+    session: LiveFormSession | None,
+    *,
+    call_id: str = "",
+    open_base_url: str = "",
+) -> dict[str, Any]:
+    """Snapshot of the agent Chrome tab for API / Postman responses.
+
+    Includes the live page URL, Chrome profile path, CDP endpoint, and a
+    clickable local page that focuses the agent window and links DevTools.
+    """
+    from .browser import (
+        CDP_PORT,
+        CDP_URL,
+        cdp_target_for_url,
+        local_devtools_url,
+    )
+    from .config import (
+        CHROME_AGENT_DATA,
+        CHROME_PROFILE_DIRECTORY,
+        PORT,
+        chrome_profile_label,
+    )
+
+    cid = (call_id or (session.call_id if session else "") or "").strip()
+    live_url = ""
+    opened = False
+    if session is not None:
+        opened = session.page is not None and not (
+            getattr(session.page, "is_closed", lambda: False)()
+        )
+        if opened and session.page is not None:
+            try:
+                live_url = str(session.page.url or "")
+                if live_url:
+                    session.url = live_url
+            except Exception:
+                live_url = session.url or ""
+        else:
+            live_url = session.url or ""
+
+    target = await asyncio.to_thread(cdp_target_for_url, live_url)
+    if not live_url:
+        live_url = str((target or {}).get("url") or "")
+    devtools = local_devtools_url(target) if target else ""
+    base = (open_base_url or "").rstrip("/") or f"http://127.0.0.1:{PORT}"
+    open_url = f"{base}/form-filler/sessions/{cid}/chrome" if cid else ""
+
+    return {
+        "opened": opened,
+        "welcome_done": bool(session.welcome_done) if session else False,
+        "url": live_url,
+        "open_url": open_url,
+        "devtools_url": devtools,
+        "cdp_url": CDP_URL,
+        "cdp_port": CDP_PORT,
+        "chrome_profile": chrome_profile_label(),
+        "chrome_profile_directory": CHROME_PROFILE_DIRECTORY,
+        "chrome_user_data": str(CHROME_AGENT_DATA),
+        "title": str((target or {}).get("title") or ""),
+        "error": (session.error if session else "") or "",
+    }
+
+
 async def end_live_form(call_id: str) -> None:
     global _active_call_id
     async with _sessions_lock:
@@ -1042,8 +1613,49 @@ async def peek_choice_labels(call_id: str) -> list[str]:
             return []
 
 
+async def _yes_no_selection_state(page: Page) -> str:
+    """Return 'yes', 'no', 'both', or 'none' from visible selected Yes/No controls."""
+    try:
+        state = await page.evaluate(
+            """() => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const nodes = [...document.querySelectorAll(
+                'button, [role=button], [role=radio], [role=option], label, input'
+              )];
+              let yes = false;
+              let no = false;
+              for (const el of nodes) {
+                const text = norm(el.innerText || el.getAttribute('aria-label') || el.value);
+                if (text !== 'yes' && text !== 'no') continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 2 || r.height < 2) continue;
+                const selected =
+                  el.getAttribute('aria-checked') === 'true' ||
+                  el.getAttribute('aria-pressed') === 'true' ||
+                  el.getAttribute('aria-selected') === 'true' ||
+                  (el instanceof HTMLInputElement && el.checked) ||
+                  (el.className || '').toLowerCase().includes('selected') ||
+                  (el.className || '').toLowerCase().includes('active') ||
+                  (el.className || '').toLowerCase().includes('checked');
+                if (!selected) continue;
+                if (text === 'yes') yes = true;
+                if (text === 'no') no = true;
+              }
+              if (yes && no) return 'both';
+              if (yes) return 'yes';
+              if (no) return 'no';
+              return 'none';
+            }"""
+        )
+    except Exception:
+        return "none"
+    return str(state or "none")
+
+
 async def navigate_back_one(call_id: str) -> dict[str, Any]:
     """Click Pointcare Back when available and reconcile elig_step to the screen."""
+    from .call_trace import trace_event
+
     session = await get_session(call_id)
     if session is None or session.page is None:
         return {
@@ -1055,17 +1667,30 @@ async def navigate_back_one(call_id: str) -> dict[str, Any]:
         page = session.page
         before = await _screen_signature(page)
         before_screen = await _eligibility_screen(page)
+        before_step = session.elig_step
         back = page.get_by_role("button", name=re.compile(r"^\s*Back\s*$", re.I)).first
         try:
             if not await back.count() or not await back.is_visible():
+                from .elig_meta import format_question
+
+                speech = (
+                    "I can't go back from this screen. There is no Back button "
+                    "available. You can still correct the current question — "
+                    + format_question(session.elig_step or before_step or "marital")
+                )
+                trace_event(
+                    call_id,
+                    "go_back_rejected",
+                    reason="no_back",
+                    screen_before=before_screen,
+                    step=session.elig_step,
+                )
                 return {
                     "ok": False,
                     "error": "no_back",
-                    "spoken": (
-                        "I can't go back from this screen. There is no Back button "
-                        "available. You can still correct the current question if needed."
-                    ),
+                    "spoken": speech,
                     "step": session.elig_step,
+                    "screen": before_screen,
                 }
             await back.click(timeout=5000)
         except Exception:
@@ -1078,6 +1703,7 @@ async def navigate_back_one(call_id: str) -> dict[str, Any]:
                     "current question."
                 ),
                 "step": session.elig_step,
+                "screen": before_screen,
             }
         landed = before_screen
         for _ in range(24):
@@ -1086,6 +1712,13 @@ async def navigate_back_one(call_id: str) -> dict[str, Any]:
                 landed = await _eligibility_screen(page)
                 break
         else:
+            trace_event(
+                call_id,
+                "go_back_rejected",
+                reason="no_transition",
+                screen_before=before_screen,
+                step=session.elig_step,
+            )
             return {
                 "ok": False,
                 "error": "no_transition",
@@ -1094,17 +1727,31 @@ async def navigate_back_one(call_id: str) -> dict[str, Any]:
                     "current question."
                 ),
                 "step": session.elig_step,
+                "screen": before_screen,
             }
         recovered = _screen_first_step(landed, session)
         if recovered and recovered in ELIG_QUESTIONS:
             session.elig_step = recovered
+        # Drop last answer cache so a stale Yes/No cannot be replayed.
+        session.last_step_answer = None
+        session.last_result = None
         from .elig_meta import format_question
 
         speech = format_question(session.elig_step)
+        trace_event(
+            call_id,
+            "go_back_ok",
+            screen_before=before_screen,
+            screen_after=landed,
+            step_before=before_step,
+            step_after=session.elig_step,
+            selected=await _yes_no_selection_state(page),
+        )
         return {
             "ok": True,
             "step": session.elig_step,
             "screen": landed,
+            "screen_before": before_screen,
             "spoken": speech,
         }
 
@@ -1427,22 +2074,37 @@ async def submit_field(
                 return _ok(call_id, "continue_with_apple", text, "sso", session, msg)
             if field_key == "email":
                 text = _normalize_email(text)
-                popup = session.popup or (_provider_popup(page) if page else None)
-                if text and popup is not None and "accounts.google." in (popup.url or ""):
-                    session.popup = popup
-                    msg = await _sign_in_with_provider(session, "Continue with Google", text)
-                    session.history.append(
-                        {"field_id": "email", "value": text, "action": "sso", "ok": True}
-                    )
-                    return _ok(call_id, "email", text, "sso", session, msg)
-            if field_key == "email" and not text:
-                return {
-                    "ok": False,
+                if not text:
+                    return {
+                        "ok": False,
+                        "call_id": call_id,
+                        "field_id": "email",
+                        "error": "email requires the caller's address",
+                        "spoken": "What email address should I use?",
+                        "auth_screen": "need_email",
+                    }
+                _mark(call_id, "browser_action", started)
+                email_result = await _sign_in_with_email(session, text)
+                _mark(call_id, "verified", started)
+                spoken = str(email_result.get("spoken") or EMAIL_SECURE_COMPLETE)
+                result = {
+                    "ok": bool(email_result.get("ok")),
                     "call_id": call_id,
                     "field_id": "email",
-                    "error": "email requires the caller's address",
-                    "spoken": "Which email should we use?",
+                    "value": "[redacted]",
+                    "action": email_result.get("action") or "email_auth",
+                    "message": spoken,
+                    "spoken": spoken,
+                    "auth_screen": email_result.get("auth_screen") or "",
+                    "awaiting_secure": bool(email_result.get("awaiting_secure")),
+                    "step": email_result.get("step") or "",
+                    "error": email_result.get("error") or "",
                 }
+                session.last_result = result
+                if request_id:
+                    session.processed_requests[request_id] = result
+                _mark(call_id, "tool_response", started)
+                return result
 
             if spec and spec.kind == "action":
                 await _click_action(_front_page(session), field_key if field_key in ACTION_BUTTONS else "continue")
@@ -1487,6 +2149,14 @@ async def submit_field(
                         await _fill_text(target, ("last name",), ("last name",), ("text",), text)
                     elif kind == "date":
                         await _fill_text(target, ("date of birth", "birth"), ("date", "mm"), ("text",), text)
+                    elif kind == "email_text":
+                        await _fill_text(
+                            target,
+                            labels,
+                            placeholders,
+                            input_types or ("email", "text"),
+                            text,
+                        )
                     elif kind == "income":
                         await _click_choice(target, text)
                     else:
@@ -1513,20 +2183,6 @@ async def submit_field(
                 field_key,
                 act or "-",
             )
-            if field_key == "email":
-                result = {
-                    "ok": True,
-                    "call_id": call_id,
-                    "field_id": "email",
-                    "value": text,
-                    "action": act or "continue",
-                    "message": msg,
-                    "spoken": "Your email was entered and Continue was selected. Goodbye.",
-                }
-                session.last_result = result
-                if request_id:
-                    session.processed_requests[request_id] = result
-                return result
             result = _result_with_next(
                 session,
                 text,
@@ -1827,7 +2483,10 @@ def _elig_ok(
     spoken = (
         ELIG_QUESTIONS[next_step]
         if next_step
-        else "You're all set. Thank you. Goodbye."
+        else (
+            "I've finished filling your household eligibility form. "
+            "Thank you for your time. Goodbye."
+        )
     )
     return {
         "ok": True,
@@ -3039,12 +3698,85 @@ def _spoken_member_query(answer: str) -> str:
     return text
 
 
+def _split_member_queries(answer: str) -> list[str]:
+    """Split 'Murali and Agent H' / 'myself, my wife' into separate queries."""
+    text = (answer or "").strip()
+    if not text:
+        return []
+    # Keep "and" inside names rare; split on list connectors.
+    parts = re.split(
+        r"\s*(?:,|;|\band\b|\balso\b|\bplus\b|\bas well as\b)\s*",
+        text,
+        flags=re.I,
+    )
+    out: list[str] = []
+    for part in parts:
+        cleaned = _spoken_member_query(part)
+        if cleaned and cleaned.lower() not in {"and", "also", "plus"}:
+            out.append(cleaned)
+    # If split produced nothing useful, fall back to the whole utterance.
+    if not out:
+        whole = _spoken_member_query(text)
+        if whole:
+            out.append(whole)
+    return out
+
+
 def _normalize_member_label(text: str) -> str:
     cleaned = _spoken_member_query(text or "")
     cleaned = re.sub(r"\s+", " ", cleaned)
-    # "John. D" / "John D." → comparable token string
+    # "John. D" / "John D." / "Murali M." → comparable token string
     cleaned = re.sub(r"\.(?=\s|$)", "", cleaned)
+    cleaned = cleaned.replace(".", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.lower().strip()
+
+
+def _resolve_kinship_to_member(
+    spoken: str,
+    members: list[dict[str, Any]],
+    session: LiveFormSession,
+) -> str | None:
+    """Map myself/wife/daughter to a unique visible member label, or None."""
+    text = (spoken or "").strip().lower()
+    labels = [str(m.get("label") or "") for m in members]
+
+    if re.search(r"\b(me|myself|i am|caller)\b", text) or text == "me":
+        me_hits = [label for label in labels if label.strip().lower() == "me"]
+        if len(me_hits) == 1:
+            return me_hits[0]
+        # Prefer primary applicant-looking single unique first name from session.
+        return None
+
+    spouse_first = (session.filled.get("spouse_first") or "").strip()
+    spouse_last = (session.filled.get("spouse_last") or "").strip()
+    if re.search(r"\b(wife|husband|spouse|partner)\b", text):
+        candidates: list[str] = []
+        for label in labels:
+            norm = _normalize_member_label(label)
+            if spouse_first and spouse_first.lower() in norm:
+                candidates.append(label)
+            elif spouse_last and spouse_last.lower() in norm:
+                candidates.append(label)
+        # Unique only — never guess among several adults.
+        uniq = list(dict.fromkeys(candidates))
+        if len(uniq) == 1:
+            return uniq[0]
+        return None
+
+    if re.search(r"\b(daughter|son|child|kid)\b", text):
+        child_first = (session.filled.get("child_first") or "").strip()
+        candidates = []
+        for label in labels:
+            norm = _normalize_member_label(label)
+            if child_first and child_first.lower() in norm:
+                candidates.append(label)
+        uniq = list(dict.fromkeys(candidates))
+        if len(uniq) == 1:
+            return uniq[0]
+        return None
+
+    return None
 
 
 def _is_plausible_member_label(label: str) -> bool:
@@ -3067,11 +3799,42 @@ def _is_plausible_member_label(label: str) -> bool:
     # Prefer person-like labels: "Me", "Angel R.", "John. D."
     if re.fullmatch(r"me", text, re.I):
         return True
+    # Reject aggregate row text: "Murali M. Agent H. David W. Mickey M."
+    if len(re.findall(r"[A-Za-z][A-Za-z'\-]*\s+[A-Za-z]\.?", text)) > 1:
+        return False
     return bool(re.match(r"^[A-Za-z][A-Za-z .'\-]{0,40}$", text))
 
 
+def _special_condition_negated(text: str, cue: str) -> bool:
+    """True when the cue appears only inside a negated phrase."""
+    lowered = (text or "").lower()
+    cue_re = re.escape(cue)
+    # "not blind", "isn't pregnant", "no one is blind", "nobody has cancer"
+    if re.search(
+        rf"\b(not|never|no|n't)\b(?:\s+\w+){{0,4}}\s+\b{cue_re}\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        rf"\b(no\s+one|nobody|neither)\b(?:\s+\w+){{0,6}}\s+\b{cue_re}\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        rf"\b(isn'?t|aren'?t|wasn'?t|weren'?t|don'?t|doesn'?t|didn'?t)\b"
+        rf"(?:\s+\w+){{0,4}}\s+\b{cue_re}\b",
+        lowered,
+    ):
+        return True
+    return False
+
+
 def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
-    """Map spoken special-condition answer onto visible Pointcare labels."""
+    """Map spoken special-condition answer onto visible Pointcare labels.
+
+    Supports natural phrasing ("I'm blind", "visual disability") and multi-select.
+    Negated cues never select a condition. "None of the above" is exclusive.
+    """
     text = re.sub(r"[.!?…]+$", "", (spoken or "").strip().lower())
     if not text:
         return []
@@ -3087,42 +3850,121 @@ def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
     ]
     pool = condition_labels or list(labels)
 
-    # Direct containment / equality against visible options.
+    def _find(*needles: str) -> str:
+        for label in pool:
+            low = label.lower()
+            if all(n in low for n in needles):
+                return label
+        return ""
+
+    # Synonym / phrase cues → visible labels (order matters for multi-select).
+    cue_checks = [
+        (
+            "none",
+            ("none",),
+            bool(re.search(r"\b(none of the above|none|neither|no conditions?)\b", text))
+            and not re.search(
+                r"\b(blind|pregnant|cancer|disabled|ssdi|foster|visual)\b", text
+            ),
+        ),
+        (
+            "pregnant",
+            ("pregnant",),
+            bool(re.search(r"\b(pregnant|pregnancy|expecting)\b", text)),
+        ),
+        (
+            "breast",
+            ("breast", "cancer"),
+            bool(re.search(r"\bbreast\b", text) and re.search(r"\bcancer\b", text)),
+        ),
+        (
+            "cervical",
+            ("cervical",),
+            bool(re.search(r"\bcervical\b", text)),
+        ),
+        (
+            "blind",
+            ("blind",),
+            bool(
+                re.search(
+                    r"\b(blind|visually impaired|visual(?:ly)?\s+disab\w*|vision loss|"
+                    r"can'?t see|cannot see)\b",
+                    text,
+                )
+            ),
+        ),
+        (
+            "disabled",
+            ("disabled",),
+            bool(
+                re.search(r"\b(disabled|ssdi|disability|on disability)\b", text)
+                and not re.search(r"\bvisual(?:ly)?\s+disab", text)
+            ),
+        ),
+        (
+            "foster",
+            ("foster",),
+            bool(re.search(r"\bfoster\b", text)),
+        ),
+    ]
+
     hits: list[str] = []
+    for cue_key, needles, matched in cue_checks:
+        if not matched:
+            continue
+        if cue_key != "none" and _special_condition_negated(text, cue_key):
+            continue
+        if cue_key == "blind" and _special_condition_negated(text, "visual"):
+            continue
+        label = _find(*needles) if cue_key != "none" else _find("none of the above")
+        if not label and cue_key == "none":
+            label = next(
+                (item for item in pool if "none of the above" in item.lower()), ""
+            )
+        if label and label not in hits:
+            hits.append(label)
+
+    # Direct containment / equality against visible options (non-negated).
     for label in pool:
         low = label.lower()
-        if text == low or text in low or low in text:
+        if label in hits:
+            continue
+        if text == low or (len(text) >= 8 and (text in low or low in text)):
+            # Skip if the matching cue words are negated in the utterance.
+            cue = next(
+                (
+                    word
+                    for word in (
+                        "blind",
+                        "pregnant",
+                        "disabled",
+                        "foster",
+                        "breast",
+                        "cervical",
+                    )
+                    if word in low and word in text
+                ),
+                "",
+            )
+            if cue and _special_condition_negated(text, cue):
+                continue
             hits.append(label)
             continue
-        # "disabled" → "Someone is disabled (SSDI)"
         spoken_words = set(re.findall(r"[a-z0-9]{3,}", text))
         label_words = set(re.findall(r"[a-z0-9]{3,}", low))
         if spoken_words and spoken_words <= label_words:
+            if any(_special_condition_negated(text, w) for w in spoken_words & label_words):
+                continue
             hits.append(label)
-            continue
-        if "disabled" in spoken_words and "disabled" in label_words:
-            hits.append(label)
-            continue
-        if "blind" in spoken_words and "blind" in label_words:
-            hits.append(label)
-            continue
-        if "pregnant" in spoken_words and "pregnant" in label_words:
-            hits.append(label)
-            continue
-        if {"breast", "cancer"} <= spoken_words and "breast" in label_words:
-            hits.append(label)
-            continue
-        if {"cervical", "cancer"} <= spoken_words and "cervical" in label_words:
-            hits.append(label)
-            continue
-        if "foster" in spoken_words and "foster" in label_words:
-            hits.append(label)
-            continue
-        if re.search(r"\bnone\b", text) and "none of the above" in low:
-            hits.append(label)
-            continue
 
-    # De-dupe while preserving order.
+    # "None of the above" is exclusive — drop it when real conditions were selected.
+    none_labels = [label for label in hits if "none of the above" in label.lower()]
+    real = [label for label in hits if "none of the above" not in label.lower()]
+    if real and none_labels:
+        hits = real
+    elif none_labels and not real:
+        hits = none_labels[:1]
+
     out: list[str] = []
     for label in hits:
         if label not in out:
@@ -3130,117 +3972,310 @@ def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
     return out
 
 
+def _map_relationship_label(spoken: str, labels: list[str]) -> str | None:
+    """Map natural relationship phrases onto a unique visible option.
+
+    Returns None when ambiguous or unsupported — never guesses the first option.
+    """
+    text = re.sub(r"[.!?…]+$", "", (spoken or "").strip().lower())
+    text = re.sub(r"\b(my|our|the|a|an|their|his|her)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or not labels:
+        return None
+    pool = [
+        label
+        for label in labels
+        if label
+        and label.lower().rstrip(" *")
+        not in {
+            "first name",
+            "last name",
+            "living with me",
+            "same mailing address",
+            "relationship to me",
+            "date of birth (optional)",
+            "age",
+        }
+    ] or list(labels)
+
+    for label in pool:
+        if label.lower() == text:
+            return label
+
+    synonym_groups: list[tuple[str, tuple[str, ...]]] = [
+        (
+            "stepchild",
+            (
+                r"\bstep[\s-]?child\b",
+                r"\bstep[\s-]?daughter\b",
+                r"\bstep[\s-]?son\b",
+                r"\bstep[\s-]?kid\b",
+            ),
+        ),
+        (
+            "grandchild",
+            (
+                r"\bgrand[\s-]?child\b",
+                r"\bgrand[\s-]?daughter\b",
+                r"\bgrand[\s-]?son\b",
+                r"\bgrandkid\b",
+            ),
+        ),
+        (
+            "foster child",
+            (r"\bfoster\b",),
+        ),
+        (
+            "child",
+            (
+                r"\bdaughter\b",
+                r"\bson\b",
+                r"\bkid\b",
+                r"\bchild\b",
+                r"\bchildren\b",
+            ),
+        ),
+        (
+            "other",
+            # Only explicit "other" — niece/cousin/etc. are unsupported without UI labels.
+            (r"\bother\b",),
+        ),
+    ]
+    def _norm_rel_key(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").lower().replace("-", " ")).strip()
+
+    for target_key, patterns in synonym_groups:
+        if not any(re.search(pat, text, re.I) for pat in patterns):
+            continue
+        # Exact normalized label only — "child" must not match Stepchild/Grandchild.
+        hits = [
+            label
+            for label in pool
+            if _norm_rel_key(label) == target_key
+        ]
+        if target_key != "other":
+            hits = [label for label in hits if "other" not in label.lower()] or hits
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            return None
+    # Unique containment as last resort.
+    contains = [
+        label
+        for label in pool
+        if label.lower() in text or text in label.lower()
+    ]
+    if len(contains) == 1:
+        return contains[0]
+    return None
+
+
 _SPECIAL_MEMBER_DISCOVER_JS = """() => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const bodyText = norm((document.body && document.body.innerText) || '').slice(0, 2500);
+  const hasApplyTo = /who does this apply to/i.test(bodyText);
+  const hasSpecial = /someone is blind|someone is pregnant|none of the above|special cases|someone is disabled/i.test(bodyText);
+  const hasMarital = /never married|what is your marital status/i.test(bodyText);
   const isCondition = (t) => /who does this apply to|someone is |someone has |someone was |none of the above|pregnant|breast cancer|cervical|\\bblind\\b|\\bssdi\\b|foster/i.test(t || '');
-  const isNav = (t) => /^(exit|back|continue|next|done|never married|married|separated|divorced|widowed|registered domestic partner|common law marriage|annual|monthly|bi-weekly|yes|no)$/i.test(t || '');
+  const isNav = (t) => /^(exit|back|continue|next|done|recheck eligibility|add member|never married|married|separated|divorced|widowed|registered domestic partner|common law marriage|annual|monthly|bi-weekly|yes|no)$/i.test(t || '');
+  // Reject aggregates like "Murali M. Agent H. David W. Mickey M."
+  const isMultiName = (t) => {
+    const hits = (t || '').match(/[A-Za-z][A-Za-z'\\-]*\\s+[A-Za-z]\\.?/g);
+    return !!(hits && hits.length > 1);
+  };
   const isPersonLike = (t) => {
     if (!t || t.length > 60 || t.length < 1) return false;
-    if (isCondition(t) || isNav(t)) return false;
+    if (isCondition(t) || isNav(t) || isMultiName(t)) return false;
     if (/^\\$?\\d/.test(t)) return false;
     if (/^me$/i.test(t)) return true;
     return /^[A-Za-z][A-Za-z .'\\-]{0,40}$/.test(t);
   };
+  const leafPersonTexts = (root) => {
+    if (!root || !root.querySelectorAll) return [];
+    const out = [];
+    for (const el of root.querySelectorAll(
+      'div, span, p, label, h1, h2, h3, h4, [role=heading]'
+    )) {
+      const text = norm(el.innerText || el.textContent || '');
+      if (!isPersonLike(text)) continue;
+      // Prefer leaf name nodes (Pointcare puts "Mickey M." in a nested div).
+      const childPerson = [...el.querySelectorAll('div, span, p, label, h1, h2, h3, h4')]
+        .some((c) => {
+          const ct = norm(c.innerText || c.textContent || '');
+          return c !== el && isPersonLike(ct) && ct.length < text.length;
+        });
+      if (childPerson) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) continue;
+      out.push(text);
+    }
+    return out;
+  };
+  // Pointcare: empty button[role=checkbox] beside a sibling name div in the same row.
+  const nameFromCheckbox = (box) => {
+    if (!box) return '';
+    let name = box.getAttribute('aria-label') || '';
+    if (!name && box.id) {
+      const lab = document.querySelector('label[for=\"' + box.id.replace(/\"/g, '') + '\"]');
+      if (lab) name = lab.innerText || lab.textContent || '';
+    }
+    if (!name) {
+      const wrap = box.closest('label');
+      if (wrap) name = wrap.innerText || wrap.textContent || '';
+    }
+    if (isPersonLike(norm(name))) return norm(name);
+    // Climb to the member row; parent of the box is often an empty padding div.
+    let cur = box.parentElement;
+    for (let depth = 0; depth < 8 && cur; depth++) {
+      const leaves = leafPersonTexts(cur);
+      if (leaves.length === 1) return leaves[0];
+      if (leaves.length > 1) {
+        // Same row usually has exactly one name; take shortest unique leaf.
+        leaves.sort((a, b) => a.length - b.length);
+        if (!isMultiName(leaves[0])) return leaves[0];
+      }
+      const own = norm(cur.innerText || cur.textContent || '');
+      if (isPersonLike(own)) return own;
+      cur = cur.parentElement;
+    }
+    return '';
+  };
+  const readChecked = (box) => !!(
+    (box && box.tagName === 'INPUT' && box.checked)
+    || (box && box.getAttribute && box.getAttribute('aria-checked') === 'true')
+    || (box && /\\b(checked|selected|active)\\b/i.test((box.className || '').toString()))
+  );
   const collect = (root) => {
     if (!root) return [];
-    const nodes = [...root.querySelectorAll(
-      'label, [role=checkbox], input[type=checkbox], button, [role=button]'
-    )];
     const out = [];
     const seenCounts = {};
-    for (const node of nodes) {
-      let text = norm(
-        node.innerText || node.textContent || node.getAttribute('aria-label') || ''
-      );
-      if (!isPersonLike(text)) continue;
-      const r = node.getBoundingClientRect ? node.getBoundingClientRect() : {width: 2, height: 2};
-      if (r.width < 1 || r.height < 1) continue;
+    const push = (text, box) => {
+      if (!isPersonLike(text)) return;
+      const r = box && box.getBoundingClientRect
+        ? box.getBoundingClientRect()
+        : { width: 2, height: 2 };
+      // Name may be visible while the empty checkbox button has zero text size —
+      // still accept when the row text resolved.
+      if (box && r.width < 1 && r.height < 1) {
+        const row = box.closest('[tabindex], div');
+        const rr = row && row.getBoundingClientRect && row.getBoundingClientRect();
+        if (!rr || rr.width < 1 || rr.height < 1) return;
+      }
       const key = text.toLowerCase();
       const dupCount = seenCounts[key] || 0;
       seenCounts[key] = dupCount + 1;
-      let input = null;
-      if (node.tagName === 'INPUT') input = node;
-      else if (node.control) input = node.control;
-      else input = node.querySelector && node.querySelector('input[type=checkbox]');
-      const checked = !!(
-        (input && input.checked)
-        || node.getAttribute('aria-checked') === 'true'
-        || /checked|selected|active/i.test(node.className || '')
-      );
-      out.push({ label: text, index: out.length, dupIndex: dupCount, checked });
+      out.push({
+        label: text,
+        index: out.length,
+        dupIndex: dupCount,
+        checked: readChecked(box),
+      });
+    };
+    // Primary: pair each checkbox control with its sibling/ancestor name leaf.
+    for (const box of root.querySelectorAll('input[type=checkbox], [role=checkbox]')) {
+      const text = nameFromCheckbox(box);
+      if (!text || isCondition(text)) continue;
+      push(text, box);
     }
-    return out;
+    // Dedupe by label keeping first (first checkbox wins).
+    const uniq = [];
+    const seen = {};
+    for (const row of out) {
+      const k = (row.label || '').toLowerCase();
+      if (seen[k]) continue;
+      seen[k] = true;
+      uniq.push(row);
+    }
+    return uniq;
   };
   const checkboxCount = document.querySelectorAll(
     'input[type=checkbox], [role=checkbox]'
   ).length;
   const sampleLabels = [...document.querySelectorAll(
-    'label, [role=checkbox], button, [role=button]'
+    'label, [role=checkbox], button, [role=button], h1, h2, h3, h4, [role=heading], div, span'
   )]
     .map((n) => norm(n.innerText || n.textContent || n.getAttribute('aria-label') || ''))
     .filter((t) => t && t.length < 80)
     .slice(0, 20);
+  const meta = {
+    hasApplyTo,
+    hasSpecial,
+    hasMarital,
+    checkboxCount,
+    visibleSample: sampleLabels,
+    url: (location && location.href) || '',
+  };
 
-  // Strategy 1: heading "Who does this apply to?"
+  // Wrong / unready page: marital chrome without Special Cases apply-to.
+  if (hasMarital && !hasApplyTo && !hasSpecial) {
+    return { members: [], strategy: 'wrong_screen_marital', ...meta };
+  }
+
+  // Strategy 1: heading "Who does this apply to?" — prefer the short heading node.
   let strategy = 'heading';
   let root = null;
   const headings = [...document.querySelectorAll(
-    'h1,h2,h3,h4,div,span,p,legend,label,strong,b'
+    'h1,h2,h3,h4,div,span,p,legend,label,strong,b,[role=heading]'
   )];
+  // Prefer exact/short heading text over wrappers that also include member names.
+  const headingHits = [];
   for (const el of headings) {
     const t = norm(el.innerText || el.textContent);
     if (!t || t.length > 80) continue;
-    if (/who does this apply to/i.test(t)) {
-      root = el.closest('section,fieldset,article,form,div') || el.parentElement;
-      let cur = el.parentElement;
-      for (let i = 0; i < 8 && cur; i++) {
-        if (cur.querySelectorAll('input[type=checkbox], [role=checkbox], label').length) {
-          root = cur;
-          break;
-        }
-        cur = cur.parentElement;
-      }
-      break;
-    }
+    if (!/who does this apply to/i.test(t)) continue;
+    headingHits.push({ el, t, len: t.length });
   }
-  let members = collect(root);
-  if (members.length) {
-    return { members, strategy, checkboxCount, visibleSample: sampleLabels };
-  }
-
-  // Strategy 2: container near a selected / visible special-condition chip.
-  strategy = 'special_section_fallback';
-  const conditionNodes = [...document.querySelectorAll(
-    'label, [role=checkbox], button, [role=button], div, span'
-  )].filter((n) => isCondition(norm(n.innerText || n.textContent || '')));
-  for (const cond of conditionNodes) {
-    let cur = cond.parentElement;
+  headingHits.sort((a, b) => a.len - b.len);
+  if (headingHits.length) {
+    const el = headingHits[0].el;
+    root = el.closest('section,fieldset,article,form,div') || el.parentElement;
+    let cur = el.parentElement;
     for (let i = 0; i < 10 && cur; i++) {
-      const found = collect(cur);
-      if (found.length >= 1) {
-        members = found;
+      const boxes = cur.querySelectorAll('input[type=checkbox], [role=checkbox]').length;
+      const names = leafPersonTexts(cur).length;
+      // Expand until the apply-to block that holds member checkbox rows.
+      if (boxes >= 1 && names >= 1) {
         root = cur;
         break;
       }
       cur = cur.parentElement;
     }
-    if (members.length) break;
   }
+  let members = collect(root);
   if (members.length) {
-    return { members, strategy, checkboxCount, visibleSample: sampleLabels };
+    return { members, strategy, ...meta };
   }
 
-  // Strategy 3: page-wide person-like checkbox/button labels.
-  strategy = 'pagewide_person_labels';
-  members = collect(document.body);
-  return { members, strategy, checkboxCount, visibleSample: sampleLabels };
+  // Strategy 2: open special-condition accordion (data-state=open) only.
+  strategy = 'special_section_fallback';
+  const openBlocks = [...document.querySelectorAll('[data-state=open], [aria-expanded=true]')]
+    .filter((n) => {
+      const t = norm(n.innerText || n.textContent || '');
+      return t && /someone is |someone has |someone was /i.test(t)
+        && /who does this apply to/i.test(t);
+    });
+  for (const block of openBlocks) {
+    const found = collect(block);
+    if (found.length >= 1) {
+      members = found;
+      root = block;
+      break;
+    }
+  }
+  if (members.length) {
+    return { members, strategy, ...meta };
+  }
+
+  // Do NOT treat page-wide checkbox counts as member evidence (call_ccdc…).
+  strategy = hasApplyTo ? 'apply_to_empty' : 'section_missing';
+  return { members: [], strategy, ...meta };
 }"""
 
 
 async def _discover_special_person_members(
     page: Page,
 ) -> dict[str, Any]:
-    """Discover household member rows; resilient if the apply-to heading is missing."""
+    """Discover household member rows inside the Special Cases apply-to section."""
     try:
         raw = await page.evaluate(_SPECIAL_MEMBER_DISCOVER_JS)
     except Exception:
@@ -3250,6 +4285,10 @@ async def _discover_special_person_members(
             "strategy": "error",
             "checkbox_count": 0,
             "visible_labels": [],
+            "has_apply_to": False,
+            "has_special": False,
+            "has_marital": False,
+            "url": "",
         }
     # Back-compat: unit tests may mock evaluate to return a bare list.
     if isinstance(raw, list):
@@ -3257,12 +4296,20 @@ async def _discover_special_person_members(
         strategy = "legacy_list"
         checkbox_count = 0
         visible_labels: list[str] = []
+        has_apply_to = False
+        has_special = False
+        has_marital = False
+        url = ""
     else:
         data = raw if isinstance(raw, dict) else {}
         members_raw = list(data.get("members") or [])
         strategy = str(data.get("strategy") or "unknown")
         checkbox_count = int(data.get("checkboxCount") or 0)
         visible_labels = [str(x) for x in (data.get("visibleSample") or [])][:20]
+        has_apply_to = bool(data.get("hasApplyTo"))
+        has_special = bool(data.get("hasSpecial"))
+        has_marital = bool(data.get("hasMarital"))
+        url = str(data.get("url") or "")[:160]
 
     filtered = [
         row
@@ -3291,7 +4338,107 @@ async def _discover_special_person_members(
         "strategy": strategy,
         "checkbox_count": checkbox_count,
         "visible_labels": visible_labels,
+        "has_apply_to": has_apply_to,
+        "has_special": has_special,
+        "has_marital": has_marital,
+        "url": url,
     }
+
+
+async def _wait_for_special_apply_to_members(
+    page: Page,
+    *,
+    timeout_ms: int = 8000,
+    call_id: str = "",
+) -> dict[str, Any]:
+    """Poll until the apply-to section exposes household member options."""
+    deadline = time.time() + max(0.5, timeout_ms / 1000.0)
+    last: dict[str, Any] = {}
+    while time.time() < deadline:
+        last = await _discover_special_person_members(page)
+        members = list(last.get("members") or [])
+        if members:
+            logger.info(
+                "special_apply_to_ready call_id=%s strategy=%s count=%s labels=%s",
+                call_id,
+                last.get("strategy"),
+                len(members),
+                [m.get("label") for m in members[:6]],
+            )
+            return last
+        strategy = str(last.get("strategy") or "")
+        if strategy.startswith("wrong_screen"):
+            break
+        try:
+            await page.wait_for_timeout(250)
+        except Exception:
+            break
+    logger.warning(
+        "special_apply_to_not_ready call_id=%s strategy=%s has_apply_to=%s "
+        "has_special=%s has_marital=%s checkbox_count=%s visible=%s url=%s",
+        call_id,
+        last.get("strategy"),
+        last.get("has_apply_to"),
+        last.get("has_special"),
+        last.get("has_marital"),
+        last.get("checkbox_count"),
+        last.get("visible_labels"),
+        (last.get("url") or "")[:80],
+    )
+    return last
+
+
+async def _recover_special_apply_to_section(
+    page: Page,
+    session: LiveFormSession,
+) -> dict[str, Any]:
+    """If apply-to is missing, re-assert the selected condition once (no toggle loop)."""
+    conditions = [
+        part.strip()
+        for part in (session.filled.get("special_conditions") or "").split(",")
+        if part.strip() and not re.search(r"none of the above", part, re.I)
+    ]
+    if not conditions:
+        return await _discover_special_person_members(page)
+
+    # Scroll toward special content if marital chrome is polluting the view.
+    try:
+        await page.evaluate(
+            """() => {
+              const hit = [...document.querySelectorAll('h1,h2,h3,div,span,label,button')]
+                .find((el) => /special cases|someone is blind|who does this apply to/i
+                  .test(el.innerText || ''));
+              if (hit && hit.scrollIntoView) hit.scrollIntoView({ block: 'center' });
+            }"""
+        )
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    discovered = await _discover_special_person_members(page)
+    if discovered.get("members"):
+        return discovered
+
+    # Re-select the first saved condition once to reopen apply-to.
+    label = conditions[0]
+    state = await _special_condition_checkbox_state(page, label)
+    if state.get("found") and state.get("checked"):
+        # Already checked but list missing — click once to re-expand if UI allows.
+        # Prefer not toggling off: only click when unchecked.
+        pass
+    elif not (state.get("found") and state.get("checked")):
+        try:
+            await _click_exact_choice(page, label)
+            await page.wait_for_timeout(400)
+        except Exception:
+            logger.exception(
+                "recover special apply-to click failed call_id=%s label=%r",
+                session.call_id,
+                label,
+            )
+    return await _wait_for_special_apply_to_members(
+        page, timeout_ms=5000, call_id=session.call_id
+    )
 
 
 async def _list_special_person_members(page: Page) -> list[dict[str, Any]]:
@@ -3300,107 +4447,316 @@ async def _list_special_person_members(page: Page) -> list[dict[str, Any]]:
     return list(discovered.get("members") or [])
 
 
+_SPECIAL_MEMBER_CLICK_JS = """({ label, dupIndex, mode }) => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase()
+    .replace(/\\.(?=\\s|$)/g, '');
+  const target = norm(label);
+  const soft = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const isCondition = (t) => /who does this apply to|someone is |someone has |someone was |none of the above/i.test(t || '');
+  const isMultiName = (t) => {
+    const hits = (t || '').match(/[A-Za-z][A-Za-z'\\-]*\\s+[A-Za-z]\\.?/g);
+    return !!(hits && hits.length > 1);
+  };
+  const isPersonLike = (t) => {
+    if (!t || t.length > 60) return false;
+    if (isCondition(t) || isMultiName(t)) return false;
+    if (/^me$/i.test(t)) return true;
+    return /^[A-Za-z][A-Za-z .'\\-]{0,40}$/.test(t);
+  };
+  const nameMatches = (text) => {
+    const n = norm(text);
+    return n === target
+      || n.startsWith(target + ' ')
+      || target.startsWith(n)
+      || n === target.replace(/\\s+/g, '');
+  };
+  const findRoot = () => {
+    const headings = [...document.querySelectorAll(
+      'h1,h2,h3,h4,div,span,p,legend,label,strong,b,[role=heading]'
+    )];
+    const hits = [];
+    for (const el of headings) {
+      const t = soft(el.innerText || el.textContent || '');
+      if (!t || t.length > 80) continue;
+      if (/who does this apply to/i.test(t)) hits.push({ el, len: t.length });
+    }
+    hits.sort((a, b) => a.len - b.len);
+    if (hits.length) {
+      const el = hits[0].el;
+      let root = el.closest('section,fieldset,div,form') || el.parentElement;
+      let cur = el.parentElement;
+      for (let i = 0; i < 10 && cur; i++) {
+        if (cur.querySelectorAll('input[type=checkbox], [role=checkbox]').length) {
+          root = cur;
+          break;
+        }
+        cur = cur.parentElement;
+      }
+      return root;
+    }
+    const open = [...document.querySelectorAll(
+      '[data-state=open], [aria-expanded=true]'
+    )].find((n) => /who does this apply to/i.test(soft(n.innerText || '')));
+    return open || document.body;
+  };
+  const readChecked = (box) => !!(
+    (box && box.tagName === 'INPUT' && box.checked)
+    || (box && box.getAttribute && box.getAttribute('aria-checked') === 'true')
+  );
+  const checkboxForNameNode = (nameNode) => {
+    let cur = nameNode;
+    for (let depth = 0; depth < 8 && cur; depth++) {
+      const box = cur.querySelector
+        && cur.querySelector('input[type=checkbox], [role=checkbox]');
+      if (box) return box;
+      cur = cur.parentElement;
+    }
+    return null;
+  };
+  const root = findRoot();
+  const nameNodes = [...root.querySelectorAll(
+    'div, span, p, label, h1, h2, h3, h4, [role=heading]'
+  )].filter((node) => {
+    const text = soft(
+      node.innerText || node.textContent || node.getAttribute('aria-label') || ''
+    );
+    if (!isPersonLike(text) || !nameMatches(text)) return false;
+    const childHit = [...node.querySelectorAll(
+      'div, span, p, label, h1, h2, h3, h4'
+    )].some((c) => {
+      const ct = soft(c.innerText || c.textContent || '');
+      return c !== node && isPersonLike(ct) && ct.length < text.length;
+    });
+    return !childHit;
+  });
+  if (!nameNodes.length) return { ok: false, reason: 'not_found' };
+  if (dupIndex >= nameNodes.length) return { ok: false, reason: 'dup_oob' };
+  const nameNode = nameNodes[dupIndex];
+  const box = checkboxForNameNode(nameNode);
+  if (!box) {
+    return {
+      ok: false,
+      reason: 'no_checkbox',
+      label: soft(nameNode.innerText || ''),
+    };
+  }
+  const already = readChecked(box);
+  if (mode === 'verify') {
+    return {
+      ok: already,
+      label: soft(nameNode.innerText || ''),
+      strategy: root === document.body ? 'pagewide' : 'scoped',
+      already,
+    };
+  }
+  if (!already) {
+    box.click();
+  }
+  return {
+    ok: true,
+    clicked: !already,
+    already,
+    label: soft(nameNode.innerText || ''),
+    strategy: root === document.body ? 'pagewide' : 'scoped',
+  };
+}"""
+
+
 async def _click_special_person_member(
     page: Page, label: str, *, dup_index: int = 0
 ) -> bool:
-    """Click a member checkbox (scoped when possible) and verify checked."""
+    """Click the member's checkbox control (not the name text) and verify checked.
+
+    Pointcare renders an empty ``button[role=checkbox]`` beside a nested name
+    ``div`` (e.g. ``Mickey M.``). Clicking the name node alone does not toggle
+    or expose ``aria-checked`` — always target the row checkbox. React updates
+    ``aria-checked`` after paint, so verify after a short wait (never a second click).
+    """
     result = await page.evaluate(
-        """({ label, dupIndex }) => {
-          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase()
-            .replace(/\\.(?=\\s|$)/g, '');
-          const target = norm(label);
-          const isCondition = (t) => /who does this apply to|someone is |someone has |someone was |none of the above/i.test(t || '');
-          const isPersonLike = (t) => {
-            if (!t || t.length > 60) return false;
-            if (isCondition(t)) return false;
-            if (/^me$/i.test(t)) return true;
-            return /^[A-Za-z][A-Za-z .'\\-]{0,40}$/.test(t);
-          };
-          const findRoot = () => {
-            const headings = [...document.querySelectorAll(
-              'h1,h2,h3,h4,div,span,p,legend,label,strong,b'
-            )];
-            for (const el of headings) {
-              const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-              if (/who does this apply to/i.test(t)) {
-                let root = el.closest('section,fieldset,div,form') || el.parentElement;
-                let cur = el.parentElement;
-                for (let i = 0; i < 8 && cur; i++) {
-                  if (cur.querySelectorAll('input[type=checkbox], [role=checkbox], label').length) {
-                    return cur;
-                  }
-                  cur = cur.parentElement;
-                }
-                return root;
-              }
-            }
-            const cond = [...document.querySelectorAll('label, button, [role=button], div, span')]
-              .find((n) => isCondition((n.innerText || '').replace(/\\s+/g, ' ').trim()));
-            if (cond) {
-              let cur = cond.parentElement;
-              for (let i = 0; i < 10 && cur; i++) {
-                const labels = [...cur.querySelectorAll('label, [role=checkbox], button')]
-                  .map((n) => (n.innerText || '').replace(/\\s+/g, ' ').trim())
-                  .filter(isPersonLike);
-                if (labels.length) return cur;
-                cur = cur.parentElement;
-              }
-            }
-            return document.body;
-          };
-          const root = findRoot();
-          const nodes = [...root.querySelectorAll(
-            'label, [role=checkbox], input[type=checkbox], button, [role=button]'
-          )];
-          const matches = [];
-          for (const node of nodes) {
-            const text = (node.innerText || node.textContent || node.getAttribute('aria-label') || '')
-              .replace(/\\s+/g, ' ').trim();
-            if (!isPersonLike(text)) continue;
-            if (norm(text) === target || norm(text).startsWith(target + ' ')
-                || target.startsWith(norm(text))) {
-              matches.push(node);
-            }
-          }
-          if (!matches.length) return { ok: false, reason: 'not_found' };
-          if (dupIndex >= matches.length) return { ok: false, reason: 'dup_oob' };
-          const node = matches[dupIndex];
-          // Prefer the checkbox / label pair in the same row.
-          let input = node.tagName === 'INPUT' ? node
-            : (node.control || (node.querySelector && node.querySelector('input[type=checkbox]')));
-          if (!input && node.parentElement) {
-            input = node.parentElement.querySelector('input[type=checkbox]');
-          }
-          const clickTarget = input || node;
-          const already = !!(
-            (input && input.checked)
-            || node.getAttribute('aria-checked') === 'true'
-          );
-          if (!already) {
-            clickTarget.click();
-          }
-          const checked = !!(
-            (input && input.checked)
-            || node.getAttribute('aria-checked') === 'true'
-            || clickTarget.getAttribute && clickTarget.getAttribute('aria-checked') === 'true'
-            || already
-          );
-          return {
-            ok: checked,
-            label: (node.innerText || '').replace(/\\s+/g, ' ').trim(),
-            strategy: root === document.body ? 'pagewide' : 'scoped',
-          };
-        }""",
-        {"label": label, "dupIndex": int(dup_index)},
+        _SPECIAL_MEMBER_CLICK_JS,
+        {"label": label, "dupIndex": int(dup_index), "mode": "click"},
     )
-    await page.wait_for_timeout(300)
-    return bool(result and result.get("ok"))
+    if not result:
+        return False
+    # Back-compat for unit tests that mock a simple {ok: True} payload.
+    if result.get("ok") and result.get("reason") is None and "clicked" not in result and "already" not in result:
+        await page.wait_for_timeout(50)
+        return True
+    if not result.get("ok"):
+        logger.warning(
+            "special_person click missed label=%r reason=%s",
+            label,
+            result.get("reason"),
+        )
+        return False
+    if result.get("already"):
+        return True
+    # Allow the SPA to commit aria-checked — do not click again.
+    await page.wait_for_timeout(350)
+    verify = await page.evaluate(
+        _SPECIAL_MEMBER_CLICK_JS,
+        {"label": label, "dupIndex": int(dup_index), "mode": "verify"},
+    )
+    if verify and verify.get("ok"):
+        return True
+    logger.warning(
+        "special_person click unverified label=%r reason=%s strategy=%s",
+        label,
+        (verify or {}).get("reason"),
+        (verify or result).get("strategy"),
+    )
+    return False
+
+
+def _match_member_rows(
+    spoken: str,
+    members: list[dict[str, Any]],
+    *,
+    raw_answer: str = "",
+) -> list[dict[str, Any]]:
+    """Return member rows matching a spoken query (exact preferred)."""
+    target_norm = _normalize_member_label(spoken)
+    if not target_norm:
+        return []
+    exact = [
+        m
+        for m in members
+        if _normalize_member_label(str(m.get("label") or "")) == target_norm
+    ]
+    if exact:
+        return exact
+    # "Mickey Mouse" → "Mickey M." (first name + last initial)
+    parts = target_norm.split()
+    if len(parts) >= 2 and len(parts[-1]) >= 1:
+        first, last = parts[0], parts[-1]
+        initial = last[0]
+        initial_hits = [
+            m
+            for m in members
+            if _normalize_member_label(str(m.get("label") or ""))
+            in {f"{first} {initial}", f"{first}{initial}"}
+            or re.fullmatch(
+                rf"{re.escape(first)} {re.escape(initial)}\.?",
+                _normalize_member_label(str(m.get("label") or "")),
+            )
+        ]
+        if len(initial_hits) == 1:
+            return initial_hits
+        if len(initial_hits) > 1:
+            return initial_hits
+    # Prefix / containment (John → John D. / Murali → Murali M.)
+    contains = [
+        m
+        for m in members
+        if target_norm in _normalize_member_label(str(m.get("label") or ""))
+        or _normalize_member_label(str(m.get("label") or "")).startswith(target_norm)
+    ]
+    if contains:
+        return contains
+    first = target_norm.split()[0]
+    if first and len(first) >= 2:
+        return [
+            m
+            for m in members
+            if _normalize_member_label(str(m.get("label") or "")).startswith(first)
+        ]
+    return []
+
+
+async def _assign_one_special_person_member(
+    page: Page,
+    spoken: str,
+    members: list[dict[str, Any]],
+    session: LiveFormSession,
+    *,
+    raw_answer: str = "",
+) -> str:
+    """Select one household member; return the visible label selected."""
+    kin = _resolve_kinship_to_member(spoken, members, session)
+    if kin:
+        spoken = kin
+
+    matches = _match_member_rows(spoken, members, raw_answer=raw_answer)
+    if not matches:
+        labels = ", ".join(
+            str(m.get("label") or "")
+            for m in members[:8]
+            if _is_plausible_member_label(str(m.get("label") or ""))
+        )
+        raise RuntimeError(
+            "SPECIAL_PERSON_CLARIFY: Please say which person: "
+            + (labels or "the household member names on the screen")
+        )
+
+    unique_labels = {
+        _normalize_member_label(str(m.get("label") or "")) for m in matches
+    }
+    if len(matches) > 1 and len(unique_labels) == 1:
+        ordinal = None
+        if re.search(r"\b(first|1st)\b", raw_answer or spoken, re.I):
+            ordinal = 0
+        elif re.search(r"\b(second|2nd)\b", raw_answer or spoken, re.I):
+            ordinal = 1
+        elif re.search(r"\b(third|3rd)\b", raw_answer or spoken, re.I):
+            ordinal = 2
+        if ordinal is None:
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: There are two people named "
+                f"{matches[0].get('label')}. Please say the first or the second."
+            )
+        if ordinal >= len(matches):
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: Please say the first or the second listed person."
+            )
+        chosen = matches[ordinal]
+    elif len(matches) > 1:
+        # Distinct people sharing a first name / vague query — clarify.
+        labels = ", ".join(str(m.get("label") or "") for m in matches[:5])
+        raise RuntimeError(
+            "SPECIAL_PERSON_CLARIFY: Several people match. Please say one of: " + labels
+        )
+    else:
+        chosen = matches[0]
+
+    label = str(chosen.get("label") or "")
+    dup_index = int(chosen.get("dupIndex") or 0)
+    # Already checked — preserve selection (do not toggle off).
+    if chosen.get("checked"):
+        logger.info(
+            "special_person already checked call_id=%s label=%r",
+            session.call_id,
+            label,
+        )
+        return label
+
+    # One click only — never retry-toggle when a generic reader fails.
+    ok = await _click_special_person_member(page, label, dup_index=dup_index)
+    if not ok:
+        # Reacquire from current DOM (SPA may have rerendered) and verify once.
+        refreshed = await _discover_special_person_members(page)
+        still = next(
+            (
+                m
+                for m in (refreshed.get("members") or [])
+                if _normalize_member_label(str(m.get("label") or ""))
+                == _normalize_member_label(label)
+                and bool(m.get("checked"))
+            ),
+            None,
+        )
+        if still:
+            return label
+        raise RuntimeError(
+            f"SPECIAL_PERSON_CLARIFY: I couldn't select {label}. "
+            "Please say the person's name again."
+        )
+    return label
 
 
 async def _assign_special_person_member(
     page: Page, answer: str, session: LiveFormSession
 ) -> None:
-    """Assign the selected special condition to a household member checkbox."""
+    """Assign the selected special condition to one or more household members."""
     raw = (answer or "").strip()
     # Condition chips are a different step — never treat them as member assignment.
     if re.search(
@@ -3415,28 +4771,47 @@ async def _assign_special_person_member(
             "Who does this apply to? Please say the household member's name."
         )
 
-    spoken = _spoken_member_query(answer)
-    if not spoken:
+    queries = _split_member_queries(raw)
+    if not queries:
         raise RuntimeError(
             "SPECIAL_PERSON_CLARIFY: Which household member does this apply to?"
         )
 
-    discovered = await _discover_special_person_members(page)
+    discovered = await _wait_for_special_apply_to_members(
+        page, timeout_ms=4000, call_id=session.call_id
+    )
     members = list(discovered.get("members") or [])
     strategy = str(discovered.get("strategy") or "")
     if not members:
+        # Wrong screen or collapsed apply-to — attempt one bounded recovery.
+        discovered = await _recover_special_apply_to_section(page, session)
+        members = list(discovered.get("members") or [])
+        strategy = str(discovered.get("strategy") or strategy)
+    if not members:
         logger.warning(
             "special_person_discovery_empty call_id=%s strategy=%s "
-            "checkbox_count=%s visible=%s spoken=%r",
+            "checkbox_count=%s has_apply_to=%s has_special=%s has_marital=%s "
+            "visible=%s spoken=%r url=%s",
             session.call_id,
             strategy,
             discovered.get("checkbox_count"),
+            discovered.get("has_apply_to"),
+            discovered.get("has_special"),
+            discovered.get("has_marital"),
             discovered.get("visible_labels"),
             (answer or "")[:40],
+            (discovered.get("url") or "")[:80],
         )
+        if discovered.get("has_marital") and not discovered.get("has_apply_to"):
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: The Special Cases member list is not on "
+                "the screen right now. Please say the condition again so I can "
+                "reopen who it applies to."
+            )
         raise RuntimeError(
-            "SPECIAL_PERSON_CLARIFY: I can't see the household member list yet. "
-            "Please say the person's name again."
+            "SPECIAL_PERSON_CLARIFY: The household member list for that condition "
+            "is not open yet. Please wait a moment and say the person's name again, "
+            "or say the condition again to reopen the list."
         )
     logger.info(
         "special_person_discovery call_id=%s strategy=%s count=%s labels=%s",
@@ -3446,98 +4821,28 @@ async def _assign_special_person_member(
         [m.get("label") for m in members[:8]],
     )
 
-    target_norm = _normalize_member_label(spoken)
-    matches = [
-        m
-        for m in members
-        if _normalize_member_label(str(m.get("label") or "")) == target_norm
-        or (
-            target_norm
-            and target_norm in _normalize_member_label(str(m.get("label") or ""))
+    selected_labels: list[str] = []
+    for query in queries:
+        label = await _assign_one_special_person_member(
+            page, query, members, session, raw_answer=raw
         )
-        or _normalize_member_label(str(m.get("label") or "")).startswith(target_norm)
-    ]
-    # Prefer exact normalized matches when available.
-    exact = [
-        m
-        for m in members
-        if _normalize_member_label(str(m.get("label") or "")) == target_norm
-    ]
-    if exact:
-        matches = exact
+        if label not in selected_labels:
+            selected_labels.append(label)
+        # Refresh checked state so subsequent selects see prior checks.
+        discovered = await _discover_special_person_members(page)
+        members = list(discovered.get("members") or []) or members
 
-    if not matches:
-        # First-name only match (John → John D. / Angel or → Angel R.)
-        first = target_norm.split()[0] if target_norm else ""
-        if first and len(first) >= 2:
-            matches = [
-                m
-                for m in members
-                if _normalize_member_label(str(m.get("label") or "")).startswith(first)
-            ]
-
-    if not matches:
-        labels = ", ".join(
-            str(m.get("label") or "")
-            for m in members[:8]
-            if _is_plausible_member_label(str(m.get("label") or ""))
-        )
-        raise RuntimeError(
-            "SPECIAL_PERSON_CLARIFY: Please say which person: "
-            + (labels or "the household member names on the screen")
-        )
-
-    # Duplicate visible labels — require first/second disambiguation.
-    unique_labels = {_normalize_member_label(str(m.get("label") or "")) for m in matches}
-    if len(matches) > 1 and len(unique_labels) == 1:
-        ordinal = None
-        if re.search(r"\b(first|1st)\b", answer or "", re.I):
-            ordinal = 0
-        elif re.search(r"\b(second|2nd)\b", answer or "", re.I):
-            ordinal = 1
-        elif re.search(r"\b(third|3rd)\b", answer or "", re.I):
-            ordinal = 2
-        if ordinal is None:
-            raise RuntimeError(
-                "SPECIAL_PERSON_CLARIFY: There are two people named "
-                f"{matches[0].get('label')}. Please say the first or the second."
-            )
-        if ordinal >= len(matches):
-            raise RuntimeError(
-                "SPECIAL_PERSON_CLARIFY: Please say the first or the second listed person."
-            )
-        chosen = matches[ordinal]
-    elif len(matches) > 1:
-        labels = ", ".join(str(m.get("label") or "") for m in matches[:5])
-        raise RuntimeError(
-            "SPECIAL_PERSON_CLARIFY: Several people match. Please say one of: " + labels
-        )
-    else:
-        chosen = matches[0]
-
-    label = str(chosen.get("label") or "")
-    dup_index = int(chosen.get("dupIndex") or 0)
-    ok = await _click_special_person_member(page, label, dup_index=dup_index)
-    if not ok:
-        # Retry once after a short wait (React may remount).
-        await page.wait_for_timeout(400)
-        ok = await _click_special_person_member(page, label, dup_index=dup_index)
-    if not ok:
-        raise RuntimeError(
-            f"SPECIAL_PERSON_CLARIFY: I couldn't select {label}. "
-            "Please say the person's name again."
-        )
     logger.info(
-        "special_person assigned call_id=%s label=%r spoken=%r",
+        "special_person assigned call_id=%s labels=%r spoken=%r",
         session.call_id,
-        label,
+        selected_labels,
         (answer or "")[:40],
     )
-    # Remember for later conditions on the same screen.
     remembered = session.filled.get("special_person_assigned", "")
     bits = [x for x in remembered.split("|") if x]
-    if label not in bits:
-        bits.append(label)
+    for label in selected_labels:
+        if label not in bits:
+            bits.append(label)
     session.filled["special_person_assigned"] = "|".join(bits)
 
 
@@ -3803,22 +5108,31 @@ async def _submit_eligibility_answer(
     screen = await _eligibility_screen(page)
     expected_group = _step_group(step)
     if screen != "unknown" and screen != expected_group:
+        # Do NOT treat mismatch as proof the caller's answer was applied.
+        # Sync step to the browser and ask that question again.
         recovered = _screen_first_step(screen, session)
         session.elig_step = recovered
+        from .elig_meta import format_question
+
         logger.warning(
-            "Eligibility state reconciled call_id=%s server_step=%s browser_screen=%s recovered=%s",
+            "Eligibility step mismatch call_id=%s server_step=%s browser_screen=%s "
+            "recovered=%s answer_not_applied=1",
             call_id,
             step,
             screen,
             recovered,
         )
-        return _elig_ok(
-            call_id,
-            session,
-            answer,
-            recovered,
-            "Browser state recovered; the answer was already represented by the open screen.",
-        )
+        return {
+            "ok": False,
+            "call_id": call_id,
+            "field_id": "eligibility_answer",
+            "value": answer,
+            "error": "step_mismatch",
+            "spoken": "ASK: " + format_question(recovered),
+            "message": "Browser step differed; answer not applied.",
+            "step": recovered,
+            "screen": screen,
+        }
 
     _mark(call_id, "browser_action", started)
     lowered = answer.lower()
@@ -3874,7 +5188,14 @@ async def _submit_eligibility_answer(
             yes = True
         else:
             raise RuntimeError(f"Expected Yes or No for {step}, got {answer!r}")
-        logger.info("Eligibility yes/no step=%s answer=%r mapped=%s", step, answer, yes)
+        logger.info(
+            "Eligibility yes/no call_id=%s step=%s answer=%r mapped=%s screen=%s",
+            call_id,
+            step,
+            answer,
+            yes,
+            screen,
+        )
         labels = {item.lower() for item in visible_labels}
         # Support screen has four long Yes options + No, not a plain Yes button.
         support_yes_labels = [
@@ -3886,10 +5207,18 @@ async def _submit_eligibility_answer(
         has_support_choices = step == "support" and (
             bool(support_yes_labels) or "no" in labels
         )
-        # Browser already left the Yes/No screen — reconcile instead of re-clicking.
+        # Missing chips is NOT proof the caller's answer was applied. Reconcile
+        # only when the browser already left this Yes/No step AND the open screen
+        # matches the expected transition for the requested answer.
         if not has_plain_yes_no and not has_support_choices:
             landed = await _eligibility_screen(page)
-            if landed in ("child_form", "person_form", "student", "disabled", "relatives", "support", "income"):
+            selected = await _yes_no_selection_state(page)
+            expected_landed = _yes_no_acceptable_screens(step, yes)
+            if landed in expected_landed or (
+                yes
+                and landed in ("child_form", "person_form")
+                and step in ("children", "student", "disabled", "relatives", "support")
+            ):
                 recovered = _screen_first_step(landed, session)
                 if landed == "child_form":
                     if not await _wait_for_child_form_ready(page, timeout_s=8):
@@ -3911,11 +5240,14 @@ async def _submit_eligibility_answer(
                 else:
                     next_step = recovered
                 logger.info(
-                    "Yes/No already applied on browser call_id=%s step=%s landed=%s next=%s",
+                    "Yes/No screen already advanced call_id=%s step=%s landed=%s "
+                    "next=%s selected=%s requested=%s",
                     call_id,
                     step,
                     landed,
                     next_step,
+                    selected,
+                    "yes" if yes else "no",
                 )
                 _mark(call_id, "verified", started)
                 return _elig_ok(
@@ -3923,12 +5255,41 @@ async def _submit_eligibility_answer(
                     session,
                     answer,
                     next_step,
-                    "Answer already reflected on the open screen.",
+                    "Browser already on the expected next screen for this answer.",
                 )
+            # Chips gone but screen does not match the requested answer — do not commit.
+            raise RuntimeError(
+                f"YESNO_VERIFY: I couldn't find Yes/No controls for {step}, and the "
+                f"open screen ({landed or 'unknown'}) does not match a "
+                f"{'Yes' if yes else 'No'} answer. Please say yes or no again."
+            )
         if step == "support":
             await _click_support_choice(page, answer, yes, visible_labels)
         else:
             await _click_exact_choice(page, "Yes" if yes else "No")
+            # Prefer an observable selected state before navigation; do not require
+            # it when Pointcare navigates immediately without aria state.
+            selected = await _yes_no_selection_state(page)
+            want = "yes" if yes else "no"
+            if selected in ("yes", "no") and selected != want:
+                logger.warning(
+                    "Yes/No selection mismatch call_id=%s step=%s want=%s got=%s",
+                    call_id,
+                    step,
+                    want,
+                    selected,
+                )
+                raise RuntimeError(
+                    f"YESNO_VERIFY: I tried to select {want}, but the form shows "
+                    f"{selected}. Please say yes or no clearly again."
+                )
+            logger.info(
+                "Yes/No click verified call_id=%s step=%s want=%s selected=%s",
+                call_id,
+                step,
+                want,
+                selected,
+            )
         if yes:
             if step == "children":
                 # Require the real child form + First Name before advancing state.
@@ -3995,7 +5356,23 @@ async def _submit_eligibility_answer(
         await _strict_fill(page, "Last Name", answer)
         next_step = "child_rel"
     elif step == "child_rel":
-        await _click_exact_choice(page, answer)
+        labels = await _visible_choice_labels(page)
+        mapped = _map_relationship_label(answer, labels)
+        if not mapped:
+            shown = ", ".join(
+                label
+                for label in labels
+                if re.search(r"child|other|step|grand|foster", label, re.I)
+            )[:160]
+            raise RuntimeError(
+                "REL_CLARIFY: Please say the relationship. "
+                + (
+                    f"Options include: {shown}."
+                    if shown
+                    else "For example, Child or Grandchild."
+                )
+            )
+        await _click_exact_choice(page, mapped)
         next_step = "child_age"
     elif step == "child_age":
         age_labels = await _ensure_age_choices_visible(page)
@@ -4052,7 +5429,27 @@ async def _submit_eligibility_answer(
         await _strict_fill(page, "Last Name", answer)
         next_step = "person_rel"
     elif step == "person_rel":
-        await _click_exact_choice(page, answer)
+        labels = await _visible_choice_labels(page)
+        mapped = _map_relationship_label(answer, labels)
+        if not mapped:
+            # Free-text relationship fields may not use chips — fill or click as given.
+            if any(
+                label.lower() == (answer or "").strip().lower() for label in labels
+            ):
+                mapped = next(
+                    label
+                    for label in labels
+                    if label.lower() == (answer or "").strip().lower()
+                )
+            elif labels:
+                shown = ", ".join(labels[:6])
+                raise RuntimeError(
+                    "REL_CLARIFY: Please say the relationship. "
+                    f"Options include: {shown}."
+                )
+            else:
+                mapped = answer
+        await _click_exact_choice(page, mapped)
         next_step = "person_age"
     elif step == "person_age":
         age_labels = await _ensure_age_choices_visible(page)
@@ -4128,14 +5525,12 @@ async def _submit_eligibility_answer(
                 + (f"Options include: {shown}." if shown else "Say blind, disabled, or none.")
             )
         for label in selected:
-            before = await _choice_signature(page, label)
-            await _click_exact_choice(page, label)
-            # Verify the intended condition control reacted when possible.
-            after = await _choice_signature(page, label)
-            if before and after and before == after and after != "__missing__":
-                # Retry once — some Pointcare checkboxes need a second click.
-                await page.wait_for_timeout(200)
-                await _click_exact_choice(page, label)
+            await _select_special_condition_checkbox(
+                page,
+                label,
+                call_id=call_id,
+                multi=len(selected) > 1,
+            )
         session.filled["special_conditions"] = ", ".join(selected)
         none_selected = len(selected) == 1 and re.search(
             r"none of the above", selected[0], re.I
@@ -4145,6 +5540,23 @@ async def _submit_eligibility_answer(
             await _wait_for_screen(page, ("programs",))
             next_step = "programs"
         else:
+            # Do not enter special_person until apply-to members are discoverable.
+            ready = await _wait_for_special_apply_to_members(
+                page, timeout_ms=8000, call_id=call_id
+            )
+            if not list(ready.get("members") or []):
+                ready = await _recover_special_apply_to_section(page, session)
+            if not list(ready.get("members") or []):
+                raise RuntimeError(
+                    "SPECIAL_CLARIFY: I selected the condition, but the "
+                    "'Who does this apply to?' member list did not open. "
+                    "Please say the condition again."
+                )
+            session.filled["special_member_labels"] = "|".join(
+                str(m.get("label") or "")
+                for m in (ready.get("members") or [])[:12]
+                if m.get("label")
+            )
             next_step = "special_person"
     elif step == "special_person":
         await _assign_special_person_member(page, answer, session)
@@ -4358,6 +5770,9 @@ def _answer_kind(field_key: str, text: str) -> str:
         return "first_name"
     if "last" in field_key and "name" in field_key:
         return "last_name"
+    # Never treat an email address as a choice chip / button label.
+    if field_key == "email" or "@" in (text or ""):
+        return "email_text"
     if field_key in ("household_income", "special_conditions") or re.search(
         r"\$|\byearly\b|\bmonthly\b|\bannual\b|every two weeks", lowered
     ):
@@ -4414,6 +5829,418 @@ async def _verify_update(
         except Exception:
             return False
     return False
+
+
+def _is_none_of_the_above_label(label: str) -> bool:
+    return bool(re.search(r"none of the above", label or "", re.I))
+
+
+async def _special_condition_checkbox_state(
+    page: Page, label: str
+) -> dict[str, Any]:
+    """Read Special Cases condition state from the real option DOM (special-only).
+
+    Pointcare condition cards often do not expose checked/aria on the clicked
+    outer text node. Walk ancestors for nested input[type=checkbox], aria, or
+    selected classes. Prefer short exact condition chips — never match household
+    member rows or the whole "Who does this apply to?" container.
+    """
+    phrase = (label or "").strip()
+    if not phrase:
+        return {"found": False, "checked": False, "source": "empty"}
+    try:
+        raw = await page.evaluate(
+            """(phrase) => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const want = norm(phrase);
+              const textOf = (el) => norm(
+                el.innerText || el.textContent || el.getAttribute('aria-label') || ''
+              );
+              const isPersonLike = (t) => {
+                if (!t || t.length > 60) return false;
+                if (/someone is |someone has |someone was |none of the above|who does this apply/i.test(t)) {
+                  return false;
+                }
+                return /^[a-z][a-z .'\\-]{0,40}$/i.test(t);
+              };
+              const nodes = [...document.querySelectorAll(
+                'label, [role=checkbox], button, [role=button], li, div, span'
+              )];
+              const candidates = [];
+              for (const el of nodes) {
+                const text = textOf(el);
+                if (!text) continue;
+                if (isPersonLike(text)) continue;
+                if (text !== want && !text.startsWith(want)) continue;
+                // Skip giant wrappers that include apply-to + member names.
+                if (text.length > want.length + 48) continue;
+                if (/who does this apply to/i.test(text)) continue;
+                candidates.push(el);
+              }
+              candidates.sort((a, b) => textOf(a).length - textOf(b).length);
+
+              const readInput = (root) => {
+                if (!root) return null;
+                if (root.tagName === 'INPUT' && root.type === 'checkbox') return root;
+                if (root.tagName === 'LABEL' && root.control
+                    && root.control.type === 'checkbox') {
+                  return root.control;
+                }
+                if (root.querySelector) {
+                  const nested = root.querySelector('input[type=checkbox]');
+                  if (nested) return nested;
+                }
+                if (root.previousElementSibling
+                    && root.previousElementSibling.matches
+                    && root.previousElementSibling.matches('input[type=checkbox]')) {
+                  return root.previousElementSibling;
+                }
+                return null;
+              };
+
+              for (const el of candidates) {
+                let cur = el;
+                for (let depth = 0; depth < 8 && cur; depth++) {
+                  const input = readInput(cur);
+                  if (input) {
+                    return {
+                      found: true,
+                      checked: !!input.checked,
+                      source: 'input',
+                    };
+                  }
+                  const aria = cur.getAttribute && cur.getAttribute('aria-checked');
+                  if (aria === 'true' || aria === 'false') {
+                    return {
+                      found: true,
+                      checked: aria === 'true',
+                      source: 'aria',
+                    };
+                  }
+                  const cls = (cur.className || '').toString().toLowerCase();
+                  if (/\\b(selected|checked|active|pressed)\\b/.test(cls)) {
+                    return { found: true, checked: true, source: 'class' };
+                  }
+                  // Condition-scoped apply-to expansion under the same card.
+                  const block = (cur.innerText || '').toLowerCase();
+                  if (
+                    block.includes(want)
+                    && /who does this apply to/.test(block)
+                    && !/none of the above/.test(want)
+                  ) {
+                    return {
+                      found: true,
+                      checked: true,
+                      source: 'apply_to_near',
+                    };
+                  }
+                  cur = cur.parentElement;
+                }
+              }
+              return { found: false, checked: false, source: 'missing' };
+            }""",
+            phrase,
+        )
+        if isinstance(raw, dict):
+            return {
+                "found": bool(raw.get("found")),
+                "checked": bool(raw.get("checked")),
+                "source": str(raw.get("source") or "missing"),
+            }
+    except Exception:
+        logger.exception("special checkbox state read failed label=%r", phrase[:60])
+    return {"found": False, "checked": False, "source": "error"}
+
+
+async def _special_next_enabled(page: Page) -> bool | None:
+    """Read-only: whether the Special Cases Next CTA is enabled. None if unknown."""
+    try:
+        raw = await page.evaluate(
+            """() => {
+              const nodes = [...document.querySelectorAll(
+                'button, [role=button], a, input[type=button], input[type=submit]'
+              )];
+              for (const el of nodes) {
+                const text = (el.innerText || el.textContent || el.value || '')
+                  .replace(/\\s+/g, ' ').trim();
+                if (!/^next$/i.test(text)) continue;
+                if (el.disabled) return false;
+                if (el.getAttribute('aria-disabled') === 'true') return false;
+                const cls = (el.className || '').toLowerCase();
+                if (/\\bdisabled\\b/.test(cls)) return false;
+                return true;
+              }
+              return null;
+            }"""
+        )
+        if raw is None:
+            return None
+        return bool(raw)
+    except Exception:
+        return None
+
+
+async def _special_apply_to_member_count(page: Page) -> int:
+    """How many household-member checkboxes are currently discoverable."""
+    try:
+        discovered = await _discover_special_person_members(page)
+        return len(list(discovered.get("members") or []))
+    except Exception:
+        return 0
+
+
+async def _special_apply_to_heading_visible(page: Page) -> bool:
+    try:
+        return bool(
+            await page.evaluate(
+                """() => /who does this apply to/i.test(
+                  (document.body && document.body.innerText) || ''
+                )"""
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _special_condition_readonly_reinspect(
+    page: Page, label: str
+) -> dict[str, Any]:
+    """Bounded read-only re-check of the condition card — never clicks.
+
+    Walks every checkbox / role=checkbox and resolves its accessible name so we
+    can verify selection when the outer card text node has no checked state.
+    """
+    phrase = (label or "").strip()
+    if not phrase:
+        return {"found": False, "checked": False, "source": "empty"}
+    try:
+        raw = await page.evaluate(
+            """(phrase) => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const want = norm(phrase);
+              const isConditionName = (t) =>
+                /someone is |someone has |someone was |none of the above/.test(t)
+                || t === want
+                || t.startsWith(want);
+              const isPersonOnly = (t) =>
+                !!t
+                && t.length < 50
+                && !isConditionName(t)
+                && /^[a-z][a-z .'\\-]{0,40}$/i.test(t);
+
+              const boxes = [...document.querySelectorAll(
+                'input[type=checkbox], [role=checkbox]'
+              )];
+              for (const box of boxes) {
+                let name = '';
+                const aria = box.getAttribute('aria-label');
+                if (aria) name = aria;
+                else if (box.id) {
+                  const lab = document.querySelector(
+                    'label[for=\"' + box.id.replace(/\"/g, '') + '\"]'
+                  );
+                  if (lab) name = lab.innerText || lab.textContent || '';
+                }
+                if (!name) {
+                  const wrap = box.closest('label');
+                  if (wrap) name = wrap.innerText || wrap.textContent || '';
+                }
+                if (!name && box.parentElement) {
+                  name = box.parentElement.innerText || box.parentElement.textContent || '';
+                }
+                const n = norm(name);
+                if (!n || isPersonOnly(n)) continue;
+                // Prefer short names; allow slightly longer when want is the lead text.
+                const lead = n.slice(0, Math.max(want.length + 24, 80));
+                if (n !== want && !n.startsWith(want) && !lead.startsWith(want)) {
+                  continue;
+                }
+                if (!isConditionName(n) && n !== want && !n.startsWith(want)) {
+                  continue;
+                }
+                const checked = !!(
+                  box.checked
+                  || box.getAttribute('aria-checked') === 'true'
+                );
+                return {
+                  found: true,
+                  checked,
+                  source: 'reinspect_checkbox',
+                };
+              }
+              return { found: false, checked: false, source: 'reinspect_missing' };
+            }""",
+            phrase,
+        )
+        if isinstance(raw, dict):
+            return {
+                "found": bool(raw.get("found")),
+                "checked": bool(raw.get("checked")),
+                "source": str(raw.get("source") or "reinspect_missing"),
+            }
+    except Exception:
+        logger.exception(
+            "special condition readonly reinspect failed label=%r", phrase[:60]
+        )
+    return {"found": False, "checked": False, "source": "reinspect_error"}
+
+
+async def _select_special_condition_checkbox(
+    page: Page,
+    label: str,
+    *,
+    call_id: str,
+    multi: bool,
+) -> None:
+    """Select one Special Cases option with at most one click — never toggle off.
+
+    Isolated to the special step. Does not modify shared choice helpers.
+    Accept only when checkbox is verified checked or the apply-to member section
+    is confirmed expanded. Never invent success without evidence.
+    """
+    is_none = _is_none_of_the_above_label(label)
+    state = await _special_condition_checkbox_state(page, label)
+    if state.get("found") and state.get("checked"):
+        logger.info(
+            "special condition already checked call_id=%s label=%r source=%s",
+            call_id,
+            label,
+            state.get("source"),
+        )
+        return
+
+    before_members = await _special_apply_to_member_count(page)
+    await _click_exact_choice(page, label)
+    # Allow the apply-to member section to expand after a successful select.
+    await page.wait_for_timeout(450)
+
+    after = await _special_condition_checkbox_state(page, label)
+    if after.get("found") and after.get("checked"):
+        logger.info(
+            "special condition checked call_id=%s label=%r source=%s",
+            call_id,
+            label,
+            after.get("source"),
+        )
+        return
+
+    if after.get("found") and not after.get("checked"):
+        # Explicit unchecked after one click — do NOT click again.
+        raise RuntimeError(
+            f"SPECIAL_CLARIFY: I couldn't confirm {label}. "
+            "Please say the condition again."
+        )
+
+    # State unreadable on the outer card — never retry-click.
+    after_members = await _special_apply_to_member_count(page)
+    apply_heading = await _special_apply_to_heading_visible(page)
+    if not is_none and (
+        after_members > before_members
+        or (apply_heading and after_members > 0)
+    ):
+        logger.info(
+            "special condition accepted via apply-to UI call_id=%s label=%r "
+            "members_before=%s members_after=%s heading=%s",
+            call_id,
+            label,
+            before_members,
+            after_members,
+            apply_heading,
+        )
+        return
+
+    if is_none:
+        next_on = await _special_next_enabled(page)
+        if next_on is True:
+            logger.info(
+                "special none accepted via Next enabled call_id=%s",
+                call_id,
+            )
+            return
+        raise RuntimeError(
+            "SPECIAL_CLARIFY: I couldn't confirm None of the above. "
+            "Please say none of the above again."
+        )
+
+    # Bounded read-only re-inspection (no second click).
+    await page.wait_for_timeout(350)
+    reinspect = await _special_condition_readonly_reinspect(page, label)
+    if reinspect.get("found") and reinspect.get("checked"):
+        logger.info(
+            "special condition checked via reinspect call_id=%s label=%r source=%s",
+            call_id,
+            label,
+            reinspect.get("source"),
+        )
+        return
+    if reinspect.get("found") and not reinspect.get("checked"):
+        raise RuntimeError(
+            f"SPECIAL_CLARIFY: I couldn't confirm {label}. "
+            "Please say the condition again."
+        )
+
+    # Re-check apply-to after the extra wait — still no clicks.
+    later_members = await _special_apply_to_member_count(page)
+    later_heading = await _special_apply_to_heading_visible(page)
+    if later_members > before_members or (later_heading and later_members > 0):
+        logger.info(
+            "special condition accepted via delayed apply-to call_id=%s label=%r "
+            "members_before=%s members_after=%s",
+            call_id,
+            label,
+            before_members,
+            later_members,
+        )
+        return
+
+    logger.warning(
+        "special condition inconclusive after click call_id=%s label=%r "
+        "multi=%s members_after=%s reinspect=%s",
+        call_id,
+        label,
+        multi,
+        later_members,
+        reinspect.get("source"),
+    )
+    raise RuntimeError(
+        f"SPECIAL_CLARIFY: I couldn't confirm {label}. "
+        "Please say the condition again."
+    )
+
+
+async def _choice_appears_selected(page: Page, value: str) -> bool:
+    """True when the named choice/checkbox looks already selected."""
+    phrase = _choice_phrase(value)
+    try:
+        return bool(
+            await page.evaluate(
+                """(phrase) => {
+                  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const want = norm(phrase);
+                  const nodes = [...document.querySelectorAll(
+                    'button, [role=button], [role=radio], [role=option], [role=checkbox], label, input'
+                  )];
+                  for (const el of nodes) {
+                    const text = norm(
+                      el.innerText || el.textContent || el.getAttribute('aria-label') || el.value || ''
+                    );
+                    if (text !== want && !text.startsWith(want)) continue;
+                    if (el.getAttribute('aria-checked') === 'true') return true;
+                    if (el.getAttribute('aria-pressed') === 'true') return true;
+                    if (el.getAttribute('aria-selected') === 'true') return true;
+                    if (el.checked) return true;
+                    const cls = (el.className || '').toLowerCase();
+                    if (/selected|checked|active|pressed/.test(cls)) return true;
+                    const input = el.control || (el.querySelector && el.querySelector('input[type=checkbox]'));
+                    if (input && input.checked) return true;
+                  }
+                  return false;
+                }""",
+                phrase,
+            )
+        )
+    except Exception:
+        return False
 
 
 async def _choice_signature(page: Page, value: str) -> str:

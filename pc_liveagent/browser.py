@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -501,6 +502,58 @@ async def open_page(url: str | None = None) -> Page:
             await page.wait_for_timeout(800)
         logger.info("Chrome tab is on %s", page.url)
         return page
+
+
+def cdp_list_targets() -> list[dict]:
+    """Return Chrome CDP page targets from the agent debugging port."""
+    try:
+        with urllib.request.urlopen(f"{CDP_URL}/json/list", timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def cdp_target_for_url(page_url: str = "") -> dict:
+    """Pick the best CDP page target for the live Pointcare tab."""
+    targets = [
+        t
+        for t in cdp_list_targets()
+        if isinstance(t, dict) and str(t.get("type") or "") == "page"
+    ]
+    if not targets:
+        return {}
+    want = (page_url or "").split("#")[0].rstrip("/").lower()
+    if want:
+        for t in targets:
+            have = str(t.get("url") or "").split("#")[0].rstrip("/").lower()
+            if have == want or want in have or have in want:
+                return t
+        for t in targets:
+            if "pointcare" in str(t.get("url") or "").lower():
+                return t
+    return targets[0]
+
+
+def local_devtools_url(target: dict) -> str:
+    """Clickable DevTools URL for the agent Chrome tab (same machine)."""
+    if not target:
+        return ""
+    target_id = str(target.get("id") or "").strip()
+    ws = str(target.get("webSocketDebuggerUrl") or "").strip()
+    if target_id:
+        return (
+            f"{CDP_URL}/devtools/inspector.html"
+            f"?ws=127.0.0.1:{CDP_PORT}/devtools/page/{target_id}"
+        )
+    if ws.startswith("ws://"):
+        return f"{CDP_URL}/devtools/inspector.html?ws={ws[5:]}"
+    frontend = str(target.get("devtoolsFrontendUrl") or "").strip()
+    if frontend.startswith("http"):
+        return frontend
+    if frontend.startswith("/"):
+        return f"{CDP_URL}{frontend}"
+    return frontend
 
 
 async def close_browser() -> None:
