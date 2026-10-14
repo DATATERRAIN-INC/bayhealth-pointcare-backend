@@ -12,7 +12,7 @@ from typing import Any
 from playwright.async_api import Page
 
 from . import config
-from .browser import open_page
+from .browser import is_playwright_closed_error, open_page
 from .form_fields import ACTION_BUTTONS, SSO_BUTTON_NEEDLES, WELCOME_CLICKS, get_field
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,81 @@ class LiveFormSession:
 _sessions: dict[str, LiveFormSession] = {}
 _sessions_lock = asyncio.Lock()
 _active_call_id = ""
+# Serialize shared-Chrome startup/welcome so concurrent calls cannot tear down
+# each other's Playwright page mid-automation.
+_startup_lock = asyncio.Lock()
+
+
+def _safe_url_for_log(url: str) -> str:
+    """Log host+path only — drop query strings that may carry onboarding codes."""
+    text = (url or "").strip()
+    if not text:
+        return ""
+    return text.split("?", 1)[0][:160]
+
+
+def session_ids_with_pages() -> list[str]:
+    """Call IDs that currently hold a Playwright Page on the shared CDP client."""
+    return [
+        cid
+        for cid, session in _sessions.items()
+        if session.page is not None and session.status not in ("ended", "superseded")
+    ]
+
+
+async def detach_all_pages_for_browser_restart(*, reason: str = "") -> None:
+    """Clear session page refs before a forced CDP disconnect (idempotent)."""
+    async with _sessions_lock:
+        items = list(_sessions.items())
+    for call_id, session in items:
+        async with session.lock:
+            if session.page is None and session.popup is None:
+                continue
+            logger.info(
+                "Detaching page refs call_id=%s status=%s reason=%s",
+                call_id,
+                session.status,
+                reason or "-",
+            )
+            session.page = None
+            session.popup = None
+            if session.status in ("open", "pending"):
+                session.status = "error"
+                session.error = session.error or f"browser_restart:{reason or 'unknown'}"
+
+
+async def _detach_session_page(session: LiveFormSession, *, reason: str = "") -> None:
+    """Drop this session's page references without closing shared CDP."""
+    async with session.lock:
+        if session.page is None and session.popup is None:
+            return
+        logger.info(
+            "Detaching session page call_id=%s reason=%s",
+            session.call_id,
+            reason or "-",
+        )
+        session.page = None
+        session.popup = None
+
+
+async def _page_wait(page: Page, timeout_ms: int, *, call_id: str = "") -> None:
+    """wait_for_timeout with a clear error when the Playwright handler is gone."""
+    try:
+        if page.is_closed():
+            raise RuntimeError(
+                f"BROWSER_CLOSED: page already closed"
+                + (f" call_id={call_id}" if call_id else "")
+            )
+        await page.wait_for_timeout(timeout_ms)
+    except Exception as exc:
+        if is_playwright_closed_error(exc) or (
+            isinstance(exc, RuntimeError) and str(exc).startswith("BROWSER_CLOSED:")
+        ):
+            raise RuntimeError(
+                "BROWSER_CLOSED: Playwright page/connection closed during wait"
+                + (f" call_id={call_id}" if call_id else "")
+            ) from exc
+        raise
 
 # Stage D Collect Mode — spoken after each Playwright fill. Server owns order/branching.
 # Stage D Collect Mode wording (ask, don't guide/tap).
@@ -308,80 +383,123 @@ def _after_clicked(session: LiveFormSession, answer: str) -> str:
 
 
 async def start_live_form(call_id: str, url: str = "") -> LiveFormSession:
+    """Open/reuse the shared agent Chrome for one call and advance welcome screens.
+
+    Startup is serialized: only one call may open/navigate/welcome on the shared
+    CDP tab at a time. Superseded sessions drop page refs without closing CDP.
+    """
     global _active_call_id
     if not call_id:
         raise ValueError("call_id is required")
     form_url = (url or "").strip() or config.POINTCARE_URL
-    async with _sessions_lock:
-        session = _sessions.get(call_id)
-        if session is None:
-            if _active_call_id and _active_call_id != call_id:
-                previous = _sessions.get(_active_call_id)
-                if previous is not None:
-                    previous.status = "superseded"
-                    previous.page = None
-            session = LiveFormSession(call_id=call_id, url=form_url)
-            _sessions[call_id] = session
-            _active_call_id = call_id
-        elif session.status == "superseded":
-            raise RuntimeError("This call was superseded by a newer browser session")
-        elif form_url and not session.url:
-            session.url = form_url
 
-    async with session.lock:
-        if session.page is not None and session.ready.is_set() and session.welcome_done:
-            return session
-        if session.page is None:
-            target = session.url or config.POINTCARE_URL
-            if not target:
-                raise RuntimeError("POINTCARE_URL is empty. Set it in .env.")
-            # Opens agent Chrome, then forces a fresh sign-in page for this call.
-            page = await open_page(target)
-            await page.wait_for_timeout(800)
-            await _logout_for_fresh_signin(page, target)
-            session.page = page
-            session.url = page.url or target
-        else:
-            page = session.page
-        if not session.welcome_done:
+    async with _startup_lock:
+        previous: LiveFormSession | None = None
+        async with _sessions_lock:
+            session = _sessions.get(call_id)
+            if session is None:
+                if _active_call_id and _active_call_id != call_id:
+                    previous = _sessions.get(_active_call_id)
+                    if previous is not None:
+                        previous.status = "superseded"
+                session = LiveFormSession(call_id=call_id, url=form_url)
+                _sessions[call_id] = session
+                _active_call_id = call_id
+                logger.info(
+                    "Session registered call_id=%s previous=%s",
+                    call_id,
+                    previous.call_id if previous else "-",
+                )
+            elif session.status == "superseded":
+                raise RuntimeError("This call was superseded by a newer browser session")
+            elif form_url and not session.url:
+                session.url = form_url
+
+        if previous is not None:
+            await _detach_session_page(previous, reason=f"superseded_by:{call_id}")
+
+        async with session.lock:
+            if session.status == "superseded":
+                raise RuntimeError("This call was superseded by a newer browser session")
+            if session.page is not None and session.ready.is_set() and session.welcome_done:
+                logger.info("Session already ready call_id=%s", call_id)
+                return session
+            page: Page | None = session.page
             try:
-                clicked = await advance_welcome_screens(page)
-                if "/auth" in (page.url or ""):
-                    await settle_on_signin_page(page)
-                elif await _already_signed_in(page):
-                    raise RuntimeError(
-                        "Pointcare bypassed the fresh sign-in page with a saved session"
+                if page is None:
+                    target = session.url or config.POINTCARE_URL
+                    if not target:
+                        raise RuntimeError("POINTCARE_URL is empty. Set it in .env.")
+                    logger.info(
+                        "Opening Pointcare call_id=%s url=%s",
+                        call_id,
+                        _safe_url_for_log(target),
                     )
-                else:
-                    raise RuntimeError(
-                        f"Welcome flow did not reach the sign-in page: {page.url}"
+                    # Opens agent Chrome, then forces a fresh sign-in page for this call.
+                    page = await open_page(target)
+                    session.page = page
+                    await _page_wait(page, 800, call_id=call_id)
+                    await _logout_for_fresh_signin(page, target)
+                    session.url = page.url or target
+                if not session.welcome_done:
+                    logger.info("Welcome screens start call_id=%s", call_id)
+                    clicked = await advance_welcome_screens(page, call_id=call_id)
+                    if "/auth" in (page.url or ""):
+                        await settle_on_signin_page(page, call_id=call_id)
+                    elif await _already_signed_in(page):
+                        raise RuntimeError(
+                            "Pointcare bypassed the fresh sign-in page with a saved session"
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Welcome flow did not reach the sign-in page: "
+                            + _safe_url_for_log(page.url or "")
+                        )
+                    session.error = ""
+                    session.history.append(
+                        {
+                            "field_id": "welcome",
+                            "value": " → ".join(clicked)
+                            or _safe_url_for_log(page.url or ""),
+                            "action": "wait_for_caller",
+                            "ok": True,
+                        }
                     )
-                session.error = ""
-                session.history.append(
-                    {
-                        "field_id": "welcome",
-                        "value": " → ".join(clicked) or page.url,
-                        "action": "wait_for_caller",
-                        "ok": True,
-                    }
+                    session.welcome_done = True
+                    session.url = page.url or session.url
+                session.status = "open"
+                session.ready.set()
+                logger.info(
+                    "Live Pointcare session opened call_id=%s url=%s welcome_done=%s err=%s",
+                    call_id,
+                    _safe_url_for_log(session.url),
+                    session.welcome_done,
+                    session.error or "-",
                 )
             except Exception as exc:
                 session.error = f"welcome: {exc}"
-                logger.exception("Welcome screens failed call_id=%s", call_id)
                 session.status = "error"
+                logger.exception(
+                    "Session startup failed call_id=%s url=%s",
+                    call_id,
+                    _safe_url_for_log(
+                        getattr(page, "url", "") if page is not None else session.url
+                    ),
+                )
+                # Drop dead page refs so APIs do not advertise a live browser.
+                if is_playwright_closed_error(exc) or "BROWSER_CLOSED" in str(exc):
+                    session.page = None
+                    session.popup = None
+                else:
+                    try:
+                        if page is not None and page.is_closed():
+                            session.page = None
+                            session.popup = None
+                    except Exception:
+                        session.page = None
+                        session.popup = None
                 raise
-            session.welcome_done = True
-            session.url = page.url or session.url
-        session.status = "open"
-        session.ready.set()
-        logger.info(
-            "Live Pointcare session opened call_id=%s url=%s welcome_done=%s err=%s",
-            call_id,
-            session.url,
-            session.welcome_done,
-            session.error or "-",
-        )
-    return session
+        return session
 
 
 def _past_welcome(url: str) -> bool:
@@ -392,39 +510,63 @@ def _past_welcome(url: str) -> bool:
     )
 
 
-async def advance_welcome_screens(page: Page) -> list[str]:
+async def advance_welcome_screens(page: Page, *, call_id: str = "") -> list[str]:
     """Click through the 4 pre-profile pages. Page 3 (frustration) is skipped via Continue."""
     clicked: list[str] = []
     if _past_welcome(page.url):
-        logger.info("Already past welcome at %s", page.url)
+        logger.info(
+            "Already past welcome call_id=%s url=%s",
+            call_id or "-",
+            _safe_url_for_log(page.url),
+        )
         return clicked
     for names in WELCOME_CLICKS:
         label = names[0]
         if _past_welcome(page.url):
             break
         try:
+            logger.info("Welcome CTA call_id=%s label=%s", call_id or "-", label)
             await _click_cta(page, label, attempts=3)
-        except Exception:
+        except Exception as exc:
+            if is_playwright_closed_error(exc):
+                raise RuntimeError(
+                    f"BROWSER_CLOSED: Playwright closed while clicking {label!r}"
+                    + (f" call_id={call_id}" if call_id else "")
+                ) from exc
             if _past_welcome(page.url) or clicked:
-                logger.info("Welcome button %s not shown; staying on %s", label, page.url)
+                logger.info(
+                    "Welcome button %s not shown call_id=%s url=%s",
+                    label,
+                    call_id or "-",
+                    _safe_url_for_log(page.url),
+                )
                 break
             raise
         clicked.append(label)
-        await page.wait_for_timeout(1400)
-        logger.info("Welcome step clicked: %s → %s", label, page.url)
+        await _page_wait(page, 1400, call_id=call_id)
+        logger.info(
+            "Welcome step clicked call_id=%s label=%s url=%s",
+            call_id or "-",
+            label,
+            _safe_url_for_log(page.url),
+        )
     return clicked
 
 
-async def settle_on_signin_page(page: Page) -> None:
+async def settle_on_signin_page(page: Page, *, call_id: str = "") -> None:
     """Stop after Create My Profile. Do not click Google / Apple / saved email."""
-    await page.wait_for_timeout(800)
+    await _page_wait(page, 800, call_id=call_id)
     try:
         await page.keyboard.press("Escape")
     except Exception:
         pass
     await _dismiss_account_picker(page)
     await _clear_autofilled_email(page)
-    logger.info("Sign-in page ready; waiting for caller email. url=%s", page.url)
+    logger.info(
+        "Sign-in page ready call_id=%s url=%s",
+        call_id or "-",
+        _safe_url_for_log(page.url),
+    )
 
 
 async def _dismiss_account_picker(page: Page) -> None:
@@ -1368,9 +1510,18 @@ async def _click_cta(page: Page, label: str, allow_sso: bool = False, attempts: 
                 await target.click(timeout=8000)
                 return
             except Exception as exc:
+                if is_playwright_closed_error(exc):
+                    raise
                 last_exc = exc
                 continue
-        await page.wait_for_timeout(500)
+        try:
+            await _page_wait(page, 500)
+        except RuntimeError:
+            if last_exc and is_playwright_closed_error(last_exc):
+                raise RuntimeError(
+                    f"BROWSER_CLOSED: Playwright closed while clicking {label!r}"
+                ) from last_exc
+            raise
     raise RuntimeError(f"Could not click {label!r} after retries: {last_exc}")
 
 
@@ -1564,10 +1715,17 @@ async def describe_live_browser(
     live_url = ""
     opened = False
     if session is not None:
-        opened = session.page is not None and not (
-            getattr(session.page, "is_closed", lambda: False)()
+        try:
+            page_live = session.page is not None and not (
+                getattr(session.page, "is_closed", lambda: False)()
+            )
+        except Exception:
+            page_live = False
+        # Failed/superseded/ended sessions must not look "opened".
+        opened = bool(
+            page_live and session.status == "open" and session.welcome_done
         )
-        if opened and session.page is not None:
+        if page_live and session.page is not None:
             try:
                 live_url = str(session.page.url or "")
                 if live_url:
@@ -1605,16 +1763,21 @@ async def describe_live_browser(
 
 
 async def end_live_form(call_id: str) -> None:
+    """End one call session. Idempotent; does not disconnect shared CDP/Chrome."""
     global _active_call_id
     async with _sessions_lock:
         session = _sessions.pop(call_id, None)
         if _active_call_id == call_id:
             _active_call_id = ""
     if not session:
+        logger.info("end_live_form no-op call_id=%s (already gone)", call_id)
         return
     async with session.lock:
         session.status = "ended"
         session.page = None
+        session.popup = None
+        session.ready.set()
+    logger.info("Session ended call_id=%s (shared CDP left connected)", call_id)
 
 
 async def peek_choice_labels(call_id: str) -> list[str]:

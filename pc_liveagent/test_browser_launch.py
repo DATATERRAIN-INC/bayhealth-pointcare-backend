@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
@@ -167,6 +168,8 @@ class FormFillerRouteTests(unittest.TestCase):
             session = LiveFormSession(
                 call_id="call_url_gen",
                 url="https://my.pointcare.com/onboarding",
+                welcome_done=True,
+                status="open",
             )
             page = AsyncMock()
             page.url = "https://my.pointcare.com/auth"
@@ -277,6 +280,207 @@ class BrowserStartupFailureTests(unittest.IsolatedAsyncioTestCase):
             result.get("chrome_url"),
             "https://example.test/form-filler/sessions/call_fail_chrome/chrome",
         )
+
+
+class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        import pc_liveagent.live_form as live_form
+
+        self.live_form = live_form
+        async with live_form._sessions_lock:
+            live_form._sessions.clear()
+            live_form._active_call_id = ""
+
+    async def asyncTearDown(self) -> None:
+        async with self.live_form._sessions_lock:
+            self.live_form._sessions.clear()
+            self.live_form._active_call_id = ""
+
+    async def test_end_live_form_idempotent_and_keeps_other_session(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            end_live_form,
+            session_ids_with_pages,
+        )
+
+        a = LiveFormSession(call_id="call_a", url="https://example.test/a", status="open")
+        b = LiveFormSession(call_id="call_b", url="https://example.test/b", status="open")
+        page_a = AsyncMock()
+        page_a.is_closed = lambda: False
+        page_b = AsyncMock()
+        page_b.is_closed = lambda: False
+        a.page = page_a
+        b.page = page_b
+        async with self.live_form._sessions_lock:
+            self.live_form._sessions["call_a"] = a
+            self.live_form._sessions["call_b"] = b
+            self.live_form._active_call_id = "call_b"
+
+        await end_live_form("call_a")
+        await end_live_form("call_a")  # idempotent
+        self.assertIsNone(a.page)
+        self.assertEqual(a.status, "ended")
+        self.assertIs(b.page, page_b)
+        self.assertEqual(session_ids_with_pages(), ["call_b"])
+
+    async def test_disconnect_refuses_while_session_holds_page(self) -> None:
+        import pc_liveagent.browser as browser_mod
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="call_hold", url="https://example.test", status="open"
+        )
+        page = AsyncMock()
+        page.is_closed = lambda: False
+        session.page = page
+        async with self.live_form._sessions_lock:
+            self.live_form._sessions["call_hold"] = session
+
+        fake_pw = AsyncMock()
+        browser_mod._playwright = fake_pw
+        browser_mod._browser = object()
+        try:
+            await browser_mod._disconnect_playwright(force=False, reason="test")
+            # Should have skipped stop because session still owns a page.
+            fake_pw.stop.assert_not_awaited()
+            self.assertIs(browser_mod._playwright, fake_pw)
+
+            await self.live_form.detach_all_pages_for_browser_restart(reason="test")
+            await browser_mod._disconnect_playwright(force=True, reason="test")
+            fake_pw.stop.assert_awaited()
+            self.assertIsNone(browser_mod._playwright)
+            self.assertIsNone(browser_mod._browser)
+        finally:
+            browser_mod._playwright = None
+            browser_mod._browser = None
+
+    async def test_welcome_closed_handler_marks_error_and_clears_page(self) -> None:
+        from pc_liveagent.live_form import start_live_form
+
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/onboarding"
+        page.is_closed = lambda: False
+
+        async def boom(*_a, **_k):
+            raise RuntimeError(
+                "Page.wait_for_timeout: unable to perform operation ... the handler is closed"
+            )
+
+        with (
+            patch("pc_liveagent.live_form.open_page", new=AsyncMock(return_value=page)),
+            patch(
+                "pc_liveagent.live_form._logout_for_fresh_signin",
+                new=AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.live_form._page_wait",
+                new=AsyncMock(side_effect=boom),
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await start_live_form("call_welcome_fail", "https://my.pointcare.com/onboarding")
+        self.assertIn("handler is closed", str(ctx.exception).lower())
+        session = self.live_form._sessions.get("call_welcome_fail")
+        self.assertIsNotNone(session)
+        assert session is not None
+        self.assertEqual(session.status, "error")
+        self.assertIsNone(session.page)
+        self.assertIn("welcome:", session.error)
+
+    async def test_concurrent_starts_serialize_shared_chrome(self) -> None:
+        from pc_liveagent.live_form import start_live_form
+
+        order: list[str] = []
+        pages = {
+            "call_1": AsyncMock(url="https://my.pointcare.com/auth", is_closed=lambda: False),
+            "call_2": AsyncMock(url="https://my.pointcare.com/auth", is_closed=lambda: False),
+        }
+
+        async def fake_open(url=""):
+            # Identify by active call being registered ends up in session; use stack.
+            return AsyncMock(url="https://my.pointcare.com/auth", is_closed=lambda: False)
+
+        started = 0
+
+        async def fake_open_tracked(url=""):
+            nonlocal started
+            started += 1
+            cur = started
+            order.append(f"open:{cur}")
+            await asyncio.sleep(0.05)
+            page = AsyncMock()
+            page.url = "https://my.pointcare.com/auth"
+            page.is_closed = lambda: False
+            return page
+
+        async def fake_welcome(page, *, call_id=""):
+            order.append(f"welcome:{call_id}")
+            await asyncio.sleep(0.05)
+            return ["Continue"]
+
+        with (
+            patch(
+                "pc_liveagent.live_form.open_page",
+                new=AsyncMock(side_effect=fake_open_tracked),
+            ),
+            patch(
+                "pc_liveagent.live_form._logout_for_fresh_signin",
+                new=AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.live_form._page_wait",
+                new=AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.live_form.advance_welcome_screens",
+                new=AsyncMock(side_effect=fake_welcome),
+            ),
+            patch(
+                "pc_liveagent.live_form.settle_on_signin_page",
+                new=AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.live_form._already_signed_in",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            t1 = asyncio.create_task(start_live_form("call_1", "https://example.test/1"))
+            await asyncio.sleep(0.01)
+            t2 = asyncio.create_task(start_live_form("call_2", "https://example.test/2"))
+            s1, s2 = await asyncio.gather(t1, t2)
+
+        # Second start must not interleave welcome before first finishes open+welcome.
+        self.assertEqual(
+            order,
+            ["open:1", "welcome:call_1", "open:2", "welcome:call_2"],
+        )
+        self.assertEqual(s2.status, "open")
+        # First session was superseded when second registered (same object as s1).
+        self.assertEqual(s1.status, "superseded")
+        self.assertEqual(self.live_form._sessions["call_1"].status, "superseded")
+        self.assertIsNone(self.live_form._sessions["call_1"].page)
+
+    async def test_failed_session_not_reported_opened(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, describe_live_browser
+
+        session = LiveFormSession(
+            call_id="call_err",
+            url="https://my.pointcare.com/onboarding",
+            status="error",
+            welcome_done=False,
+            error="welcome: BROWSER_CLOSED",
+        )
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/onboarding"
+        page.is_closed = lambda: False
+        session.page = page
+        with patch(
+            "pc_liveagent.browser.cdp_target_for_url",
+            return_value={},
+        ):
+            info = await describe_live_browser(session, call_id="call_err")
+        self.assertFalse(info["opened"])
+        self.assertIn("BROWSER_CLOSED", info["error"])
 
 
 if __name__ == "__main__":

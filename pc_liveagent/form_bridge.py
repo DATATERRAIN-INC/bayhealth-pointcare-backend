@@ -723,12 +723,32 @@ async def on_caller_transcript(call_id: str, call: dict[str, Any], form_url: str
 
 
 async def on_call_started(call_id: str, form_url: str = "") -> dict[str, Any]:
-    from .live_form import describe_live_browser
+    from .live_form import describe_live_browser, get_session
 
-    session = await start_live_form(call_id, form_url or config.POINTCARE_URL)
+    try:
+        session = await start_live_form(call_id, form_url or config.POINTCARE_URL)
+    except Exception as exc:
+        logger.exception("on_call_started failed call_id=%s", call_id)
+        failed = await get_session(call_id)
+        browser = await describe_live_browser(failed, call_id=call_id)
+        browser["opened"] = False
+        browser["error"] = browser.get("error") or str(exc)[:200]
+        return {
+            "ok": False,
+            "call_id": call_id,
+            "url": browser.get("url") or (failed.url if failed else ""),
+            "status": (failed.status if failed else "error"),
+            "welcome_done": bool(failed.welcome_done) if failed else False,
+            "error": str(exc)[:300],
+            "history": (failed.history[-10:] if failed else []),
+            "browser": browser,
+        }
     browser = await describe_live_browser(session, call_id=call_id)
+    opened = bool(browser.get("opened")) and session.status == "open"
+    if not opened:
+        browser["opened"] = False
     return {
-        "ok": True,
+        "ok": opened,
         "call_id": call_id,
         "url": browser.get("url") or session.url,
         "status": session.status,
