@@ -16,6 +16,7 @@ from playwright.async_api import Browser, Page, async_playwright
 from .config import (
     CHROME_AGENT_DATA,
     CHROME_CHANNEL,
+    CHROME_EXECUTABLE,
     CHROME_NO_SANDBOX,
     CHROME_PROFILE_DIR,
     CHROME_PROFILE_DIRECTORY,
@@ -41,9 +42,26 @@ _lock = asyncio.Lock()
 def _is_executable_file(path: Path) -> bool:
     """True when path is an existing executable file (not a directory)."""
     try:
-        return path.is_file() and os.access(path, os.X_OK)
+        if not path.is_file():
+            return False
+        if sys.platform == "win32":
+            # os.access(X_OK) is unreliable on Windows; accept common binaries.
+            return path.suffix.lower() in {".exe", ".bat", ".cmd"} or os.access(
+                path, os.X_OK
+            )
+        return os.access(path, os.X_OK)
     except OSError:
         return False
+
+
+def _sessions_holding_pages() -> list[str]:
+    """Call IDs that still hold a live Page on the shared CDP connection."""
+    try:
+        from . import live_form
+
+        return live_form.session_ids_with_pages()
+    except Exception:
+        return []
 
 
 def _chrome_candidates_windows() -> list[Path]:
@@ -87,7 +105,12 @@ def _chrome_executable() -> str:
     (msedge, chromium, chrome-beta, …) remain Playwright channel names and are
     not resolved here — callers that need a path must set ``CHROME_EXECUTABLE``.
     """
-    explicit = (os.environ.get("CHROME_EXECUTABLE") or "").strip().strip('"').strip("'")
+    explicit = (
+        (CHROME_EXECUTABLE or os.environ.get("CHROME_EXECUTABLE") or "")
+        .strip()
+        .strip('"')
+        .strip("'")
+    )
     if explicit:
         path = Path(explicit).expanduser()
         if _is_executable_file(path):
@@ -502,8 +525,17 @@ async def _ensure_chrome_process(start_url: str = "") -> None:
             "Debug Chrome is open for a different profile; restarting for %s",
             chrome_profile_label(),
         )
+        # Detach session page refs before tearing down the shared CDP connection.
+        try:
+            from . import live_form
+
+            await live_form.detach_all_pages_for_browser_restart(
+                reason="chrome_profile_switch"
+            )
+        except Exception:
+            logger.exception("detach_all_pages_for_browser_restart failed")
         await asyncio.to_thread(_kill_debug_chrome)
-        await _disconnect_playwright()
+        await _disconnect_playwright(force=True, reason="chrome_profile_switch")
         await asyncio.sleep(1.5)
 
     await asyncio.to_thread(_seed_agent_profile, user_data_dir)
@@ -544,7 +576,9 @@ async def _connect() -> Browser:
             _ = _browser.contexts
             return _browser
         except Exception:
-            await _disconnect_playwright()
+            logger.warning("Existing Playwright CDP browser unusable; reconnecting")
+            await _disconnect_playwright(force=True, reason="stale_browser")
+    logger.info("Starting Playwright CDP connection to %s", CDP_URL)
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.connect_over_cdp(CDP_URL)
     logger.info(
@@ -555,15 +589,50 @@ async def _connect() -> Browser:
     return _browser
 
 
-async def _disconnect_playwright() -> None:
+async def _disconnect_playwright(*, force: bool = False, reason: str = "") -> None:
+    """Stop the shared Playwright CDP client.
+
+    Does not kill the Chrome process. Refuses to disconnect while sessions still
+    hold Page objects unless ``force=True`` (shutdown / profile restart after detach).
+    """
     global _playwright, _browser
+    owners = _sessions_holding_pages()
+    if owners and not force:
+        logger.warning(
+            "Skip Playwright disconnect; sessions still hold pages owners=%s reason=%s",
+            owners[:8],
+            reason or "-",
+        )
+        return
+    logger.info(
+        "Disconnecting Playwright CDP force=%s reason=%s owners=%s",
+        force,
+        reason or "-",
+        owners[:8] if owners else [],
+    )
     _browser = None
     if _playwright is not None:
         try:
             await _playwright.stop()
         except Exception:
-            pass
+            logger.exception("Playwright stop failed reason=%s", reason or "-")
         _playwright = None
+
+
+def is_playwright_closed_error(exc: BaseException) -> bool:
+    """True when Playwright reports a closed page/browser/connection handler."""
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "handler is closed",
+            "target closed",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "connection closed",
+            "protocol error",
+        )
+    )
 
 
 async def _maximize(page: Page) -> None:
@@ -677,5 +746,12 @@ def local_devtools_url(target: dict) -> str:
 
 
 async def close_browser() -> None:
+    """App shutdown: detach session pages, then drop the shared Playwright client."""
+    try:
+        from . import live_form
+
+        await live_form.detach_all_pages_for_browser_restart(reason="app_shutdown")
+    except Exception:
+        logger.exception("detach on close_browser failed")
     # Disconnect automation only. Do not kill the Chrome window.
-    await _disconnect_playwright()
+    await _disconnect_playwright(force=True, reason="app_shutdown")

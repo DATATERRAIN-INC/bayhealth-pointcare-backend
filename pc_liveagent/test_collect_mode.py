@@ -648,6 +648,7 @@ class BrowserLinkTests(unittest.IsolatedAsyncioTestCase):
             call_id="call_browser_link",
             url="https://my.pointcare.com/onboarding",
             welcome_done=True,
+            status="open",
         )
         session.page = page
         with patch(
