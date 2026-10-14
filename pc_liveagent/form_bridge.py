@@ -25,11 +25,29 @@ logger = logging.getLogger(__name__)
 _elig_applied: dict[str, dict[str, float]] = {}
 _call_snapshots: dict[str, dict[str, Any]] = {}
 _fallback_tasks: dict[str, asyncio.Task] = {}
+# Bumped on eligibility go-back so stale Yes/No from prior questions are ignored.
+_transcript_nav_gen: dict[str, int] = {}
 _TRANSCRIPT_KEYS = ("transcript", "transcript_object", "transcript_with_tool_calls")
 # Let Retell's submit_field win so the tool result can speak the next question.
 _FALLBACK_DELAY_S = 2.4
 # Suppress duplicate applies for the same step+answer only (not across questions).
 _STEP_APPLY_COOLDOWN_S = 6.0
+
+
+def invalidate_transcript_answers(call_id: str) -> None:
+    """After go-back: cancel delayed fallback and bump generation so old Yes/No die."""
+    if not call_id:
+        return
+    _transcript_nav_gen[call_id] = _transcript_nav_gen.get(call_id, 0) + 1
+    task = _fallback_tasks.pop(call_id, None)
+    if task and not task.done():
+        task.cancel()
+    _heard.pop(call_id, None)
+    logger.info(
+        "transcript_answers_invalidated call_id=%s gen=%s",
+        call_id,
+        _transcript_nav_gen[call_id],
+    )
 
 
 def _apply_key(step: str, answer: str) -> str:
@@ -471,12 +489,21 @@ def _yes_no_from_recent_transcript(
 
     Retell often splits one spoken question across agent turns and may include an
     earlier ASR miss (Yes) before the caller repeats No. After a repeat request,
-    prefer the latest clear Yes/No.
+    prefer the latest clear Yes/No. Never reuse answers from before a go-back.
     """
     if step not in YES_NO_ELIG_STEPS:
         return None
     turns = conversation_turns(call or {}, transcript)
     cue = _STEP_QUESTION_CUES.get(step, r".")
+
+    # Latest user turn is navigation → do not resolve a Yes/No from older turns.
+    for kind, text in reversed(turns):
+        if kind != "user":
+            continue
+        lowered = (text or "").lower()
+        if re.search(r"\b(go\s*back|goback|previous question)\b", lowered):
+            return None
+        break
 
     # Start after the latest substantive question for this step (ignore tiny
     # fragments like "age of 19?").
@@ -495,20 +522,28 @@ def _yes_no_from_recent_transcript(
     if start is None:
         return None
 
-    # If the caller asked to repeat, only use answers after that request.
-    repeat_at = None
+    # If the caller asked to go back or repeat, only use answers AFTER that request.
+    reset_at = None
     for index in range(start, len(turns)):
         kind, text = turns[index]
-        if kind == "user" and re.search(
-            r"\b(repeat|say that again|what was the question)\b",
-            text.lower(),
+        if kind != "user":
+            continue
+        lowered = (text or "").lower()
+        if re.search(
+            r"\b(go\s*back|goback|previous question|repeat|say that again|"
+            r"what was the question)\b",
+            lowered,
         ):
-            repeat_at = index + 1
-    scan_from = repeat_at if repeat_at is not None else start
+            reset_at = index + 1
+    scan_from = reset_at if reset_at is not None else start
 
     answers: list[str] = []
     for kind, text in turns[scan_from:]:
         if kind != "user":
+            continue
+        lowered = (text or "").lower()
+        if re.search(r"\b(go\s*back|goback|previous question)\b", lowered):
+            answers.clear()
             continue
         mapped = _eligibility_answer_from_utterance(step, text)
         if mapped in ("Yes", "No"):
@@ -636,6 +671,9 @@ async def on_caller_transcript(call_id: str, call: dict[str, Any], form_url: str
         return
     if not answer:
         return
+    # Never apply Yes/No from a go-back / control utterance.
+    if re.search(r"\b(go\s*back|goback|previous question)\b", (line or "").lower()):
+        return
 
     applied_key = _apply_key(step, answer)
     fingerprint = f"{applied_key}:{line.strip().lower()[:40]}"
@@ -645,13 +683,15 @@ async def on_caller_transcript(call_id: str, call: dict[str, Any], form_url: str
         return
 
     _heard[call_id] = fingerprint
+    nav_gen = _transcript_nav_gen.get(call_id, 0)
     logger.info(
-        "latency call_id=%s stage=transcript_received question=%r latest=%r resolved=%r step=%s",
+        "latency call_id=%s stage=transcript_received question=%r latest=%r resolved=%r step=%s gen=%s",
         call_id,
         (question or "")[:100],
         (line or "")[:80],
         answer,
         step,
+        nav_gen,
     )
 
     # Delay so Custom LLM / submit_field can win first.
@@ -662,6 +702,13 @@ async def on_caller_transcript(call_id: str, call: dict[str, Any], form_url: str
     async def _delayed() -> None:
         try:
             await asyncio.sleep(_FALLBACK_DELAY_S)
+            if _transcript_nav_gen.get(call_id, 0) != nav_gen:
+                logger.info(
+                    "transcript_fallback_skipped_stale_nav call_id=%s gen=%s",
+                    call_id,
+                    nav_gen,
+                )
+                return
             await _apply_transcript_fallback(call_id, step, answer, form_url, line)
         except asyncio.CancelledError:
             raise
@@ -676,15 +723,19 @@ async def on_caller_transcript(call_id: str, call: dict[str, Any], form_url: str
 
 
 async def on_call_started(call_id: str, form_url: str = "") -> dict[str, Any]:
+    from .live_form import describe_live_browser
+
     session = await start_live_form(call_id, form_url or config.POINTCARE_URL)
+    browser = await describe_live_browser(session, call_id=call_id)
     return {
         "ok": True,
         "call_id": call_id,
-        "url": session.url,
+        "url": browser.get("url") or session.url,
         "status": session.status,
         "welcome_done": session.welcome_done,
         "error": session.error,
         "history": session.history[-10:],
+        "browser": browser,
     }
 
 
@@ -707,6 +758,7 @@ async def on_call_ended(
     _elig_applied.pop(call_id, None)
     _call_snapshots.pop(call_id, None)
     _fallback_locks.pop(call_id, None)
+    _transcript_nav_gen.pop(call_id, None)
     try:
         from .call_turn import drop_controller
 
