@@ -231,6 +231,8 @@ class PatientSerializer(serializers.ModelSerializer):
             patient=obj, status=Call.Status.IN_PROGRESS
         ).exists():
             return Call.Status.IN_PROGRESS
+        if Call.objects.filter(patient=obj, status=Call.Status.WAITING).exists():
+            return Call.Status.WAITING
 
         latest_real = (
             Call.objects.filter(patient=obj)

@@ -121,6 +121,7 @@ class Call(models.Model):
         SCHEDULED = "scheduled", "Scheduled"
         PAUSED = "paused", "Paused"
         IN_PROGRESS = "in_progress", "In Progress"
+        WAITING = "waiting", "Waiting"
         COMPLETED = "completed", "Completed"
         NOT_ATTENDED = "not_attended", "Not Attended"
         CALLBACK = "callback", "Callback"

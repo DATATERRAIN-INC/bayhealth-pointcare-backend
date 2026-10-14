@@ -36,6 +36,7 @@ wt_logger = logging.getLogger("ai_caller.warm_transfer")
 
 _SESSION_TTL_SECONDS = 60 * 60 * 24
 _PENDING_CACHE_KEY = "warm_transfer:pending"
+_OPEN_SESSIONS_KEY = "warm_transfer:open_sessions"
 
 _POLL_INTERVAL_SECONDS = 5
 _YES_RE = re.compile(
@@ -135,7 +136,349 @@ def save_session(session: Dict[str, Any]) -> Dict[str, Any]:
             "TRANSFER_SESSION_CACHE_FALLBACK session=%s (file cache)",
             session_id,
         )
+        _index_session(fallback, session)
+        return session
+    _index_session(cache, session)
     return session
+
+
+def _phone_digits(value: str) -> str:
+    return _digits(normalize_phone(value or "") or (value or ""))
+
+
+def _phone_cache_key(digits: str) -> str:
+    return f"warm_transfer:phone:{digits}"
+
+
+def _queue_scope(session: Dict[str, Any]) -> str:
+    user_id = session.get("user_id")
+    if user_id:
+        return f"user:{user_id}"
+    number = _phone_digits(str(session.get("transfer_number") or ""))
+    return f"agent:{number or 'default'}"
+
+
+def _queue_key(scope: str) -> str:
+    return f"warm_transfer:queue:{scope}"
+
+
+def _active_key(scope: str) -> str:
+    return f"warm_transfer:active:{scope}"
+
+
+def _index_session(cache, session: Dict[str, Any]) -> None:
+    """Remember this session by patient phone so concurrent transfers stay apart."""
+    sid = str(session.get("session_id") or "").strip()
+    if not sid:
+        return
+    phone = _phone_digits(str(session.get("phone_number") or ""))
+    if phone:
+        cache.set(_phone_cache_key(phone), sid, timeout=_SESSION_TTL_SECONDS)
+    retell_id = str(session.get("retell_call_id") or "").strip()
+    if retell_id:
+        cache.set(
+            f"warm_transfer:retell:{retell_id}",
+            sid,
+            timeout=_SESSION_TTL_SECONDS,
+        )
+    try:
+        ids = list(cache.get(_OPEN_SESSIONS_KEY) or [])
+    except Exception:
+        ids = []
+    ended = bool(session.get("conference_ended") or session.get("agent_released"))
+    if ended:
+        ids = [item for item in ids if item != sid]
+    elif sid not in ids:
+        ids.append(sid)
+    cache.set(_OPEN_SESSIONS_KEY, ids, timeout=_SESSION_TTL_SECONDS)
+
+
+def _open_sessions() -> list:
+    try:
+        ids = list(_session_cache().get(_OPEN_SESSIONS_KEY) or [])
+    except Exception:
+        ids = []
+    sessions = []
+    for sid in ids:
+        session = load_session(str(sid))
+        if session:
+            sessions.append(session)
+    return sessions
+
+
+def _same_phone(left: str, right: str) -> bool:
+    a = _phone_digits(left)
+    b = _phone_digits(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(a) >= 10 and len(b) >= 10 and a[-10:] == b[-10:]
+
+
+def _party_numbers(*values: str) -> list:
+    bridge = _phone_digits(_from_number())
+    found = []
+    for value in values:
+        digits = _phone_digits(value)
+        if not digits or digits == bridge or digits in found:
+            continue
+        found.append(digits)
+    return found
+
+
+def resolve_inbound_session(
+    *,
+    call_sid: str = "",
+    from_number: str = "",
+    to_number: str = "",
+    caller: str = "",
+    called: str = "",
+) -> Dict[str, Any]:
+    """
+    Pick this inbound transfer's own session.
+
+    The Twilio number has one voice URL, so every transfer used to land in
+    the latest conference. Match the patient phone, and if that is missing
+    hand out unclaimed sessions one at a time.
+    """
+    call_sid = (call_sid or "").strip()
+    cache = _session_cache()
+    lock = "warm_transfer:inbound_lock"
+    if not cache.add(lock, call_sid or "1", timeout=10):
+        # Another transfer is being assigned. Wait briefly and try once.
+        time.sleep(0.2)
+        if not cache.add(lock, call_sid or "1", timeout=10):
+            wt_logger.warning("TRANSFER_INBOUND_LOCK_BUSY call=%s", call_sid or "-")
+            return {}
+    try:
+        sessions = _open_sessions()
+        if call_sid:
+            for session in sessions:
+                if str(session.get("call_sid") or "") == call_sid:
+                    return session
+        parties = _party_numbers(from_number, to_number, caller, called)
+        for party in parties:
+            for session in sessions:
+                if session.get("conference_ended") or session.get("agent_released"):
+                    continue
+                bound = str(session.get("call_sid") or "")
+                if bound and bound != call_sid:
+                    continue
+                if _same_phone(str(session.get("phone_number") or ""), party):
+                    if call_sid:
+                        session["call_sid"] = call_sid
+                        save_session(session)
+                    return session
+        unclaimed = [
+            session
+            for session in sessions
+            if not session.get("call_sid")
+            and not session.get("conference_ended")
+            and not session.get("agent_released")
+        ]
+        if not unclaimed:
+            return {}
+        chosen = unclaimed[0]
+        if call_sid:
+            chosen["call_sid"] = call_sid
+            save_session(chosen)
+        if len(unclaimed) > 1 and not parties:
+            wt_logger.info(
+                "TRANSFER_INBOUND_FIFO session=%s call=%s waiting=%s",
+                chosen.get("session_id"),
+                call_sid or "-",
+                len(unclaimed) - 1,
+            )
+        return chosen
+    finally:
+        cache.delete(lock)
+
+
+def _slot_busy(session_id: str) -> bool:
+    session = load_session(session_id)
+    if not session:
+        return False
+    if session.get("agent_released") or session.get("conference_ended"):
+        return False
+    return str(session.get("queue_state") or "") == "active"
+
+
+def _enqueue(cache, scope: str, session_id: str) -> None:
+    key = _queue_key(scope)
+    rows = [str(item) for item in (cache.get(key) or []) if str(item) != session_id]
+    rows.append(session_id)
+    cache.set(key, rows, timeout=_SESSION_TTL_SECONDS)
+
+
+def _dequeue(cache, scope: str, session_id: str) -> None:
+    key = _queue_key(scope)
+    rows = [str(item) for item in (cache.get(key) or []) if str(item) != session_id]
+    cache.set(key, rows, timeout=_SESSION_TTL_SECONDS)
+
+
+def admit_patient_to_agent(session: Dict[str, Any]) -> str:
+    """
+    One patient talks to the live agent. Everyone else stays a waiting call.
+
+    Returns "active" or "waiting".
+    """
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    sid = str(session.get("session_id") or "").strip()
+    if not sid:
+        return "waiting"
+    if session.get("queue_state") == "active" and session.get("agent_claimed"):
+        return "active"
+    if session.get("queue_state") == "waiting":
+        return "waiting"
+    scope = _queue_scope(session)
+    cache = _session_cache()
+    lock = f"warm_transfer:admit:{scope}"
+    locked = False
+    for _ in range(8):
+        if cache.add(lock, sid, timeout=10):
+            locked = True
+            break
+        time.sleep(0.05)
+    if not locked:
+        _enqueue(cache, scope, sid)
+        session["queue_state"] = "waiting"
+        session["agent_claimed"] = False
+        save_session(session)
+        wt_logger.info("AGENT_QUEUE_WAIT session=%s scope=%s reason=lock", sid, scope)
+        return "waiting"
+    try:
+        active = str(cache.get(_active_key(scope)) or "")
+        if active == sid or not _slot_busy(active):
+            cache.set(_active_key(scope), sid, timeout=_SESSION_TTL_SECONDS)
+            _dequeue(cache, scope, sid)
+            session["queue_state"] = "active"
+            session["agent_claimed"] = True
+            save_session(session)
+            wt_logger.info("AGENT_QUEUE_ACTIVE session=%s scope=%s", sid, scope)
+            return "active"
+        _enqueue(cache, scope, sid)
+        session["queue_state"] = "waiting"
+        session["agent_claimed"] = False
+        save_session(session)
+        wt_logger.info("AGENT_QUEUE_WAIT session=%s scope=%s behind=%s", sid, scope, active)
+        return "waiting"
+    finally:
+        cache.delete(lock)
+
+
+def transfer_call_should_stay_open(retell_call_id: str) -> bool:
+    """True while this patient is still with the agent or waiting for one."""
+    retell_call_id = (retell_call_id or "").strip()
+    if not retell_call_id:
+        return False
+    try:
+        sid = str(_session_cache().get(f"warm_transfer:retell:{retell_call_id}") or "")
+    except Exception:
+        sid = ""
+    session = load_session(sid) if sid else {}
+    if not session or session.get("conference_ended") or session.get("agent_released"):
+        return False
+    state = str(session.get("queue_state") or "")
+    if state in {"waiting", "active"}:
+        return True
+    return bool(session.get("call_sid"))
+
+
+def set_transfer_call_status(session: Dict[str, Any], status: str) -> None:
+    """Publish waiting / in_progress / completed on the call so the queue updates."""
+    from apps.ai_caller.models import Call
+
+    session = dict(session or {})
+    retell_call_id = str(session.get("retell_call_id") or "").strip()
+    call_sid = str(session.get("call_sid") or "").strip()
+    call = None
+    if retell_call_id:
+        call = Call.objects.filter(retell_call_id=retell_call_id).first()
+    if call is None and call_sid:
+        call = Call.objects.filter(warm_transfer_session_id=call_sid).first()
+    if call is None or call.status == status:
+        return
+    if call.status in {Call.Status.CALLBACK, Call.Status.CANCEL}:
+        return
+    call.status = status
+    call.save(update_fields=["status", "updated_at"])
+
+
+def release_agent_slot(session: Dict[str, Any]) -> None:
+    """Free the live agent and connect the next waiting patient."""
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    sid = str(session.get("session_id") or "").strip()
+    if not sid or session.get("agent_released"):
+        return
+    scope = _queue_scope(session)
+    cache = _session_cache()
+    was_active = bool(session.get("agent_claimed")) or str(
+        cache.get(_active_key(scope)) or ""
+    ) == sid
+    _dequeue(cache, scope, sid)
+    session["agent_released"] = True
+    session["conference_ended"] = True
+    session["agent_claimed"] = False
+    session["queue_state"] = "ended"
+    save_session(session)
+    if str(cache.get(_active_key(scope)) or "") == sid:
+        cache.delete(_active_key(scope))
+    if not session.get("callback_offer_started"):
+        set_transfer_call_status(session, "completed")
+    if was_active:
+        promote_next_waiting(scope)
+
+
+def promote_next_waiting(scope: str) -> None:
+    """Dial the live agent into the next patient's own conference."""
+    scope = (scope or "").strip()
+    if not scope:
+        return
+    cache = _session_cache()
+    lock = f"warm_transfer:admit:{scope}"
+    if not cache.add(lock, "promote", timeout=10):
+        return
+    chosen = None
+    try:
+        if _slot_busy(str(cache.get(_active_key(scope)) or "")):
+            return
+        rows = [str(item) for item in (cache.get(_queue_key(scope)) or [])]
+        remaining = []
+        for sid in rows:
+            session = load_session(sid)
+            if (
+                not session
+                or session.get("agent_released")
+                or session.get("conference_ended")
+                or not session.get("call_sid")
+            ):
+                continue
+            if chosen is None:
+                chosen = session
+                continue
+            remaining.append(sid)
+        cache.set(_queue_key(scope), remaining, timeout=_SESSION_TTL_SECONDS)
+        if chosen is None:
+            return
+        sid = str(chosen.get("session_id") or "")
+        cache.set(_active_key(scope), sid, timeout=_SESSION_TTL_SECONDS)
+        chosen["queue_state"] = "active"
+        chosen["agent_claimed"] = True
+        chosen["b_dialed"] = False
+        save_session(chosen)
+        wt_logger.info("AGENT_QUEUE_PROMOTE session=%s scope=%s", sid, scope)
+    finally:
+        cache.delete(lock)
+    if not chosen:
+        return
+    set_transfer_call_status(chosen, "in_progress")
+    announce_connecting(chosen)
+    start_coordinator_leg(chosen)
 
 
 def split_stereo_wav(audio: bytes) -> Tuple[bytes, bytes]:
@@ -495,6 +838,24 @@ def next_agent_twiml() -> str:
     )
 
 
+def hold_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('Please hold. A live agent is helping another caller. You are still in line.')}"
+        "</Response>"
+    )
+
+
+def connecting_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('Thank you for waiting. I am connecting you to a live agent now.')}"
+        "</Response>"
+    )
+
+
 def ask_callback_twiml(session: Dict[str, Any]) -> str:
     session_id = str((session or {}).get("session_id") or "")
     gather_url = escape(
@@ -549,6 +910,39 @@ def callback_unclear_twiml(session: Dict[str, Any]) -> str:
         f"{_say('We will follow up another day. Goodbye.')}"
         "<Hangup/>"
         "</Response>"
+    )
+
+
+def _announce_conference(session: Dict[str, Any], path: str, label: str) -> None:
+    session = dict(session or {})
+    conference_sid = str(session.get("conference_sid") or "").strip()
+    session_id = str(session.get("session_id") or "")
+    if not conference_sid or not session_id:
+        return
+    client = _twilio_client()
+    if client is None:
+        return
+    try:
+        client.conferences(conference_sid).update(
+            announce_url=_abs_url(path, session_id),
+            announce_method="POST",
+        )
+        logger.info(
+            "Announced %s session=%s conf=%s", label, session_id, conference_sid
+        )
+    except Exception:
+        logger.exception("Failed to announce %s session=%s", label, session_id)
+
+
+def announce_hold(session: Dict[str, Any]) -> None:
+    _announce_conference(
+        session, "/api/ai-call/twilio/warm-transfer/hold/", "hold"
+    )
+
+
+def announce_connecting(session: Dict[str, Any]) -> None:
+    _announce_conference(
+        session, "/api/ai-call/twilio/warm-transfer/connecting/", "connecting"
     )
 
 
@@ -753,6 +1147,8 @@ def offer_agent_unreachable_callback(session: Dict[str, Any]) -> bool:
     session["status"] = "agent_unreachable_ask_callback"
     session["callback_offer_started"] = True
     save_session(session)
+    # This patient is no longer with the agent. Let the next waiting caller through.
+    release_agent_slot(session)
 
     dialer_logger = logging.getLogger("ai_caller.dialer")
     dialer_logger.info(
@@ -1019,6 +1415,7 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
     # Conference over → live-agent talk ended; extend full-call duration.
     if event in {"end", "conference-end"}:
         extend_call_ended_at(session)
+        release_agent_slot(session)
         return
     if event == "join" and join_call:
         session = load_session(str(session.get("session_id") or "")) or session
@@ -1036,6 +1433,12 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
                 daemon=True,
             ).start()
         session = load_session(str(session.get("session_id") or "")) or session
+        if (
+            str(session.get("queue_state") or "") == "waiting"
+            and inbound_sid
+            and join_call == inbound_sid
+        ):
+            announce_hold(session)
     if event != "join" or session.get("spoke_now") or not conference_sid:
         return
     count = 0

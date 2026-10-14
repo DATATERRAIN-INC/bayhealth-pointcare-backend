@@ -78,6 +78,16 @@ urlpatterns = [
         name="twilio-warm-transfer-next-agent",
     ),
     path(
+        "twilio/warm-transfer/hold/",
+        twiml_views.warm_transfer_hold,
+        name="twilio-warm-transfer-hold",
+    ),
+    path(
+        "twilio/warm-transfer/connecting/",
+        twiml_views.warm_transfer_connecting,
+        name="twilio-warm-transfer-connecting",
+    ),
+    path(
         "twilio/warm-transfer/ask-callback/",
         twiml_views.warm_transfer_ask_callback,
         name="twilio-warm-transfer-ask-callback",
