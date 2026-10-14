@@ -106,6 +106,9 @@ ELIG_QUESTIONS: dict[str, str] = {
         "disabled on SSDI, was in foster care at 18, or none of the above?"
     ),
     "special_person": "Which household member does each selected condition apply to?",
+    "special_more": (
+        "Are there any other conditions to add? Please say Yes or No."
+    ),
     "babies_count": "How many babies are expected?",
     "due_date": "What is the due date?",
     "programs": (
@@ -122,6 +125,7 @@ YES_NO_ELIG_STEPS = frozenset(
         "relatives",
         "support",
         "child_more",
+        "special_more",
         "programs",
     }
 )
@@ -259,7 +263,15 @@ def _next_elig_step(session: LiveFormSession, answer: str) -> str:
     if step == "special":
         return "special_person"
     if step == "special_person":
-        return "babies_count" if "pregnant" in (answer or "").lower() else "programs"
+        return "special_more"
+    if step == "special_more":
+        if yes:
+            return "special"
+        return (
+            "babies_count"
+            if "pregnant" in (session.filled.get("special_conditions") or "").lower()
+            else "programs"
+        )
     if step == "babies_count":
         return "due_date"
     if step == "due_date":
@@ -1544,6 +1556,7 @@ async def describe_live_browser(
         CHROME_AGENT_DATA,
         CHROME_PROFILE_DIRECTORY,
         PORT,
+        PUBLIC_BASE_URL,
         chrome_profile_label,
     )
 
@@ -1568,7 +1581,11 @@ async def describe_live_browser(
     if not live_url:
         live_url = str((target or {}).get("url") or "")
     devtools = local_devtools_url(target) if target else ""
-    base = (open_base_url or "").rstrip("/") or f"http://127.0.0.1:{PORT}"
+    base = (
+        (open_base_url or "").rstrip("/")
+        or (PUBLIC_BASE_URL or "").rstrip("/")
+        or f"http://127.0.0.1:{PORT}"
+    )
     open_url = f"{base}/form-filler/sessions/{cid}/chrome" if cid else ""
 
     return {
@@ -2219,6 +2236,7 @@ async def submit_field(
                     "CHILD_MORE_CLARIFY:",
                     "SPECIAL_CLARIFY:",
                     "SPECIAL_PERSON_CLARIFY:",
+                    "SPECIAL_MORE_CLARIFY:",
                 )
             ):
                 clarify = err_text.split(":", 1)[1].strip()
@@ -2258,7 +2276,12 @@ async def submit_field(
                         # Never roll special_person / detail steps back to special.
                         and not (
                             session.elig_step
-                            in ("special_person", "babies_count", "due_date")
+                            in (
+                                "special_person",
+                                "special_more",
+                                "babies_count",
+                                "due_date",
+                            )
                             and recovered == "special"
                         )
                     ):
@@ -2318,7 +2341,13 @@ def _step_group(step: str) -> str:
         return "person_form"
     if step in ("income_when", "income_range"):
         return "income"
-    if step in ("special", "special_person", "babies_count", "due_date"):
+    if step in (
+        "special",
+        "special_person",
+        "special_more",
+        "babies_count",
+        "due_date",
+    ):
         return "special"
     return step
 
@@ -2463,13 +2492,49 @@ def _screen_first_step(screen: str, session: LiveFormSession) -> str:
             return "income_range"
         return "income_when"
     if screen == "special":
-        # Keep member-assignment / pregnancy detail once condition is selected.
-        if session.elig_step in ("special_person", "babies_count", "due_date"):
+        # Keep member-assignment / more-conditions / pregnancy detail once selected.
+        if session.elig_step in (
+            "special_person",
+            "special_more",
+            "babies_count",
+            "due_date",
+        ):
             return session.elig_step
         return "special"
     if screen in ELIG_QUESTIONS:
         return screen
     return session.elig_step
+
+
+def _spoken_question_for_step(session: LiveFormSession, step: str) -> str:
+    """Build the server-controlled spoken question, with one-time section intros."""
+    base = (ELIG_QUESTIONS.get(step) or "").strip()
+    if not base:
+        return "Could you say that again?"
+    if step == "spouse_first" and not session.filled.get("spouse_section_intro"):
+        session.filled["spouse_section_intro"] = "1"
+        return (
+            "Now, I'd like to ask a few questions about your spouse or partner. "
+            + base
+        )
+    if step == "child_first":
+        inst = _ensure_child_instance(session)
+        key = f"child_section_intro_{inst}"
+        if not session.filled.get(key):
+            session.filled[key] = "1"
+            if inst == "1":
+                return "Now, let's get a few details about the child. " + base
+            return "Now, let's get a few details about the next child. " + base
+    return base
+
+
+def _section_context_for_step(step: str) -> str:
+    """Brief section context for explain/repeat-without-advance requests."""
+    if step.startswith("spouse_"):
+        return "These questions are about your spouse or partner."
+    if step.startswith("child_"):
+        return "These questions are about the child we're adding."
+    return ""
 
 
 def _elig_ok(
@@ -2478,16 +2543,19 @@ def _elig_ok(
     answer: str,
     next_step: str,
     message: str,
+    *,
+    spoken_override: str | None = None,
 ) -> dict[str, Any]:
     session.elig_step = next_step
-    spoken = (
-        ELIG_QUESTIONS[next_step]
-        if next_step
-        else (
+    if spoken_override is not None:
+        spoken = spoken_override
+    elif next_step:
+        spoken = _spoken_question_for_step(session, next_step)
+    else:
+        spoken = (
             "I've finished filling your household eligibility form. "
             "Thank you for your time. Goodbye."
         )
-    )
     return {
         "ok": True,
         "call_id": call_id,
@@ -2926,15 +2994,80 @@ async def _visible_choice_labels(page: Page) -> list[str]:
     return out
 
 
-def _income_period_choice(spoken: str) -> str:
+def _normalize_income_period_text(spoken: str) -> str:
+    """Strip punctuation and collapse whitespace for income-period matching."""
     text = (spoken or "").strip().lower()
-    if re.search(r"\b(bi[-\s]?week|every two weeks?|two weeks?|fortnight)\b", text):
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _income_period_choice(spoken: str) -> str:
+    """Map spoken income period onto the canonical Pointcare tab label.
+
+    Important: do not use ``\\bbi[\\-\\s]?week\\b`` — that fails on \"bi-weekly\"
+    because there is no word boundary between \"week\" and \"ly\".
+    """
+    text = _normalize_income_period_text(spoken)
+    if not text:
+        return spoken
+    compact = re.sub(r"[\s\-]+", "", text)
+    # bi-weekly / biweekly / bi weekly / every two weeks / STT by|buy weekly
+    if (
+        "biweekly" in compact
+        or "biweek" == compact
+        or compact in {"byweekly", "buyweekly", "byweek", "buyweek"}
+        or re.search(
+            r"\b(?:bi\s*week(?:ly|s)?|by\s*week(?:ly)?|buy\s*week(?:ly)?|"
+            r"every\s*(?:two|2)\s*weeks?|(?:once\s+)?(?:every\s+)?two\s*weeks?|"
+            r"fortnight(?:ly)?)\b",
+            text,
+        )
+    ):
         return "Bi-weekly"
     if re.search(r"\bmonth", text):
         return "Monthly"
     if re.search(r"\b(year|annual)", text):
         return "Annual"
     return spoken
+
+
+def _looks_like_income_period_label(label: str) -> bool:
+    """True for a single income-period chip — not concatenated tab strips."""
+    low = re.sub(r"\s+", " ", (label or "").strip().lower())
+    if not low or len(low) > 24:
+        return False
+    if low in {"annual", "monthly", "bi-weekly", "biweekly", "every two weeks"}:
+        return True
+    return bool(
+        re.fullmatch(
+            r"(annual|monthly|bi[\s\-]*week(?:ly)?|every\s*(?:two|2)\s*weeks?)",
+            low,
+        )
+    )
+
+
+def _resolve_income_period_label(
+    spoken: str, labels: list[str] | None = None
+) -> str:
+    """Map spoken period onto an exact visible Pointcare option (no first-option fallback)."""
+    period = _income_period_choice(spoken)
+    if period not in {"Annual", "Monthly", "Bi-weekly"}:
+        return ""
+    pool = [item for item in (labels or []) if (item or "").strip()]
+    if not pool:
+        return period
+    # Prefer an exact visible label that resolves to the same period.
+    for label in pool:
+        if not _looks_like_income_period_label(label):
+            continue
+        if _income_period_choice(label) == period or label.lower().strip() == period.lower():
+            return label
+    period_like = [label for label in pool if _looks_like_income_period_label(label)]
+    # Period chips are visible but none matched the spoken answer — clarify, don't guess.
+    if period_like:
+        return ""
+    # Unrelated labels on screen (e.g. marital) — do not force an income period.
+    return ""
 
 
 _NUMBER_WORDS = {
@@ -3349,13 +3482,9 @@ def _fuzzy_choice_label(spoken: str, labels: list[str]) -> str:
     """Map ASR / spoken text onto a visible Pointcare button label."""
     labels = _choice_labels_for_matching(labels)
     # Income period tabs before generic phrase mapping.
-    period = _income_period_choice(spoken)
-    if period in {"Annual", "Monthly", "Bi-weekly"}:
-        for label in labels:
-            if label.lower() == period.lower():
-                return label
-        if any(label.lower() in {"annual", "monthly", "bi-weekly"} for label in labels):
-            return period
+    period_label = _resolve_income_period_label(spoken, labels)
+    if period_label:
+        return period_label
     # Income dollar ranges only — never treat age chips as income bands.
     if _labels_look_like_income(labels) or (
         not _labels_look_like_age(labels)
@@ -3827,6 +3956,128 @@ def _special_condition_negated(text: str, cue: str) -> bool:
     ):
         return True
     return False
+
+
+def _short_special_condition_label(label: str) -> str:
+    """Spoken-friendly short form of a Pointcare special-condition chip."""
+    text = (label or "").strip()
+    text = re.sub(
+        r"^someone\s+(is|has|was)\s+",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\s*\(ssdi\)\s*", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text or (label or "").strip()
+
+
+def _record_special_assignment_pairs(
+    session: LiveFormSession, conditions: list[str], members: list[str]
+) -> None:
+    """Remember verified condition→member assignments for confirmation speech."""
+    conds = [c.strip() for c in conditions if (c or "").strip()]
+    mems = [m.strip() for m in members if (m or "").strip()]
+    if not conds or not mems:
+        return
+    existing = session.filled.get("special_assignment_pairs", "")
+    chunks = [c for c in existing.split("||") if c.strip()]
+    by_cond = {}
+    for chunk in chunks:
+        if ">>>" not in chunk:
+            continue
+        cond, mem_part = chunk.split(">>>", 1)
+        by_cond[cond] = [m for m in mem_part.split("&") if m]
+    for cond in conds:
+        prior = by_cond.get(cond, [])
+        for mem in mems:
+            if mem not in prior:
+                prior.append(mem)
+        by_cond[cond] = prior
+    session.filled["special_assignment_pairs"] = "||".join(
+        f"{cond}>>>{'&'.join(mems)}" for cond, mems in by_cond.items()
+    )
+
+
+def _special_more_confirm_speech(session: LiveFormSession) -> str:
+    """Confirm verified condition/member selections, then ask about more conditions."""
+    pairs_raw = session.filled.get("special_assignment_pairs", "")
+    parts: list[str] = []
+    if pairs_raw:
+        for chunk in pairs_raw.split("||"):
+            if ">>>" not in chunk:
+                continue
+            cond, mem_part = chunk.split(">>>", 1)
+            short = _short_special_condition_label(cond)
+            members = " and ".join(m for m in mem_part.split("&") if m)
+            if short and members:
+                parts.append(f"{short} selected for {members}")
+            elif short:
+                parts.append(f"{short} selected")
+    if not parts:
+        conds = [
+            _short_special_condition_label(c.strip())
+            for c in (session.filled.get("special_conditions") or "").split(",")
+            if c.strip()
+        ]
+        members = [
+            m
+            for m in (session.filled.get("special_person_assigned") or "").split("|")
+            if m
+        ]
+        cond_text = " and ".join(conds) if conds else "the selected condition"
+        if members:
+            parts.append(f"{cond_text} selected for {' and '.join(members)}")
+        else:
+            parts.append(f"{cond_text} selected")
+    if len(parts) == 1:
+        body = f"I have {parts[0]}."
+    else:
+        body = "I have " + "; ".join(parts) + "."
+    return body + " Are there any other conditions to add? Please say Yes or No."
+
+
+async def _verify_special_selections_before_next(
+    page: Page, session: LiveFormSession
+) -> None:
+    """Ensure remembered conditions (and members when visible) are still selected."""
+    conditions = [
+        c.strip()
+        for c in (session.filled.get("special_conditions") or "").split(",")
+        if c.strip()
+        and not re.search(r"none of the above", c, re.I)
+    ]
+    for cond in conditions:
+        state = await _special_condition_checkbox_state(page, cond)
+        if state.get("found") and not state.get("checked"):
+            raise RuntimeError(
+                "SPECIAL_MORE_CLARIFY: I no longer see "
+                f"{_short_special_condition_label(cond)} selected. "
+                "Please say the condition again."
+            )
+    assigned = [
+        m
+        for m in (session.filled.get("special_person_assigned") or "").split("|")
+        if m
+    ]
+    if not assigned:
+        return
+    discovered = await _discover_special_person_members(page)
+    members = list(discovered.get("members") or [])
+    if not members:
+        # Apply-to list may collapse after assignment; conditions already verified.
+        return
+    by_norm = {
+        _normalize_member_label(str(m.get("label") or "")): m for m in members
+    }
+    for name in assigned:
+        row = by_norm.get(_normalize_member_label(name))
+        if row is not None and not row.get("checked"):
+            raise RuntimeError(
+                "SPECIAL_MORE_CLARIFY: I no longer see "
+                f"{name} selected for the condition. "
+                "Please say the household member again."
+            )
 
 
 def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
@@ -5136,6 +5387,7 @@ async def _submit_eligibility_answer(
 
     _mark(call_id, "browser_action", started)
     lowered = answer.lower()
+    spoken_override: str | None = None
 
     if step == "marital":
         await _click_exact_choice(page, answer)
@@ -5464,8 +5716,50 @@ async def _submit_eligibility_answer(
         await _click_continue_to(page, (target_screen,))
         next_step = target
     elif step == "income_when":
-        period = _income_period_choice(answer)
+        labels = await _visible_choice_labels(page)
+        period = _resolve_income_period_label(answer, labels)
+        if not period:
+            # Labels may still be loading — allow canonical when spoken maps cleanly.
+            canonical = _income_period_choice(answer)
+            if canonical in {"Annual", "Monthly", "Bi-weekly"} and not any(
+                _looks_like_income_period_label(item) for item in labels
+            ):
+                period = canonical
+            else:
+                shown = ", ".join(
+                    item
+                    for item in labels
+                    if _looks_like_income_period_label(item)
+                ) or "Annual, Monthly, or Bi-weekly"
+                raise RuntimeError(
+                    "INCOME_CLARIFY: Please say which income period you know best. "
+                    f"Options include: {shown}."
+                )
+        before_sig = await _choice_signature(page, period)
+        before_ranges = _income_range_labels(labels)
         await _click_exact_choice(page, period)
+        verified = False
+        for _ in range(24):
+            await page.wait_for_timeout(125)
+            after_sig = await _choice_signature(page, period)
+            if after_sig != before_sig and after_sig not in ("", "__missing__"):
+                verified = True
+                break
+            after_labels = await _visible_choice_labels(page)
+            after_ranges = _income_range_labels(after_labels)
+            # Selecting a period refreshes the dollar-range chips.
+            if after_ranges and after_ranges != before_ranges:
+                verified = True
+                break
+            if await _income_period_selected(page, period):
+                verified = True
+                break
+        if not verified:
+            raise RuntimeError(
+                "INCOME_CLARIFY: I couldn't confirm that income period. "
+                "Please say Annual, Monthly, or Bi-weekly."
+            )
+        session.filled["income_when"] = period
         session.elig_step = "income_range"
         next_step = "income_range"
     elif step == "income_range":
@@ -5531,7 +5825,18 @@ async def _submit_eligibility_answer(
                 call_id=call_id,
                 multi=len(selected) > 1,
             )
-        session.filled["special_conditions"] = ", ".join(selected)
+        # Preserve prior selections when adding more conditions after special_more.
+        prior = [
+            item.strip()
+            for item in (session.filled.get("special_conditions") or "").split(",")
+            if item.strip()
+        ]
+        merged = list(prior)
+        for label in selected:
+            if label not in merged:
+                merged.append(label)
+        session.filled["special_conditions"] = ", ".join(merged)
+        session.filled["special_active_conditions"] = "|".join(selected)
         none_selected = len(selected) == 1 and re.search(
             r"none of the above", selected[0], re.I
         )
@@ -5559,17 +5864,54 @@ async def _submit_eligibility_answer(
             )
             next_step = "special_person"
     elif step == "special_person":
+        before_assigned = [
+            item
+            for item in (session.filled.get("special_person_assigned") or "").split("|")
+            if item
+        ]
         await _assign_special_person_member(page, answer, session)
-        if "pregnant" in session.filled.get("special_conditions", "").lower():
-            try:
-                await _click_cta(page, "Add details", attempts=2)
-            except Exception:
-                pass
-            next_step = "babies_count"
+        after_assigned = [
+            item
+            for item in (session.filled.get("special_person_assigned") or "").split("|")
+            if item
+        ]
+        newly = [item for item in after_assigned if item not in before_assigned]
+        if not newly:
+            newly = after_assigned
+        active = [
+            item
+            for item in (session.filled.get("special_active_conditions") or "").split("|")
+            if item
+        ]
+        if not active:
+            active = [
+                item.strip()
+                for item in (session.filled.get("special_conditions") or "").split(",")
+                if item.strip()
+            ]
+        _record_special_assignment_pairs(session, active, newly)
+        spoken_override = _special_more_confirm_speech(session)
+        next_step = "special_more"
+    elif step == "special_more":
+        if _is_yes(answer):
+            next_step = "special"
+        elif _is_no(answer):
+            await _verify_special_selections_before_next(page, session)
+            if "pregnant" in (session.filled.get("special_conditions") or "").lower():
+                try:
+                    await _click_cta(page, "Add details", attempts=2)
+                except Exception:
+                    pass
+                next_step = "babies_count"
+            else:
+                await _click_cta(page, "Next", attempts=3)
+                await _wait_for_screen(page, ("programs",))
+                next_step = "programs"
         else:
-            await _click_cta(page, "Next", attempts=3)
-            await _wait_for_screen(page, ("programs",))
-            next_step = "programs"
+            raise RuntimeError(
+                "SPECIAL_MORE_CLARIFY: "
+                + _special_more_confirm_speech(session)
+            )
     elif step == "babies_count":
         await _strict_fill(page, "Number of babies", answer)
         next_step = "due_date"
@@ -5605,6 +5947,7 @@ async def _submit_eligibility_answer(
         answer,
         next_step,
         f"Applied and verified eligibility step {step}.",
+        spoken_override=spoken_override,
     )
     _mark(call_id, "next_question", started)
     _mark(call_id, "tool_response", started)
@@ -6233,6 +6576,40 @@ async def _choice_appears_selected(page: Page, value: str) -> bool:
                     if (/selected|checked|active|pressed/.test(cls)) return true;
                     const input = el.control || (el.querySelector && el.querySelector('input[type=checkbox]'));
                     if (input && input.checked) return true;
+                  }
+                  return false;
+                }""",
+                phrase,
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _income_period_selected(page: Page, period: str) -> bool:
+    """True when the income-period tab looks selected (aria/class/pressed)."""
+    phrase = (period or "").strip()
+    if not phrase:
+        return False
+    try:
+        return bool(
+            await page.evaluate(
+                """(phrase) => {
+                  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const want = norm(phrase);
+                  const nodes = [...document.querySelectorAll(
+                    'button, [role=button], [role=radio], [role=tab], [role=option]'
+                  )];
+                  const el = nodes.find((node) => norm(node.innerText) === want);
+                  if (!el) return false;
+                  const aria = (el.getAttribute('aria-checked')
+                    || el.getAttribute('aria-pressed')
+                    || el.getAttribute('aria-selected')
+                    || '').toLowerCase();
+                  if (aria === 'true') return true;
+                  const cls = (el.className || '').toLowerCase();
+                  if (/\\b(selected|active|checked|pressed|is-selected)\\b/.test(cls)) {
+                    return true;
                   }
                   return false;
                 }""",

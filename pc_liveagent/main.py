@@ -84,13 +84,28 @@ def home():
 
 
 def _request_base_url(request: Request) -> str:
-    """Public base for clickable open_url links (dev tunnel or localhost)."""
+    """Public base for clickable open_url / chrome_url links.
+
+    Prefer ``PUBLIC_BASE_URL`` (production HTTPS origin) so links stay on the
+    FastAPI/nginx path even when Host headers vary. Fall back to forwarded
+    host when running behind a tunnel or local proxy.
+    """
+    configured = (getattr(config, "PUBLIC_BASE_URL", None) or "").strip().rstrip("/")
+    if configured:
+        return configured
     # Prefer forwarded host when running behind a tunnel / proxy.
     proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
     host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
     if host:
         return f"{proto}://{host}"
     return str(request.base_url).rstrip("/")
+
+
+def _chrome_session_url(base: str, call_id: str) -> str:
+    cid = (call_id or "").strip()
+    if not cid:
+        return ""
+    return f"{base.rstrip('/')}/form-filler/sessions/{cid}/chrome"
 
 
 @app.post("/form-filler/outbound/")
@@ -114,26 +129,44 @@ async def form_filler_outbound(
     call_id = str(result.get("call_id") or "")
     form_url = (payload.form_url or "").strip() or config.POINTCARE_URL
     base = _request_base_url(request)
+    chrome_link = _chrome_session_url(base, call_id)
     # Open Chrome and auto-click the welcome pages before/while the call connects.
     if call_id and form_url:
         try:
             started = await on_call_started(call_id, form_url)
-            browser = dict(started.get("browser") or {})
-            # Rebuild open_url against this request host so Postman can click it.
+            # Rebuild open_url against the public base so Postman/ops can click it.
             live = await get_session(call_id)
             browser = await describe_live_browser(
                 live, call_id=call_id, open_base_url=base
             )
+            # Never claim success when the browser snapshot says otherwise.
+            if not browser.get("opened"):
+                browser["opened"] = False
+                browser["error"] = (
+                    browser.get("error")
+                    or (started.get("error") if isinstance(started, dict) else "")
+                    or "Browser session did not open."
+                )
             result["browser"] = browser
-            result["chrome_url"] = browser.get("open_url") or browser.get("url") or ""
+            result["chrome_url"] = browser.get("open_url") or chrome_link
         except Exception as exc:
             logger.exception("Failed to open Pointcare for call_id=%s", call_id)
+            # Safe public error — no filesystem paths or secrets.
+            safe = "Browser startup failed. Check server logs for details."
+            err_text = str(exc)
+            if "Chrome was not found" in err_text or "CHROME_EXECUTABLE" in err_text:
+                safe = (
+                    "Google Chrome was not found on this host. "
+                    "Install google-chrome-stable or set CHROME_EXECUTABLE."
+                )
+            elif "remote debugging" in err_text.lower():
+                safe = "Chrome started but remote debugging did not become ready."
             result["browser"] = {
                 "opened": False,
-                "error": str(exc),
-                "open_url": f"{base}/form-filler/sessions/{call_id}/chrome" if call_id else "",
+                "error": safe,
+                "open_url": chrome_link,
             }
-            result["chrome_url"] = result["browser"].get("open_url") or ""
+            result["chrome_url"] = chrome_link
             background_tasks.add_task(on_call_started, call_id, form_url)
     return result
 
@@ -170,10 +203,25 @@ async def form_filler_welcome(
 async def form_filler_session(call_id: str, request: Request):
     session = await get_session(call_id)
     if session is None:
-        raise HTTPException(status_code=404, detail="No live session for that call_id")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "session_not_found",
+                "message": "No live Pointcare Live Agent session for that call_id.",
+                "service": "pointcare-liveagent",
+                "call_id": call_id,
+            },
+        )
+    base = _request_base_url(request)
     browser = await describe_live_browser(
-        session, call_id=call_id, open_base_url=_request_base_url(request)
+        session, call_id=call_id, open_base_url=base
     )
+    # Strip internal filesystem paths from the public API payload.
+    public_browser = {
+        k: v
+        for k, v in browser.items()
+        if k not in ("chrome_user_data", "cdp_url")
+    }
     return {
         "call_id": session.call_id,
         "url": browser.get("url") or session.url,
@@ -185,35 +233,58 @@ async def form_filler_session(call_id: str, request: Request):
         "ready": session.ready.is_set(),
         "signed_in": session.signed_in,
         "eligibility_step": session.elig_step,
-        "browser": browser,
-        "chrome_url": browser.get("open_url") or browser.get("url") or "",
+        "browser": public_browser,
+        "chrome_url": browser.get("open_url") or _chrome_session_url(base, call_id),
+        "service": "pointcare-liveagent",
     }
 
 
 @app.get("/form-filler/sessions/{call_id}/chrome", response_class=HTMLResponse)
 async def form_filler_open_chrome(call_id: str, request: Request):
-    """Clickable page: focus agent Chrome and show live URL + DevTools link."""
+    """Clickable page: focus agent Chrome and show live URL + DevTools link.
+
+    Distinctive HTML so operators can tell FastAPI handled the request
+    (vs a Django/nginx catch-all 404).
+    """
     session = await get_session(call_id)
     if session is None:
-        raise HTTPException(status_code=404, detail="No live session for that call_id")
+        # Distinctive HTML 404 — if the public URL shows Django's page instead,
+        # Nginx is routing /form-filler/ to Django (8000), not FastAPI (8001).
+        return HTMLResponse(
+            status_code=404,
+            content=f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Session not found</title></head>
+<body style="font-family:system-ui;max-width:40rem;margin:2rem auto;padding:0 1rem">
+  <h1>Pointcare Live Agent — session not found</h1>
+  <p>No active browser session for call <code>{call_id}</code>.</p>
+  <p>This response is from <strong>pointcare-liveagent</strong> (FastAPI).
+     If you instead see a Django 404 page at this URL, Nginx is not proxying
+     <code>/form-filler/</code> to the live-agent service on port 8001.</p>
+</body>
+</html>""",
+        )
+    opened = False
     if session.page is not None:
         try:
             await session.page.bring_to_front()
+            opened = True
         except Exception:
             logger.exception("bring_to_front failed call_id=%s", call_id)
     browser = await describe_live_browser(
         session, call_id=call_id, open_base_url=_request_base_url(request)
     )
     live = browser.get("url") or session.url or ""
+    # DevTools is localhost-only; useful on the EC2 host, not via public HTTPS.
     devtools = browser.get("devtools_url") or ""
     profile = browser.get("chrome_profile") or ""
-    user_data = browser.get("chrome_user_data") or ""
     step = session.elig_step or ""
+    status = "running" if (opened or browser.get("opened")) else "session present (browser not attached)"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Agent Chrome — {call_id}</title>
+  <title>Pointcare Live Agent — {call_id}</title>
   <meta http-equiv="refresh" content="5">
   <style>
     body {{ font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }}
@@ -225,18 +296,18 @@ async def form_filler_open_chrome(call_id: str, request: Request):
   </style>
 </head>
 <body>
-  <h1>Agent Chrome is running</h1>
+  <h1>Pointcare Live Agent — Chrome session</h1>
+  <p class="meta">service <code>pointcare-liveagent</code> · status <code>{status}</code></p>
   <p class="meta">Call <code>{call_id}</code> · profile <code>{profile}</code>
      · step <code>{step or "-"}</code></p>
   <p>Live tab URL:</p>
   <p><a href="{live}">{live or "(unavailable)"}</a></p>
   <p>
     <a class="btn" href="{live or "#"}" target="_blank" rel="noreferrer">Open live URL</a>
-    <a class="btn secondary" href="{devtools or "#"}" target="_blank" rel="noreferrer">Open Chrome DevTools</a>
+    <a class="btn secondary" href="{devtools or "#"}" target="_blank" rel="noreferrer">Open Chrome DevTools (localhost)</a>
   </p>
-  <p class="meta">The automation window was brought to the front on this machine.
-     DevTools shows the same agent Chrome tab (CDP port {browser.get("cdp_port")}).</p>
-  <p class="meta">User data: <code>{user_data}</code></p>
+  <p class="meta">On the application host, the automation window was brought to the front when possible.
+     DevTools only works from that host (CDP is bound to 127.0.0.1).</p>
   <p class="meta">This page refreshes every 5s so the URL stays current.</p>
 </body>
 </html>
