@@ -359,7 +359,7 @@ def create_patient_from_row(row, *, source, upload=None, upload_file_key="", use
             "first_name": first_name,
             "last_name": last_name,
             "address": address,
-            "dob": parsed_dob.isoformat() if parsed_dob else "",
+            "dob": parsed_dob.isoformat() if parsed_dob else None,
             "doctor": row.get("doctor", ""),
             "service_name": row.get("service_name") or row.get("service") or "",
             "country_code": country_code,
@@ -508,12 +508,18 @@ MINOR_AGE_YEARS = 18
 
 
 def _patient_age(dob):
+    if not dob:
+        return None
     today = date.today()
     return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
 
 def _is_minor(dob):
-    return _patient_age(dob) < MINOR_AGE_YEARS
+    # Missing DOB → treat as adult (care call), not guardian flow.
+    age = _patient_age(dob)
+    if age is None:
+        return False
+    return age < MINOR_AGE_YEARS
 
 
 def _combine_phone(country_code, phone_number):
