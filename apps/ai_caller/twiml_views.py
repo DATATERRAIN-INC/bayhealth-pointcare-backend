@@ -15,6 +15,7 @@ from apps.ai_caller.twilio_bridge import (
     callback_scheduled_twiml,
     callback_unclear_twiml,
     admit_patient_to_agent,
+    agent_join_allowed,
     conference_wait_twiml,
     connect_twiml,
     connecting_twiml,
@@ -25,7 +26,6 @@ from apps.ai_caller.twilio_bridge import (
     inbound_connect_twiml,
     is_affirmative,
     is_negative,
-    load_pending_session,
     load_session,
     maybe_failover_on_agent_status,
     next_agent_twiml,
@@ -49,18 +49,11 @@ def _xml(body: str) -> HttpResponse:
 
 
 def _session(request):
+    """Load the session named on this webhook. Never the latest pending one."""
     session_id = (
         request.GET.get("session_id") or request.POST.get("session_id") or ""
     ).strip()
     session = load_session(session_id) if session_id else {}
-    if not session:
-        session = load_pending_session()
-    call_sid = (request.POST.get("CallSid") or "").strip()
-    if session and call_sid and not session.get("call_sid"):
-        session["call_sid"] = call_sid
-        save_session(session)
-        # Persist Twilio CA... Call SID on Call.warm_transfer_session_id.
-        _sync_call_twilio_ids(session)
     return session
 
 
@@ -153,17 +146,25 @@ def warm_transfer_gather(request):
 @csrf_exempt
 @require_POST
 def warm_transfer_join(request):
+    """Live agent enters only the active patient's conference."""
     session = _session(request)
-    if not session:
+    call_sid = (request.POST.get("CallSid") or "").strip()
+    if not agent_join_allowed(session, call_sid):
+        logger.warning(
+            "Rejected agent join session=%s call=%s state=%s",
+            (session or {}).get("session_id"),
+            call_sid or "-",
+            (session or {}).get("queue_state"),
+        )
         return _xml(
             '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
         )
-    if request.POST.get("CallSid"):
-        session["dial_call_sid"] = request.POST.get("CallSid")
+    if call_sid:
+        session["dial_call_sid"] = call_sid
         save_session(session)
         start_leg_recording(
             session,
-            str(session.get("dial_call_sid") or ""),
+            call_sid,
             str(session.get("dial_speaker") or "provider"),
         )
     return _xml(participant_join_twiml(session))
@@ -277,12 +278,16 @@ def warm_transfer_dial_status(request):
     session = _session(request)
     if session:
         session["dial_status"] = status
-        dial_sid = (request.POST.get("DialCallSid") or "").strip()
-        if dial_sid:
-            session["dial_call_sid"] = dial_sid
+        dial_sid = (request.POST.get("DialCallSid") or request.POST.get("CallSid") or "").strip()
+        current_dial = str(session.get("dial_call_sid") or "")
+        # A backup agent's old call must not replace the agent now in this conference.
+        if dial_sid and current_dial and dial_sid != current_dial:
+            return _xml(
+                '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+            )
         save_session(session)
         if maybe_failover_on_agent_status(
-            session, call_status=status, call_sid=dial_sid
+            session, call_status=status, call_sid=dial_sid or current_dial
         ):
             # Keep patient on the line; next agent is being dialed.
             return _xml(
@@ -317,8 +322,12 @@ def warm_transfer_status(request):
     call_sid = (request.POST.get("CallSid") or "").strip()
     if session:
         session["call_status"] = call_status
-        if call_sid and not session.get("call_sid"):
+        patient_sid = str(session.get("call_sid") or "")
+        dial_sid = str(session.get("dial_call_sid") or "")
+        # The agent leg must not be stored as the patient's call.
+        if call_sid and not patient_sid and call_sid != dial_sid:
             session["call_sid"] = call_sid
+            patient_sid = call_sid
         save_session(session)
         maybe_failover_on_agent_status(
             session, call_status=call_status, call_sid=call_sid
@@ -329,7 +338,10 @@ def warm_transfer_status(request):
             from apps.ai_caller.twilio_bridge import extend_call_ended_at
 
             patient_sid = str(session.get("call_sid") or "")
-            if not call_sid or call_sid == patient_sid:
+            dial_sid = str(session.get("dial_call_sid") or "")
+            # Only the patient leaving ends this conference. An agent hangup
+            # must not pull the next waiting patient into this room.
+            if patient_sid and call_sid == patient_sid and call_sid != dial_sid:
                 extend_call_ended_at(session)
                 release_agent_slot(session)
     return HttpResponse("ok")

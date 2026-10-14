@@ -37,6 +37,7 @@ wt_logger = logging.getLogger("ai_caller.warm_transfer")
 _SESSION_TTL_SECONDS = 60 * 60 * 24
 _PENDING_CACHE_KEY = "warm_transfer:pending"
 _OPEN_SESSIONS_KEY = "warm_transfer:open_sessions"
+_ORIGINAL_VOICE_KEY = "warm_transfer:original_voice_url"
 
 _POLL_INTERVAL_SECONDS = 5
 _YES_RE = re.compile(
@@ -432,6 +433,7 @@ def release_agent_slot(session: Dict[str, Any]) -> None:
         set_transfer_call_status(session, "completed")
     if was_active:
         promote_next_waiting(scope)
+    restore_inbound_voice_url(session)
 
 
 def promote_next_waiting(scope: str) -> None:
@@ -688,6 +690,20 @@ def _twilio_client():
     return Client(sid, token)
 
 
+def _hangup_call(call_sid: str) -> None:
+    """End one Twilio call so it cannot enter a conference it no longer belongs to."""
+    call_sid = (call_sid or "").strip()
+    if not call_sid:
+        return
+    client = _twilio_client()
+    if client is None:
+        return
+    try:
+        client.calls(call_sid).update(status="completed")
+    except Exception:
+        logger.exception("Failed to hang up call %s", call_sid)
+
+
 def _abs_url(path: str, session_id: str, **extra: str) -> str:
     base = _backend_base()
     params = {"session_id": session_id, **{k: v for k, v in extra.items() if v}}
@@ -736,7 +752,29 @@ def declined_twiml() -> str:
 
 
 def conference_name(session_id: str) -> str:
-    return f"care-wt-{session_id}"[:40]
+    """One conference per patient session. Names are never shared."""
+    safe = re.sub(r"[^A-Za-z0-9]", "", (session_id or "").strip())[:32]
+    return f"care-wt-{safe}"[:40]
+
+
+def agent_join_allowed(session: Dict[str, Any], call_sid: str = "") -> bool:
+    """Only the agent dialed for the active patient may enter that conference."""
+    if not session:
+        return False
+    if session.get("conference_ended") or session.get("agent_released"):
+        return False
+    if str(session.get("queue_state") or "") != "active" or not session.get("agent_claimed"):
+        return False
+    allowed = str(session.get("dial_call_sid") or "").strip()
+    call_sid = (call_sid or "").strip()
+    if allowed and call_sid and call_sid != allowed:
+        return False
+    return True
+
+
+def shared_inbound_url() -> str:
+    """One webhook for every transfer. The caller is matched to their own session."""
+    return f"{_backend_base()}/api/ai-call/twilio/warm-transfer/inbound/"
 
 
 def _ring_url() -> str:
@@ -1082,6 +1120,10 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
     session["transfer_number_index"] = next_idx
     session["transfer_number"] = nxt
     session["live_agent_number"] = nxt
+    # Drop the agent who did not answer so they cannot join this conference late
+    # and end up in the room with the next agent.
+    old_dial = str(session.get("dial_call_sid") or "").strip()
+    _hangup_call(old_dial)
     session["b_dialed"] = False
     session["dial_call_sid"] = ""
     session["provider_recording_started"] = False
@@ -2192,8 +2234,20 @@ def _incoming_number(client, phone: str):
 
 
 def restore_inbound_voice_url(session: Dict[str, Any]) -> None:
+    """Put the Twilio number back only after every transfer has finished.
+
+    Restoring earlier points the next patient at another patient's webhook.
+    """
     session = dict(session or {})
     if session.get("voice_url_restored"):
+        return
+    this_id = str(session.get("session_id") or "").strip()
+    for other in _open_sessions():
+        other_id = str(other.get("session_id") or "")
+        if other_id == this_id:
+            continue
+        if other.get("conference_ended") or other.get("agent_released"):
+            continue
         return
     sid = str(session.get("incoming_sid") or "").strip()
     if not sid:
@@ -2201,8 +2255,19 @@ def restore_inbound_voice_url(session: Dict[str, Any]) -> None:
     client = _twilio_client()
     if client is None:
         return
-    previous = session.get("previous_voice_url")
-    method = session.get("previous_voice_method") or "POST"
+    original = {}
+    try:
+        original = _session_cache().get(_ORIGINAL_VOICE_KEY) or {}
+    except Exception:
+        original = {}
+    if not isinstance(original, dict):
+        original = {}
+    previous = original.get("voice_url")
+    if previous is None:
+        previous = session.get("previous_voice_url")
+    if isinstance(previous, str) and "/warm-transfer/inbound" in previous:
+        previous = ""
+    method = original.get("voice_method") or session.get("previous_voice_method") or "POST"
     try:
         kwargs: Dict[str, Any] = {"voice_method": method}
         if previous is not None:
@@ -2276,18 +2341,36 @@ def prepare_retell_bridge(
         }
 
     session_id = uuid.uuid4().hex[:16]
-    inbound_url = _abs_url("/api/ai-call/twilio/warm-transfer/inbound/", session_id)
-    previous_url = getattr(incoming, "voice_url", None) or ""
-    previous_method = getattr(incoming, "voice_method", None) or "POST"
+    inbound_url = shared_inbound_url()
+    current_url = getattr(incoming, "voice_url", None) or ""
+    current_method = getattr(incoming, "voice_method", None) or "POST"
+    original = {}
     try:
-        incoming.update(voice_url=inbound_url, voice_method="POST")
-    except Exception as exc:
-        logger.exception("Failed to point Twilio number at warm-transfer inbound")
-        return {
-            "ok": False,
-            "error": f"Failed to prepare Twilio recorder: {exc}",
-            "status_code": 502,
-        }
+        original = _session_cache().get(_ORIGINAL_VOICE_KEY) or {}
+    except Exception:
+        original = {}
+    if not isinstance(original, dict):
+        original = {}
+    if not str(current_url).startswith(inbound_url):
+        if not original:
+            original = {"voice_url": current_url, "voice_method": current_method}
+            try:
+                _session_cache().set(
+                    _ORIGINAL_VOICE_KEY, original, timeout=_SESSION_TTL_SECONDS
+                )
+            except Exception:
+                logger.exception("Failed to remember original Twilio voice URL")
+        try:
+            incoming.update(voice_url=inbound_url, voice_method="POST")
+        except Exception as exc:
+            logger.exception("Failed to point Twilio number at warm-transfer inbound")
+            return {
+                "ok": False,
+                "error": f"Failed to prepare Twilio recorder: {exc}",
+                "status_code": 502,
+            }
+    previous_url = original.get("voice_url", current_url)
+    previous_method = original.get("voice_method", current_method)
 
     numbers = [
         str(n).strip()

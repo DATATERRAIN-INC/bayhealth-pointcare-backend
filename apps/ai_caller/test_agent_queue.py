@@ -125,3 +125,42 @@ class AgentQueueTests(unittest.TestCase):
             [first["session_id"], second["session_id"], third["session_id"]],
             ["a", "b", "c"],
         )
+
+    def test_each_patient_has_a_different_conference(self):
+        from apps.ai_caller.twilio_bridge import (
+            conference_name,
+            join_conference_twiml,
+            load_session,
+        )
+
+        a = self._session("aaaa1111aaaa1111", "+15551110001")
+        b = self._session("bbbb2222bbbb2222", "+15551110002")
+        c = self._session("cccc3333cccc3333", "+15551110003")
+        names = {
+            conference_name(a["session_id"]),
+            conference_name(b["session_id"]),
+            conference_name(c["session_id"]),
+        }
+        self.assertEqual(len(names), 3)
+        admit_patient_to_agent(a)
+        admit_patient_to_agent(b)
+        active_room = join_conference_twiml(load_session("aaaa1111aaaa1111"), is_host=True)
+        waiting_room = join_conference_twiml(load_session("bbbb2222bbbb2222"), is_host=True)
+        self.assertIn(conference_name(a["session_id"]), active_room)
+        self.assertIn(conference_name(b["session_id"]), waiting_room)
+        self.assertNotIn(conference_name(a["session_id"]), waiting_room)
+
+    def test_backup_agent_cannot_join_a_waiting_patient(self):
+        from apps.ai_caller.twilio_bridge import agent_join_allowed, load_session
+
+        a = self._session("a", "+15551110001")
+        b = self._session("b", "+15551110002")
+        admit_patient_to_agent(a)
+        admit_patient_to_agent(b)
+        a = load_session("a")
+        b = load_session("b")
+        a["dial_call_sid"] = "CAagent1"
+        save_session(a)
+        self.assertTrue(agent_join_allowed(a, "CAagent1"))
+        self.assertFalse(agent_join_allowed(a, "CAagent2"))
+        self.assertFalse(agent_join_allowed(b, "CAagent2"))
