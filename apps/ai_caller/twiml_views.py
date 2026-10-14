@@ -68,8 +68,6 @@ def warm_transfer_answer(request):
     return _xml(answer_twiml(session))
 
 
-@csrf_exempt
-@require_POST
 def _place_with_agent_or_wait(session):
     """Dial the live agent for one patient. Leave the others as waiting calls."""
     decision = admit_patient_to_agent(session)
@@ -86,12 +84,30 @@ def _place_with_agent_or_wait(session):
     return session
 
 
+@csrf_exempt
+@require_POST
 def warm_transfer_inbound(request):
     """Retell transferred one patient onto our Twilio number.
 
     Each patient stays in their own conference. Only one is dialed through
     to the live agent; the others are marked waiting.
     """
+    try:
+        return _warm_transfer_inbound(request)
+    except Exception:
+        logger.exception("Warm-transfer inbound failed")
+        return _xml(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Say voice=\"Polly.Joanna\" language=\"en-US\">"
+            "We could not connect you right now. Goodbye."
+            "</Say>"
+            "<Hangup/>"
+            "</Response>"
+        )
+
+
+def _warm_transfer_inbound(request):
     session = resolve_inbound_session(
         call_sid=(request.POST.get("CallSid") or "").strip(),
         from_number=(request.POST.get("From") or "").strip(),
