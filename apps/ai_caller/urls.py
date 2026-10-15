@@ -68,6 +68,16 @@ urlpatterns = [
         name="twilio-warm-transfer-speak-now",
     ),
     path(
+        "twilio/warm-transfer/queue-tone/",
+        twiml_views.warm_transfer_queue_tone,
+        name="twilio-warm-transfer-queue-tone",
+    ),
+    path(
+        "twilio/warm-transfer/queue-tone-audio/",
+        twiml_views.warm_transfer_queue_tone_audio,
+        name="twilio-warm-transfer-queue-tone-audio",
+    ),
+    path(
         "twilio/warm-transfer/wait/",
         twiml_views.warm_transfer_wait,
         name="twilio-warm-transfer-wait",

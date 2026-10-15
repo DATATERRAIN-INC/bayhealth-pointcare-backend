@@ -11,7 +11,9 @@ from __future__ import annotations
 import audioop
 import io
 import logging
+import math
 import re
+import struct
 import threading
 import time
 import uuid
@@ -182,16 +184,33 @@ def _index_session(cache, session: Dict[str, Any]) -> None:
             sid,
             timeout=_SESSION_TTL_SECONDS,
         )
-    try:
-        ids = list(cache.get(_OPEN_SESSIONS_KEY) or [])
-    except Exception:
-        ids = []
     ended = bool(session.get("conference_ended") or session.get("agent_released"))
-    if ended:
-        ids = [item for item in ids if item != sid]
-    elif sid not in ids:
-        ids.append(sid)
-    cache.set(_OPEN_SESSIONS_KEY, ids, timeout=_SESSION_TTL_SECONDS)
+    # get()-then-set() on the shared open-sessions list is not atomic — two
+    # concurrent transfers (e.g. patients requesting a live agent at the same
+    # moment) can both read the same snapshot and the second write silently
+    # clobbers the first, permanently dropping that patient from the queue.
+    # Guard the read-modify-write with the same short spin-lock used for the
+    # active/waiting agent slot elsewhere in this module.
+    lock = "warm_transfer:open_sessions_lock"
+    locked = False
+    for _ in range(20):
+        if cache.add(lock, sid, timeout=5):
+            locked = True
+            break
+        time.sleep(0.02)
+    try:
+        try:
+            ids = list(cache.get(_OPEN_SESSIONS_KEY) or [])
+        except Exception:
+            ids = []
+        if ended:
+            ids = [item for item in ids if item != sid]
+        elif sid not in ids:
+            ids.append(sid)
+        cache.set(_OPEN_SESSIONS_KEY, ids, timeout=_SESSION_TTL_SECONDS)
+    finally:
+        if locked:
+            cache.delete(lock)
 
 
 def _open_sessions() -> list:
@@ -318,6 +337,26 @@ def _dequeue(cache, scope: str, session_id: str) -> None:
     cache.set(key, rows, timeout=_SESSION_TTL_SECONDS)
 
 
+def _maybe_notify_agent_of_new_waiter(cache, scope: str) -> None:
+    """Play the agent a private tone the FIRST time a caller starts waiting.
+
+    Only fires on the empty-queue -> one-waiter transition, so the agent
+    hears one cue per new queue forming, not once per caller in a long line.
+    """
+    try:
+        already_waiting = bool(cache.get(_queue_key(scope)) or [])
+    except Exception:
+        already_waiting = True  # fail safe: skip rather than spam on error
+    if already_waiting:
+        return
+    active_sid = str(cache.get(_active_key(scope)) or "")
+    if not active_sid or not _slot_busy(active_sid):
+        return
+    active_session = load_session(active_sid)
+    if active_session:
+        notify_agent_waiting_tone(active_session)
+
+
 def admit_patient_to_agent(session: Dict[str, Any]) -> str:
     """
     One patient talks to the live agent. Everyone else stays a waiting call.
@@ -344,6 +383,7 @@ def admit_patient_to_agent(session: Dict[str, Any]) -> str:
             break
         time.sleep(0.05)
     if not locked:
+        _maybe_notify_agent_of_new_waiter(cache, scope)
         _enqueue(cache, scope, sid)
         session["queue_state"] = "waiting"
         session["agent_claimed"] = False
@@ -360,6 +400,7 @@ def admit_patient_to_agent(session: Dict[str, Any]) -> str:
             save_session(session)
             wt_logger.info("AGENT_QUEUE_ACTIVE session=%s scope=%s", sid, scope)
             return "active"
+        _maybe_notify_agent_of_new_waiter(cache, scope)
         _enqueue(cache, scope, sid)
         session["queue_state"] = "waiting"
         session["agent_claimed"] = False
@@ -865,6 +906,80 @@ def speak_now_twiml() -> str:
         f"{_say('You can speak now.')}"
         "</Response>"
     )
+
+
+_QUEUE_TONE_WAV: Optional[bytes] = None
+
+
+def generate_queue_tone_wav() -> bytes:
+    """Short single beep — no external audio asset needed. Cached after first build."""
+    global _QUEUE_TONE_WAV
+    if _QUEUE_TONE_WAV is not None:
+        return _QUEUE_TONE_WAV
+    sample_rate = 8000
+    duration = 0.3
+    freq = 900.0
+    amplitude = 12000
+    n_samples = int(sample_rate * duration)
+    frames = bytearray()
+    for i in range(n_samples):
+        value = int(amplitude * math.sin(2 * math.pi * freq * i / sample_rate))
+        frames += struct.pack("<h", value)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(bytes(frames))
+    _QUEUE_TONE_WAV = buf.getvalue()
+    return _QUEUE_TONE_WAV
+
+
+def queue_tone_twiml(session_id: str = "") -> str:
+    tone_url = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/queue-tone-audio/", session_id)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"<Play>{tone_url}</Play>"
+        "</Response>"
+    )
+
+
+def notify_agent_waiting_tone(active_session: Dict[str, Any]) -> None:
+    """Private one-way beep to the live agent only — a caller is now waiting.
+
+    Uses the Conference Participant-level announce: it plays only to the
+    agent's leg, the patient on the call never hears it.
+    """
+    conference_sid = str(active_session.get("conference_sid") or "").strip()
+    agent_call_sid = str(active_session.get("dial_call_sid") or "").strip()
+    if not conference_sid or not agent_call_sid:
+        return
+    client = _twilio_client()
+    if client is None:
+        return
+    session_id = str(active_session.get("session_id") or "")
+    try:
+        client.conferences(conference_sid).participants(agent_call_sid).update(
+            announce_url=_abs_url(
+                "/api/ai-call/twilio/warm-transfer/queue-tone/", session_id
+            ),
+            announce_method="POST",
+        )
+        wt_logger.info(
+            "AGENT_QUEUE_TONE session=%s conf=%s agent_call=%s",
+            session_id,
+            conference_sid,
+            agent_call_sid,
+        )
+    except Exception:
+        wt_logger.exception(
+            "Failed to play queue-waiting tone conf=%s agent_call=%s",
+            conference_sid,
+            agent_call_sid,
+        )
 
 
 def next_agent_twiml() -> str:

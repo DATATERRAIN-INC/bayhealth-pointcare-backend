@@ -21,6 +21,7 @@ from apps.ai_caller.twilio_bridge import (
     connecting_twiml,
     declined_twiml,
     dial_status_twiml,
+    generate_queue_tone_wav,
     handle_conference_status,
     hold_twiml,
     inbound_connect_twiml,
@@ -31,6 +32,7 @@ from apps.ai_caller.twilio_bridge import (
     next_agent_twiml,
     participant_join_twiml,
     persist_humans_transcript,
+    queue_tone_twiml,
     release_agent_slot,
     resolve_inbound_session,
     save_session,
@@ -190,6 +192,22 @@ def warm_transfer_join(request):
 @require_POST
 def warm_transfer_speak_now(request):
     return _xml(speak_now_twiml())
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_queue_tone(request):
+    """Private one-way announce to the live agent only: a caller is waiting."""
+    session_id = (
+        request.GET.get("session_id") or request.POST.get("session_id") or ""
+    ).strip()
+    return _xml(queue_tone_twiml(session_id))
+
+
+@csrf_exempt
+def warm_transfer_queue_tone_audio(request):
+    """Serve the short waiting-caller beep the tone TwiML plays."""
+    return HttpResponse(generate_queue_tone_wav(), content_type="audio/wav")
 
 
 @csrf_exempt
