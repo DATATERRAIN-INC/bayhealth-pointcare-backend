@@ -190,6 +190,17 @@ class Call(models.Model):
 
     class Meta:
         ordering = ["-id"]
+        indexes = [
+            # Default list: filter by user, order by newest id.
+            models.Index(fields=["user", "-id"], name="ai_call_user_id_desc"),
+            # Status filters + summary counts.
+            models.Index(fields=["user", "status"], name="ai_call_user_status"),
+            # Retell sync fallback query (in_progress / recent missing transcript).
+            models.Index(
+                fields=["user", "status", "-started_at"],
+                name="ai_call_user_status_started",
+            ),
+        ]
 
     def __str__(self):
         return f"Call #{self.id} ({self.status})"

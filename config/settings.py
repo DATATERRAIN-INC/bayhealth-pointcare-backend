@@ -188,7 +188,7 @@ CELERY_BEAT_SCHEDULE = {
     "ai-caller-sync-in-progress-calls": {
         "task": "ai_caller.sync_in_progress_calls",
         "schedule": timedelta(
-            seconds=float(os.getenv("CELERY_SYNC_CALLS_INTERVAL_SECONDS", "45"))
+            seconds=float(os.getenv("CELERY_SYNC_CALLS_INTERVAL_SECONDS", "5"))
         ),
     },
 }
