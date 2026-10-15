@@ -23,12 +23,12 @@ from apps.ai_caller.serializers import (
 from apps.ai_caller.services import (
     ensure_first_queued_call,
     get_call_queryset,
+    get_call_summary_counts,
     get_caller_settings,
     get_patient_queryset,
     place_outbound_call_for_patient,
     save_call_decline_reason,
     sync_call_transcript,
-    sync_in_progress_calls_from_retell,
     update_call_from_retell_payload,
     upload_patients_from_file,
 )
@@ -146,20 +146,25 @@ class CallViewSet(viewsets.ModelViewSet):
             else (status_values or "").strip()
         )
         exclude_queued = self.action == "list" and not has_status
+        # List UI does not need full transcript JSON; detail / retell_call_id still does.
+        retell_call_id = (self.request.query_params.get("retell_call_id") or "").strip()
+        light = self.action == "list" and not retell_call_id
         return get_call_queryset(
             user=self.request.user,
             search=self.request.query_params.get("search", ""),
             source=self.request.query_params.get("source", ""),
             status=status_values,
             patient_id=self.request.query_params.get("patient_id", ""),
-            retell_call_id=self.request.query_params.get("retell_call_id", ""),
+            retell_call_id=retell_call_id,
             exclude_queued=exclude_queued,
             ordering=self.request.query_params.get("ordering", ""),
+            light=light,
         )
 
     def list(self, request, *args, **kwargs):
-        # Keep statuses fresh even if Retell webhooks were missed.
-        sync_in_progress_calls_from_retell(user=request.user, limit=25)
+        # Status/transcript refresh runs on Celery beat (see ai_caller.sync_in_progress_calls).
+        # Do not block list responses on Retell HTTP — that was making this API very slow.
+        self._enqueue_retell_sync(request.user)
         retell_call_id = (request.query_params.get("retell_call_id") or "").strip()
         if retell_call_id:
             call = self.get_queryset().first()
@@ -167,6 +172,23 @@ class CallViewSet(viewsets.ModelViewSet):
                 return error_response("Call not found.", 404)
             return Response({"transcript": transcript_for_api(call.transcript or [])})
         return super().list(request, *args, **kwargs)
+
+    @staticmethod
+    def _enqueue_retell_sync(user):
+        """Debounced background sync so the UI stays fresh without blocking."""
+        user_id = getattr(user, "pk", None)
+        if not user_id:
+            return
+        try:
+            from django.core.cache import cache
+
+            from apps.ai_caller.tasks import sync_in_progress_calls_for_user
+
+            cache_key = f"ai_caller:list_sync:{user_id}"
+            if cache.add(cache_key, 1, timeout=5):
+                sync_in_progress_calls_for_user.delay(user_id, limit=10)
+        except Exception:
+            pass
 
     def update(self, request, *args, **kwargs):
         """Update dial-queue call status: paused / cancel / queued / scheduled."""
@@ -232,34 +254,8 @@ class CallViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
-        sync_in_progress_calls_from_retell(user=request.user, limit=25)
-        queryset = Call.objects.filter(user=request.user)
-        return Response(
-            {
-                "all": queryset.exclude(
-                    status__in=[
-                        Call.Status.QUEUED,
-                        Call.Status.SCHEDULED,
-                        Call.Status.PAUSED,
-                    ]
-                ).count(),
-                "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
-                "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
-                "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
-                "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
-                # Waiting dial pool (ready-now + future scheduled + paused).
-                "queued": queryset.filter(
-                    status__in=[
-                        Call.Status.QUEUED,
-                        Call.Status.SCHEDULED,
-                        Call.Status.PAUSED,
-                    ]
-                ).count(),
-                "scheduled": queryset.filter(status=Call.Status.SCHEDULED).count(),
-                "paused": queryset.filter(status=Call.Status.PAUSED).count(),
-                "cancel": queryset.filter(status=Call.Status.CANCEL).count(),
-            }
-        )
+        self._enqueue_retell_sync(request.user)
+        return Response(get_call_summary_counts(user=request.user))
 
     @action(detail=True, methods=["post"], url_path="trigger")
     def trigger(self, request, pk=None):

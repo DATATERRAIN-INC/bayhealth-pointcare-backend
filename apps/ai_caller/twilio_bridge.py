@@ -36,6 +36,8 @@ wt_logger = logging.getLogger("ai_caller.warm_transfer")
 
 _SESSION_TTL_SECONDS = 60 * 60 * 24
 _PENDING_CACHE_KEY = "warm_transfer:pending"
+_OPEN_SESSIONS_KEY = "warm_transfer:open_sessions"
+_ORIGINAL_VOICE_KEY = "warm_transfer:original_voice_url"
 
 _POLL_INTERVAL_SECONDS = 5
 _YES_RE = re.compile(
@@ -135,7 +137,350 @@ def save_session(session: Dict[str, Any]) -> Dict[str, Any]:
             "TRANSFER_SESSION_CACHE_FALLBACK session=%s (file cache)",
             session_id,
         )
+        _index_session(fallback, session)
+        return session
+    _index_session(cache, session)
     return session
+
+
+def _phone_digits(value: str) -> str:
+    return _digits(normalize_phone(value or "") or (value or ""))
+
+
+def _phone_cache_key(digits: str) -> str:
+    return f"warm_transfer:phone:{digits}"
+
+
+def _queue_scope(session: Dict[str, Any]) -> str:
+    user_id = session.get("user_id")
+    if user_id:
+        return f"user:{user_id}"
+    number = _phone_digits(str(session.get("transfer_number") or ""))
+    return f"agent:{number or 'default'}"
+
+
+def _queue_key(scope: str) -> str:
+    return f"warm_transfer:queue:{scope}"
+
+
+def _active_key(scope: str) -> str:
+    return f"warm_transfer:active:{scope}"
+
+
+def _index_session(cache, session: Dict[str, Any]) -> None:
+    """Remember this session by patient phone so concurrent transfers stay apart."""
+    sid = str(session.get("session_id") or "").strip()
+    if not sid:
+        return
+    phone = _phone_digits(str(session.get("phone_number") or ""))
+    if phone:
+        cache.set(_phone_cache_key(phone), sid, timeout=_SESSION_TTL_SECONDS)
+    retell_id = str(session.get("retell_call_id") or "").strip()
+    if retell_id:
+        cache.set(
+            f"warm_transfer:retell:{retell_id}",
+            sid,
+            timeout=_SESSION_TTL_SECONDS,
+        )
+    try:
+        ids = list(cache.get(_OPEN_SESSIONS_KEY) or [])
+    except Exception:
+        ids = []
+    ended = bool(session.get("conference_ended") or session.get("agent_released"))
+    if ended:
+        ids = [item for item in ids if item != sid]
+    elif sid not in ids:
+        ids.append(sid)
+    cache.set(_OPEN_SESSIONS_KEY, ids, timeout=_SESSION_TTL_SECONDS)
+
+
+def _open_sessions() -> list:
+    try:
+        ids = list(_session_cache().get(_OPEN_SESSIONS_KEY) or [])
+    except Exception:
+        ids = []
+    sessions = []
+    for sid in ids:
+        session = load_session(str(sid))
+        if session:
+            sessions.append(session)
+    return sessions
+
+
+def _same_phone(left: str, right: str) -> bool:
+    a = _phone_digits(left)
+    b = _phone_digits(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(a) >= 10 and len(b) >= 10 and a[-10:] == b[-10:]
+
+
+def _party_numbers(*values: str) -> list:
+    bridge = _phone_digits(_from_number())
+    found = []
+    for value in values:
+        digits = _phone_digits(value)
+        if not digits or digits == bridge or digits in found:
+            continue
+        found.append(digits)
+    return found
+
+
+def resolve_inbound_session(
+    *,
+    call_sid: str = "",
+    from_number: str = "",
+    to_number: str = "",
+    caller: str = "",
+    called: str = "",
+) -> Dict[str, Any]:
+    """
+    Pick this inbound transfer's own session.
+
+    The Twilio number has one voice URL, so every transfer used to land in
+    the latest conference. Match the patient phone, and if that is missing
+    hand out unclaimed sessions one at a time.
+    """
+    call_sid = (call_sid or "").strip()
+    cache = _session_cache()
+    lock = "warm_transfer:inbound_lock"
+    if not cache.add(lock, call_sid or "1", timeout=10):
+        # Another transfer is being assigned. Wait briefly and try once.
+        time.sleep(0.2)
+        if not cache.add(lock, call_sid or "1", timeout=10):
+            wt_logger.warning("TRANSFER_INBOUND_LOCK_BUSY call=%s", call_sid or "-")
+            return {}
+    try:
+        sessions = _open_sessions()
+        if call_sid:
+            for session in sessions:
+                if str(session.get("call_sid") or "") == call_sid:
+                    return session
+        parties = _party_numbers(from_number, to_number, caller, called)
+        for party in parties:
+            for session in sessions:
+                if session.get("conference_ended") or session.get("agent_released"):
+                    continue
+                bound = str(session.get("call_sid") or "")
+                if bound and bound != call_sid:
+                    continue
+                if _same_phone(str(session.get("phone_number") or ""), party):
+                    if call_sid:
+                        session["call_sid"] = call_sid
+                        save_session(session)
+                    return session
+        unclaimed = [
+            session
+            for session in sessions
+            if not session.get("call_sid")
+            and not session.get("conference_ended")
+            and not session.get("agent_released")
+        ]
+        if not unclaimed:
+            return {}
+        chosen = unclaimed[0]
+        if call_sid:
+            chosen["call_sid"] = call_sid
+            save_session(chosen)
+        if len(unclaimed) > 1 and not parties:
+            wt_logger.info(
+                "TRANSFER_INBOUND_FIFO session=%s call=%s waiting=%s",
+                chosen.get("session_id"),
+                call_sid or "-",
+                len(unclaimed) - 1,
+            )
+        return chosen
+    finally:
+        cache.delete(lock)
+
+
+def _slot_busy(session_id: str) -> bool:
+    session = load_session(session_id)
+    if not session:
+        return False
+    if session.get("agent_released") or session.get("conference_ended"):
+        return False
+    return str(session.get("queue_state") or "") == "active"
+
+
+def _enqueue(cache, scope: str, session_id: str) -> None:
+    key = _queue_key(scope)
+    rows = [str(item) for item in (cache.get(key) or []) if str(item) != session_id]
+    rows.append(session_id)
+    cache.set(key, rows, timeout=_SESSION_TTL_SECONDS)
+
+
+def _dequeue(cache, scope: str, session_id: str) -> None:
+    key = _queue_key(scope)
+    rows = [str(item) for item in (cache.get(key) or []) if str(item) != session_id]
+    cache.set(key, rows, timeout=_SESSION_TTL_SECONDS)
+
+
+def admit_patient_to_agent(session: Dict[str, Any]) -> str:
+    """
+    One patient talks to the live agent. Everyone else stays a waiting call.
+
+    Returns "active" or "waiting".
+    """
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    sid = str(session.get("session_id") or "").strip()
+    if not sid:
+        return "waiting"
+    if session.get("queue_state") == "active" and session.get("agent_claimed"):
+        return "active"
+    if session.get("queue_state") == "waiting":
+        return "waiting"
+    scope = _queue_scope(session)
+    cache = _session_cache()
+    lock = f"warm_transfer:admit:{scope}"
+    locked = False
+    for _ in range(8):
+        if cache.add(lock, sid, timeout=10):
+            locked = True
+            break
+        time.sleep(0.05)
+    if not locked:
+        _enqueue(cache, scope, sid)
+        session["queue_state"] = "waiting"
+        session["agent_claimed"] = False
+        save_session(session)
+        wt_logger.info("AGENT_QUEUE_WAIT session=%s scope=%s reason=lock", sid, scope)
+        return "waiting"
+    try:
+        active = str(cache.get(_active_key(scope)) or "")
+        if active == sid or not _slot_busy(active):
+            cache.set(_active_key(scope), sid, timeout=_SESSION_TTL_SECONDS)
+            _dequeue(cache, scope, sid)
+            session["queue_state"] = "active"
+            session["agent_claimed"] = True
+            save_session(session)
+            wt_logger.info("AGENT_QUEUE_ACTIVE session=%s scope=%s", sid, scope)
+            return "active"
+        _enqueue(cache, scope, sid)
+        session["queue_state"] = "waiting"
+        session["agent_claimed"] = False
+        save_session(session)
+        wt_logger.info("AGENT_QUEUE_WAIT session=%s scope=%s behind=%s", sid, scope, active)
+        return "waiting"
+    finally:
+        cache.delete(lock)
+
+
+def transfer_call_should_stay_open(retell_call_id: str) -> bool:
+    """True while this patient is still with the agent or waiting for one."""
+    retell_call_id = (retell_call_id or "").strip()
+    if not retell_call_id:
+        return False
+    try:
+        sid = str(_session_cache().get(f"warm_transfer:retell:{retell_call_id}") or "")
+    except Exception:
+        sid = ""
+    session = load_session(sid) if sid else {}
+    if not session or session.get("conference_ended") or session.get("agent_released"):
+        return False
+    state = str(session.get("queue_state") or "")
+    if state in {"waiting", "active"}:
+        return True
+    return bool(session.get("call_sid"))
+
+
+def set_transfer_call_status(session: Dict[str, Any], status: str) -> None:
+    """Publish waiting / in_progress / completed on the call so the queue updates."""
+    from apps.ai_caller.models import Call
+
+    session = dict(session or {})
+    retell_call_id = str(session.get("retell_call_id") or "").strip()
+    call_sid = str(session.get("call_sid") or "").strip()
+    call = None
+    if retell_call_id:
+        call = Call.objects.filter(retell_call_id=retell_call_id).first()
+    if call is None and call_sid:
+        call = Call.objects.filter(warm_transfer_session_id=call_sid).first()
+    if call is None or call.status == status:
+        return
+    if call.status in {Call.Status.CALLBACK, Call.Status.CANCEL}:
+        return
+    call.status = status
+    call.save(update_fields=["status", "updated_at"])
+
+
+def release_agent_slot(session: Dict[str, Any]) -> None:
+    """Free the live agent and connect the next waiting patient."""
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    sid = str(session.get("session_id") or "").strip()
+    if not sid or session.get("agent_released"):
+        return
+    scope = _queue_scope(session)
+    cache = _session_cache()
+    was_active = bool(session.get("agent_claimed")) or str(
+        cache.get(_active_key(scope)) or ""
+    ) == sid
+    _dequeue(cache, scope, sid)
+    session["agent_released"] = True
+    session["conference_ended"] = True
+    session["agent_claimed"] = False
+    session["queue_state"] = "ended"
+    save_session(session)
+    if str(cache.get(_active_key(scope)) or "") == sid:
+        cache.delete(_active_key(scope))
+    if not session.get("callback_offer_started"):
+        set_transfer_call_status(session, "completed")
+    if was_active:
+        promote_next_waiting(scope)
+    restore_inbound_voice_url(session)
+
+
+def promote_next_waiting(scope: str) -> None:
+    """Dial the live agent into the next patient's own conference."""
+    scope = (scope or "").strip()
+    if not scope:
+        return
+    cache = _session_cache()
+    lock = f"warm_transfer:admit:{scope}"
+    if not cache.add(lock, "promote", timeout=10):
+        return
+    chosen = None
+    try:
+        if _slot_busy(str(cache.get(_active_key(scope)) or "")):
+            return
+        rows = [str(item) for item in (cache.get(_queue_key(scope)) or [])]
+        remaining = []
+        for sid in rows:
+            session = load_session(sid)
+            if (
+                not session
+                or session.get("agent_released")
+                or session.get("conference_ended")
+                or not session.get("call_sid")
+            ):
+                continue
+            if chosen is None:
+                chosen = session
+                continue
+            remaining.append(sid)
+        cache.set(_queue_key(scope), remaining, timeout=_SESSION_TTL_SECONDS)
+        if chosen is None:
+            return
+        sid = str(chosen.get("session_id") or "")
+        cache.set(_active_key(scope), sid, timeout=_SESSION_TTL_SECONDS)
+        chosen["queue_state"] = "active"
+        chosen["agent_claimed"] = True
+        chosen["b_dialed"] = False
+        save_session(chosen)
+        wt_logger.info("AGENT_QUEUE_PROMOTE session=%s scope=%s", sid, scope)
+    finally:
+        cache.delete(lock)
+    if not chosen:
+        return
+    set_transfer_call_status(chosen, "in_progress")
+    announce_connecting(chosen)
+    start_coordinator_leg(chosen)
 
 
 def split_stereo_wav(audio: bytes) -> Tuple[bytes, bytes]:
@@ -345,6 +690,20 @@ def _twilio_client():
     return Client(sid, token)
 
 
+def _hangup_call(call_sid: str) -> None:
+    """End one Twilio call so it cannot enter a conference it no longer belongs to."""
+    call_sid = (call_sid or "").strip()
+    if not call_sid:
+        return
+    client = _twilio_client()
+    if client is None:
+        return
+    try:
+        client.calls(call_sid).update(status="completed")
+    except Exception:
+        logger.exception("Failed to hang up call %s", call_sid)
+
+
 def _abs_url(path: str, session_id: str, **extra: str) -> str:
     base = _backend_base()
     params = {"session_id": session_id, **{k: v for k, v in extra.items() if v}}
@@ -393,7 +752,49 @@ def declined_twiml() -> str:
 
 
 def conference_name(session_id: str) -> str:
-    return f"care-wt-{session_id}"[:40]
+    """One conference per patient session. Names are never shared."""
+    safe = re.sub(r"[^A-Za-z0-9]", "", (session_id or "").strip())[:32]
+    return f"care-wt-{safe}"[:40]
+
+
+def agent_join_allowed(session: Dict[str, Any], call_sid: str = "") -> bool:
+    """Only the agent dialed for the active patient may enter that conference."""
+    if not session:
+        return False
+    if session.get("conference_ended") or session.get("agent_released"):
+        return False
+    if str(session.get("queue_state") or "") != "active" or not session.get("agent_claimed"):
+        return False
+    allowed = str(session.get("dial_call_sid") or "").strip()
+    call_sid = (call_sid or "").strip()
+    if allowed and call_sid and call_sid != allowed:
+        return False
+    return True
+
+
+def shared_inbound_url() -> str:
+    """One webhook for every transfer. The caller is matched to their own session."""
+    return f"{_backend_base()}/api/ai-call/twilio/warm-transfer/inbound/"
+
+
+def _ring_url() -> str:
+    """Audio played to the patient while the live agent line is ringing."""
+    configured = (getattr(settings, "WARM_TRANSFER_RING_URL", "") or "").strip()
+    if configured:
+        return configured
+    # Twilio Client outgoing ringtone — works as a transfer ringback.
+    return "https://sdk.twilio.com/js/client/sounds/releases/1.0.0/outgoing.mp3"
+
+
+def conference_wait_twiml() -> str:
+    """Conference waitUrl: loop ring tone until the live agent joins."""
+    ring = escape(_ring_url())
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Play loop="0">{ring}</Play>'
+        "</Response>"
+    )
 
 
 def join_conference_twiml(session: Dict[str, Any], *, is_host: bool) -> str:
@@ -401,6 +802,9 @@ def join_conference_twiml(session: Dict[str, Any], *, is_host: bool) -> str:
     conf = escape(conference_name(session_id))
     status_cb = escape(
         _abs_url("/api/ai-call/twilio/warm-transfer/conference-status/", session_id)
+    )
+    wait_url = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/wait/", session_id)
     )
     mix_cb = escape(
         _abs_url(
@@ -422,7 +826,8 @@ def join_conference_twiml(session: Dict[str, Any], *, is_host: bool) -> str:
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Dial>"
-        f'<Conference beep="false" waitUrl="" startConferenceOnEnter="true" '
+        f'<Conference beep="false" waitUrl="{wait_url}" waitMethod="POST" '
+        f'startConferenceOnEnter="true" '
         f'endConferenceOnExit="{end_on_exit}" {record_attrs}'
         f'statusCallback="{status_cb}" statusCallbackEvent="start join end" '
         f'statusCallbackMethod="POST">{conf}</Conference>'
@@ -460,6 +865,151 @@ def speak_now_twiml() -> str:
         f"{_say('You can speak now.')}"
         "</Response>"
     )
+
+
+def next_agent_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('That agent is unavailable. I am connecting you to the next agent now. Please hold.')}"
+        "</Response>"
+    )
+
+
+def hold_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('Please hold. A live agent is helping another caller. You are still in line.')}"
+        "</Response>"
+    )
+
+
+def connecting_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('Thank you for waiting. I am connecting you to a live agent now.')}"
+        "</Response>"
+    )
+
+
+def ask_callback_twiml(session: Dict[str, Any]) -> str:
+    session_id = str((session or {}).get("session_id") or "")
+    gather_url = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/callback-gather/", session_id)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('I am sorry, none of our enrollment agents are available right now. What day and time works best for a callback?')}"
+        f'<Gather input="speech" timeout="8" speechTimeout="auto" '
+        f'action="{gather_url}" method="POST">'
+        f"{_say('For example, you can say tomorrow at 3 PM, or Friday morning.')}"
+        "</Gather>"
+        f"{_say('Sorry, I did not catch a time. We will follow up another day. Goodbye.')}"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def callback_scheduled_twiml(when_text: str = "") -> str:
+    when = (when_text or "").strip()
+    if when:
+        line = (
+            f"Got it. I have scheduled your callback for {when}. "
+            "Thank you for your time. Goodbye."
+        )
+    else:
+        line = (
+            "Got it. I have scheduled your callback. "
+            "Thank you for your time. Goodbye."
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say(line)}"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def callback_unclear_twiml(session: Dict[str, Any]) -> str:
+    session_id = str((session or {}).get("session_id") or "")
+    gather_url = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/callback-gather/", session_id)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{_say('Sorry, I did not catch that. Please tell me a day and time for your callback.')}"
+        f'<Gather input="speech" timeout="8" speechTimeout="auto" '
+        f'action="{gather_url}" method="POST"></Gather>'
+        f"{_say('We will follow up another day. Goodbye.')}"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def _announce_conference(session: Dict[str, Any], path: str, label: str) -> None:
+    session = dict(session or {})
+    conference_sid = str(session.get("conference_sid") or "").strip()
+    session_id = str(session.get("session_id") or "")
+    if not conference_sid or not session_id:
+        return
+    client = _twilio_client()
+    if client is None:
+        return
+    try:
+        client.conferences(conference_sid).update(
+            announce_url=_abs_url(path, session_id),
+            announce_method="POST",
+        )
+        logger.info(
+            "Announced %s session=%s conf=%s", label, session_id, conference_sid
+        )
+    except Exception:
+        logger.exception("Failed to announce %s session=%s", label, session_id)
+
+
+def announce_hold(session: Dict[str, Any]) -> None:
+    _announce_conference(
+        session, "/api/ai-call/twilio/warm-transfer/hold/", "hold"
+    )
+
+
+def announce_connecting(session: Dict[str, Any]) -> None:
+    _announce_conference(
+        session, "/api/ai-call/twilio/warm-transfer/connecting/", "connecting"
+    )
+
+
+def announce_next_agent(session: Dict[str, Any]) -> None:
+    """Tell the patient on the conference that we are dialing the next live agent."""
+    session = dict(session or {})
+    conference_sid = str(session.get("conference_sid") or "").strip()
+    session_id = str(session.get("session_id") or "")
+    if not conference_sid or not session_id:
+        return
+    client = _twilio_client()
+    if client is None:
+        return
+    try:
+        client.conferences(conference_sid).update(
+            announce_url=_abs_url(
+                "/api/ai-call/twilio/warm-transfer/next-agent/", session_id
+            ),
+            announce_method="POST",
+        )
+        logger.info(
+            "Announced next-agent failover session=%s conf=%s",
+            session_id,
+            conference_sid,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to announce next-agent failover session=%s", session_id
+        )
 
 
 def start_coordinator_leg(session: Dict[str, Any]) -> None:
@@ -551,7 +1101,9 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
         )
         session["status"] = "agent_unreachable"
         save_session(session)
-        return False
+        # Ask the patient for a callback time (no more agents left).
+        offer_agent_unreachable_callback(session)
+        return True
 
     previous = numbers[idx] if idx < len(numbers) else session.get("transfer_number")
     nxt = numbers[next_idx]
@@ -568,6 +1120,10 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
     session["transfer_number_index"] = next_idx
     session["transfer_number"] = nxt
     session["live_agent_number"] = nxt
+    # Drop the agent who did not answer so they cannot join this conference late
+    # and end up in the room with the next agent.
+    old_dial = str(session.get("dial_call_sid") or "").strip()
+    _hangup_call(old_dial)
     session["b_dialed"] = False
     session["dial_call_sid"] = ""
     session["provider_recording_started"] = False
@@ -606,8 +1162,99 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
                 session_id,
             )
 
+    # Patient is already in the conference — announce before dialing the next agent.
+    announce_next_agent(session)
     start_coordinator_leg(session)
     return True
+
+
+def offer_agent_unreachable_callback(session: Dict[str, Any]) -> bool:
+    """
+    When no live agent answers, redirect the patient leg to ask for a callback time.
+    Returns True when the redirect (or prior offer) is in progress.
+    """
+    session = load_session(str((session or {}).get("session_id") or "")) or dict(
+        session or {}
+    )
+    session_id = str(session.get("session_id") or "")
+    if not session_id:
+        return False
+    if session.get("callback_offer_started") or session.get("status") in {
+        "agent_unreachable_ask_callback",
+        "callback_scheduled",
+    }:
+        return True
+
+    patient_sid = str(session.get("call_sid") or "").strip()
+    session["status"] = "agent_unreachable_ask_callback"
+    session["callback_offer_started"] = True
+    save_session(session)
+    # This patient is no longer with the agent. Let the next waiting caller through.
+    release_agent_slot(session)
+
+    dialer_logger = logging.getLogger("ai_caller.dialer")
+    dialer_logger.info(
+        "AGENT_UNREACHABLE_ASK_CALLBACK session=%s patient_sid=%s",
+        session_id,
+        patient_sid or "-",
+    )
+
+    client = _twilio_client()
+    if client is None or not patient_sid:
+        logger.warning(
+            "Cannot ask callback — missing twilio client or patient call_sid session=%s",
+            session_id,
+        )
+        return False
+    try:
+        client.calls(patient_sid).update(
+            url=_abs_url(
+                "/api/ai-call/twilio/warm-transfer/ask-callback/", session_id
+            ),
+            method="POST",
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to redirect patient for callback ask session=%s", session_id
+        )
+        return False
+
+
+def schedule_callback_from_warm_transfer_speech(
+    session: Dict[str, Any], *, speech: str
+) -> tuple:
+    """
+    Parse spoken callback time and create ScheduledOutreach.
+    Returns (ok, message_for_patient, error).
+    """
+    from apps.ai_caller.models import Call
+    from apps.ai_caller.scheduling import schedule_callback_request
+
+    session = dict(session or {})
+    raw = (speech or "").strip()
+    if not raw:
+        return False, "", "empty"
+
+    retell_call_id = str(session.get("retell_call_id") or "").strip()
+    patient_sid = str(session.get("call_sid") or "").strip()
+    call = None
+    if retell_call_id:
+        call = Call.objects.filter(retell_call_id=retell_call_id).first()
+    if not call and patient_sid:
+        call = Call.objects.filter(warm_transfer_session_id=patient_sid).first()
+    if not call:
+        return False, "", "call_not_found"
+
+    row, error = schedule_callback_request(call=call, raw_time_text=raw)
+    if error or not row:
+        return False, "", error or "schedule_failed"
+
+    when = (getattr(row, "raw_time_text", None) or raw).strip()
+    session["status"] = "callback_scheduled"
+    session["callback_raw_time"] = when
+    save_session(session)
+    return True, when, ""
 
 
 def maybe_failover_on_agent_status(
@@ -629,7 +1276,28 @@ def maybe_failover_on_agent_status(
         return False
     if session.get("spoke_now") or session.get("status") == "connected":
         return False
-    return failover_to_next_live_agent(session, reason=status)
+    if session.get("callback_offer_started") or session.get("status") in {
+        "agent_unreachable_ask_callback",
+        "callback_scheduled",
+    }:
+        return True
+
+    numbers = [
+        str(n).strip()
+        for n in (
+            session.get("transfer_numbers") or session.get("live_agent_numbers") or []
+        )
+        if str(n).strip()
+    ]
+    # Single agent (or empty list): no failover target — ask for callback.
+    if len(numbers) < 2:
+        session["status"] = "agent_unreachable"
+        save_session(session)
+        return offer_agent_unreachable_callback(session)
+
+    if failover_to_next_live_agent(session, reason=status):
+        return True
+    return offer_agent_unreachable_callback(session)
 
 
 def start_leg_recording(session: Dict[str, Any], call_sid: str, leg: str) -> None:
@@ -743,6 +1411,8 @@ def start_leg_recording_for_call(session: Dict[str, Any], call_sid: str) -> None
 
 
 def announce_you_can_speak_now(session: Dict[str, Any], conference_sid: str) -> None:
+    from apps.ai_caller.models import Call
+
     session = dict(session or {})
     if session.get("spoke_now") or not conference_sid:
         return
@@ -767,6 +1437,14 @@ def announce_you_can_speak_now(session: Dict[str, Any], conference_sid: str) -> 
         )
     except Exception:
         logger.exception("Failed to announce connected session=%s", session_id)
+        return
+
+    try:
+        set_transfer_call_status(session, Call.Status.CONNECT_LIVE_AGENT)
+    except Exception:
+        logger.exception(
+            "Failed to set connect_live_agent status session=%s", session_id
+        )
 
 
 def _delayed_start_leg_recording(session_id: str, call_sid: str, leg: str) -> None:
@@ -789,6 +1467,7 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
     # Conference over → live-agent talk ended; extend full-call duration.
     if event in {"end", "conference-end"}:
         extend_call_ended_at(session)
+        release_agent_slot(session)
         return
     if event == "join" and join_call:
         session = load_session(str(session.get("session_id") or "")) or session
@@ -806,6 +1485,12 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
                 daemon=True,
             ).start()
         session = load_session(str(session.get("session_id") or "")) or session
+        if (
+            str(session.get("queue_state") or "") == "waiting"
+            and inbound_sid
+            and join_call == inbound_sid
+        ):
+            announce_hold(session)
     if event != "join" or session.get("spoke_now") or not conference_sid:
         return
     count = 0
@@ -947,8 +1632,16 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
         )
         return
     elif not patient and not provider:
-        mix = str(session.get("humans_transcript") or "")
-        mix_items = None
+        if mix_items:
+            # Diarization produced structured, timestamped turns but didn't
+            # confidently split into patient + live_agent (e.g. only one
+            # voice cluster detected). Keep those turns intact instead of
+            # flattening everything into a single unlabeled wall of text —
+            # a partially-labeled transcript is still better than one blob.
+            mix = ""
+        else:
+            mix = str(session.get("humans_transcript") or "")
+            mix_items = None
     elif provider and not patient:
         # Provider-only is safe (live agent inbound). Persist it.
         mix = ""
@@ -1559,8 +2252,20 @@ def _incoming_number(client, phone: str):
 
 
 def restore_inbound_voice_url(session: Dict[str, Any]) -> None:
+    """Put the Twilio number back only after every transfer has finished.
+
+    Restoring earlier points the next patient at another patient's webhook.
+    """
     session = dict(session or {})
     if session.get("voice_url_restored"):
+        return
+    this_id = str(session.get("session_id") or "").strip()
+    for other in _open_sessions():
+        other_id = str(other.get("session_id") or "")
+        if other_id == this_id:
+            continue
+        if other.get("conference_ended") or other.get("agent_released"):
+            continue
         return
     sid = str(session.get("incoming_sid") or "").strip()
     if not sid:
@@ -1568,8 +2273,19 @@ def restore_inbound_voice_url(session: Dict[str, Any]) -> None:
     client = _twilio_client()
     if client is None:
         return
-    previous = session.get("previous_voice_url")
-    method = session.get("previous_voice_method") or "POST"
+    original = {}
+    try:
+        original = _session_cache().get(_ORIGINAL_VOICE_KEY) or {}
+    except Exception:
+        original = {}
+    if not isinstance(original, dict):
+        original = {}
+    previous = original.get("voice_url")
+    if previous is None:
+        previous = session.get("previous_voice_url")
+    if isinstance(previous, str) and "/warm-transfer/inbound" in previous:
+        previous = ""
+    method = original.get("voice_method") or session.get("previous_voice_method") or "POST"
     try:
         kwargs: Dict[str, Any] = {"voice_method": method}
         if previous is not None:
@@ -1643,18 +2359,54 @@ def prepare_retell_bridge(
         }
 
     session_id = uuid.uuid4().hex[:16]
-    inbound_url = _abs_url("/api/ai-call/twilio/warm-transfer/inbound/", session_id)
-    previous_url = getattr(incoming, "voice_url", None) or ""
-    previous_method = getattr(incoming, "voice_method", None) or "POST"
+    inbound_url = shared_inbound_url()
+    current_url = getattr(incoming, "voice_url", None) or ""
+    current_method = getattr(incoming, "voice_method", None) or "POST"
+    original = {}
     try:
-        incoming.update(voice_url=inbound_url, voice_method="POST")
-    except Exception as exc:
-        logger.exception("Failed to point Twilio number at warm-transfer inbound")
-        return {
-            "ok": False,
-            "error": f"Failed to prepare Twilio recorder: {exc}",
-            "status_code": 502,
-        }
+        original = _session_cache().get(_ORIGINAL_VOICE_KEY) or {}
+    except Exception:
+        original = {}
+    if not isinstance(original, dict):
+        original = {}
+    # Never treat a warm-transfer webhook (any tunnel) as the "original"
+    # production voice URL — restoring that later causes Twilio app errors.
+    current_is_wt = "/twilio/warm-transfer/inbound" in str(current_url)
+    needs_voice_update = (
+        str(current_url).rstrip("/") != inbound_url.rstrip("/")
+        or str(current_method).upper() != "POST"
+    )
+    if needs_voice_update:
+        if not original and current_url and not current_is_wt:
+            original = {"voice_url": current_url, "voice_method": current_method}
+            try:
+                _session_cache().set(
+                    _ORIGINAL_VOICE_KEY, original, timeout=_SESSION_TTL_SECONDS
+                )
+            except Exception:
+                logger.exception("Failed to remember original Twilio voice URL")
+        try:
+            incoming.update(voice_url=inbound_url, voice_method="POST")
+            logger.info(
+                "Twilio voice URL refreshed to current BACKEND_URL inbound=%s (was %s)",
+                inbound_url,
+                current_url,
+            )
+        except Exception as exc:
+            logger.exception("Failed to point Twilio number at warm-transfer inbound")
+            return {
+                "ok": False,
+                "error": f"Failed to prepare Twilio recorder: {exc}",
+                "status_code": 502,
+            }
+    previous_url = original.get("voice_url") or (
+        "" if current_is_wt else current_url
+    )
+    if "/warm-transfer/inbound" in str(previous_url):
+        previous_url = ""
+    previous_method = original.get("voice_method") or (
+        current_method if not current_is_wt else "POST"
+    )
 
     numbers = [
         str(n).strip()
