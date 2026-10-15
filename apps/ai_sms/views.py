@@ -144,6 +144,8 @@ def _conversation_transcript_payload(conversation, request=None):
     )
     return {
         "chat_id": conversation.chat_id,
+        "status": conversation.status or "",
+        "step": conversation.step or "",
         "transcript": transcript,
         "recording_url": recording_url,
     }
@@ -274,7 +276,8 @@ class StartSmsConversationView(APIView):
                 "patient_name": result.get("patient_name") or "",
                 "chat_id": result["chat_id"],
                 "message_sid": result.get("message_sid") or "",
-                "status": result.get("status") or "ongoing",
+                "status": result.get("status") or "sent",
+                "step": result.get("step") or "identity",
                 "type": "SMS",
                 "started_at": result.get("started_at"),
                 "created_by": result.get("created_by"),
@@ -327,7 +330,8 @@ class StartMinorSmsConversationView(APIView):
                 "updated_by": result.get("updated_by"),
                 "chat_id": result["chat_id"],
                 "message_sid": result.get("message_sid") or "",
-                "status": result.get("status") or "ongoing",
+                "status": result.get("status") or "sent",
+                "step": result.get("step") or "identity",
                 "type": "SMS",
                 "started_at": result.get("started_at"),
                 "from_number": result.get("from_number") or None,
@@ -340,7 +344,7 @@ class StartMinorSmsConversationView(APIView):
                 "message": result.get("message") or "Minor SMS conversation started.",
             },
             status=status.HTTP_200_OK,
-        )
+        }
 
 
 @method_decorator(csrf_exempt, name="dispatch")

@@ -64,5 +64,6 @@ class SmsConversationListSerializer(serializers.ModelSerializer):
             "patient_id",
             "patient_name",
             "status",
+            "step",
             "created_at",
         ]

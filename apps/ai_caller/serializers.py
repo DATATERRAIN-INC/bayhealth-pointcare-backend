@@ -325,6 +325,11 @@ class CallSerializer(serializers.ModelSerializer):
     scheduled_at = serializers.SerializerMethodField()
     schedule_kind = serializers.SerializerMethodField()
     schedule_raw_time = serializers.SerializerMethodField()
+    timezone = serializers.SerializerMethodField()
+    started_at = serializers.SerializerMethodField()
+    ended_at = serializers.SerializerMethodField()
+    created_at = serializers.SerializerMethodField()
+    updated_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Call
@@ -343,6 +348,7 @@ class CallSerializer(serializers.ModelSerializer):
             "agent_id",
             "transfer_number",
             "decline_reason",
+            "timezone",
             "started_at",
             "ended_at",
             "duration_seconds",
@@ -357,6 +363,56 @@ class CallSerializer(serializers.ModelSerializer):
             "updated_at",
         )
         read_only_fields = fields
+
+    def _caller_timezone_name(self):
+        cached = getattr(self, "_cached_timezone_name", None)
+        if cached is not None:
+            return cached
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        name = "America/New_York"
+        if user is not None and getattr(user, "pk", None):
+            try:
+                from apps.ai_caller.services import get_caller_settings
+
+                name = (
+                    get_caller_settings(user).timezone or "America/New_York"
+                ).strip()
+            except Exception:
+                name = "America/New_York"
+        self._cached_timezone_name = name
+        return name
+
+    def _caller_tz(self):
+        cached = getattr(self, "_cached_tz", None)
+        if cached is not None:
+            return cached
+        from apps.ai_caller.services import resolve_timezone
+
+        self._cached_tz = resolve_timezone(self._caller_timezone_name())
+        return self._cached_tz
+
+    def _local_iso(self, value):
+        if value is None:
+            return None
+        if timezone.is_naive(value):
+            value = timezone.make_aware(value, timezone.utc)
+        return value.astimezone(self._caller_tz()).isoformat()
+
+    def get_timezone(self, obj):
+        return self._caller_timezone_name()
+
+    def get_started_at(self, obj):
+        return self._local_iso(obj.started_at)
+
+    def get_ended_at(self, obj):
+        return self._local_iso(obj.ended_at)
+
+    def get_created_at(self, obj):
+        return self._local_iso(obj.created_at)
+
+    def get_updated_at(self, obj):
+        return self._local_iso(obj.updated_at)
 
     def get_message_count(self, obj):
         return len(obj.transcript or [])
@@ -383,9 +439,9 @@ class CallSerializer(serializers.ModelSerializer):
 
     def get_scheduled_at(self, obj):
         if hasattr(obj, "_scheduled_at"):
-            return getattr(obj, "_scheduled_at", None)
+            return self._local_iso(getattr(obj, "_scheduled_at", None))
         row = self._open_outreach(obj)
-        return row.scheduled_at if row else None
+        return self._local_iso(row.scheduled_at) if row else None
 
     def get_schedule_kind(self, obj):
         if hasattr(obj, "_schedule_kind"):
