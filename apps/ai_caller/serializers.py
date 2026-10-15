@@ -355,6 +355,11 @@ class CallSerializer(serializers.ModelSerializer):
     ended_at = serializers.SerializerMethodField()
     created_at = serializers.SerializerMethodField()
     updated_at = serializers.SerializerMethodField()
+    timezone = serializers.SerializerMethodField()
+    started_at = serializers.SerializerMethodField()
+    ended_at = serializers.SerializerMethodField()
+    created_at = serializers.SerializerMethodField()
+    updated_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Call
