@@ -4,12 +4,15 @@ import logging
 
 from django.conf import settings
 from django.db.models import (
+    BooleanField,
     Case,
     CharField,
     Count,
     Exists,
     F,
+    Func,
     IntegerField,
+    JSONField,
     OuterRef,
     Prefetch,
     Q,
@@ -17,7 +20,7 @@ from django.db.models import (
     Value,
     When,
 )
-from django.db.models.functions import Cast, Concat
+from django.db.models.functions import Cast, Coalesce, Concat, JSONObject
 from django.utils import timezone
 
 from apps.ai_caller.models import (
@@ -223,6 +226,14 @@ def _parse_status_list(status):
     return statuses
 
 
+class _JsonbArrayLength(Func):
+    """PostgreSQL jsonb_array_length(expr)."""
+
+    function = "jsonb_array_length"
+    arity = 1
+    output_field = IntegerField()
+
+
 def get_call_queryset(
     *,
     user=None,
@@ -233,6 +244,7 @@ def get_call_queryset(
     retell_call_id="",
     exclude_queued=False,
     ordering="",
+    light=False,
 ):
     queryset = Call.objects.select_related("patient").all()
     if user is not None:
@@ -276,23 +288,39 @@ def get_call_queryset(
     if retell_call_id:
         queryset = queryset.filter(retell_call_id=retell_call_id)
 
-    # Open outreach linked as the dial to place, or as the source callback call.
+    # One subquery for open outreach schedule fields (was 3 identical lookups).
     open_outreach = (
         ScheduledOutreach.objects.filter(
             status=ScheduledOutreach.Status.SCHEDULED,
         )
         .filter(Q(queued_call_id=OuterRef("pk")) | Q(source_call_id=OuterRef("pk")))
         .order_by("scheduled_at", "id")
+        .annotate(
+            _row=JSONObject(
+                scheduled_at=F("scheduled_at"),
+                kind=F("kind"),
+                raw_time_text=F("raw_time_text"),
+            )
+        )
+        .values("_row")[:1]
     )
     queryset = queryset.annotate(
-        _scheduled_at=Subquery(open_outreach.values("scheduled_at")[:1]),
-        _schedule_kind=Subquery(open_outreach.values("kind")[:1]),
-        _schedule_raw_time=Subquery(open_outreach.values("raw_time_text")[:1]),
+        _outreach=Subquery(open_outreach, output_field=JSONField()),
     )
 
     # Dial-queue UI order: scheduled (soonest) → paused → queued (oldest first).
     if ordering in {"dial_queue", "queue", "scheduled_first"}:
+        # Datetime sort needs a typed column; JSONObject value alone isn't orderable.
+        scheduled_at_sq = (
+            ScheduledOutreach.objects.filter(
+                status=ScheduledOutreach.Status.SCHEDULED,
+            )
+            .filter(Q(queued_call_id=OuterRef("pk")) | Q(source_call_id=OuterRef("pk")))
+            .order_by("scheduled_at", "id")
+            .values("scheduled_at")[:1]
+        )
         queryset = queryset.annotate(
+            _scheduled_at=Subquery(scheduled_at_sq),
             _dial_group=Case(
                 When(status=Call.Status.SCHEDULED, then=Value(0)),
                 When(status=Call.Status.PAUSED, then=Value(1)),
@@ -309,7 +337,56 @@ def get_call_queryset(
     else:
         queryset = queryset.order_by("-id")
 
+    if light:
+        # List payload only needs message_count / has_transcript — skip fat JSON blobs.
+        queryset = queryset.annotate(
+            _message_count=Coalesce(_JsonbArrayLength("transcript"), Value(0)),
+        ).annotate(
+            _has_transcript=Case(
+                When(_message_count__gt=0, then=Value(True)),
+                default=Value(False),
+                output_field=BooleanField(),
+            ),
+        ).defer(
+            "transcript",
+            "retell_transcript",
+            "live_agent_transcript",
+        )
+
     return queryset
+
+
+def get_call_summary_counts(*, user):
+    """Single-query status breakdown for /calls/summary/."""
+    queryset = Call.objects.filter(user=user)
+    dial_queue = [
+        Call.Status.QUEUED,
+        Call.Status.SCHEDULED,
+        Call.Status.PAUSED,
+    ]
+    counts = queryset.aggregate(
+        all=Count(
+            "id",
+            filter=~Q(status__in=dial_queue),
+        ),
+        completed=Count("id", filter=Q(status=Call.Status.COMPLETED)),
+        in_progress=Count("id", filter=Q(status=Call.Status.IN_PROGRESS)),
+        ongoing=Count("id", filter=Q(status=Call.Status.ONGOING)),
+        connect_live_agent=Count(
+            "id", filter=Q(status=Call.Status.CONNECT_LIVE_AGENT)
+        ),
+        waiting=Count("id", filter=Q(status=Call.Status.WAITING)),
+        not_attended=Count("id", filter=Q(status=Call.Status.NOT_ATTENDED)),
+        voicemail_reached=Count(
+            "id", filter=Q(status=Call.Status.VOICEMAIL_REACHED)
+        ),
+        callback=Count("id", filter=Q(status=Call.Status.CALLBACK)),
+        queued=Count("id", filter=Q(status__in=dial_queue)),
+        scheduled=Count("id", filter=Q(status=Call.Status.SCHEDULED)),
+        paused=Count("id", filter=Q(status=Call.Status.PAUSED)),
+        cancel=Count("id", filter=Q(status=Call.Status.CANCEL)),
+    )
+    return counts
 
 
 def ensure_first_queued_call(patient, *, actor=None):

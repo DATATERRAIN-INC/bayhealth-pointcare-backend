@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from django.db.models import Q
 from django.utils import timezone
@@ -343,7 +343,7 @@ class CallSerializer(serializers.ModelSerializer):
     # Same value set on patient create as service_name (why we are calling).
     reason = serializers.CharField(source="patient.service_name", read_only=True)
     duration_seconds = serializers.IntegerField(read_only=True)
-    has_transcript = serializers.BooleanField(read_only=True)
+    has_transcript = serializers.SerializerMethodField()
     message_count = serializers.SerializerMethodField()
     recording_url = serializers.SerializerMethodField()
     live_agent_recording_url = serializers.SerializerMethodField()
@@ -420,6 +420,15 @@ class CallSerializer(serializers.ModelSerializer):
     def _local_iso(self, value):
         if value is None:
             return None
+        # JSONObject / JSON subquery may return ISO strings instead of datetimes.
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            try:
+                value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return raw
         if timezone.is_naive(value):
             value = timezone.make_aware(value, timezone.utc)
         return value.astimezone(self._caller_tz()).isoformat()
@@ -439,7 +448,19 @@ class CallSerializer(serializers.ModelSerializer):
     def get_updated_at(self, obj):
         return self._local_iso(obj.updated_at)
 
+    def get_has_transcript(self, obj):
+        annotated = getattr(obj, "_has_transcript", None)
+        if annotated is not None:
+            return bool(annotated)
+        count = getattr(obj, "_message_count", None)
+        if count is not None:
+            return int(count) > 0
+        return bool(obj.transcript)
+
     def get_message_count(self, obj):
+        count = getattr(obj, "_message_count", None)
+        if count is not None:
+            return int(count)
         return len(obj.transcript or [])
 
     def get_recording_url(self, obj):
@@ -452,36 +473,47 @@ class CallSerializer(serializers.ModelSerializer):
             return None
         return (obj.live_agent_recording_url or "").strip() or None
 
-    def _open_outreach(self, obj):
+    def _outreach_row(self, obj):
+        """Open scheduled outreach, preferring queryset annotation when present."""
+        if hasattr(obj, "_outreach"):
+            row = getattr(obj, "_outreach", None) or None
+            return row if isinstance(row, dict) else None
+        # Legacy annotated fields (dial-queue ordering / older code paths).
+        if hasattr(obj, "_scheduled_at") or hasattr(obj, "_schedule_kind"):
+            return {
+                "scheduled_at": getattr(obj, "_scheduled_at", None),
+                "kind": getattr(obj, "_schedule_kind", None),
+                "raw_time_text": getattr(obj, "_schedule_raw_time", None) or "",
+            }
         return (
             ScheduledOutreach.objects.filter(
                 status=ScheduledOutreach.Status.SCHEDULED,
             )
             .filter(Q(queued_call_id=obj.pk) | Q(source_call_id=obj.pk))
             .order_by("scheduled_at", "id")
+            .values("scheduled_at", "kind", "raw_time_text")
             .first()
         )
 
     def get_scheduled_at(self, obj):
-        if hasattr(obj, "_scheduled_at"):
-            return self._local_iso(getattr(obj, "_scheduled_at", None))
-        row = self._open_outreach(obj)
-        return self._local_iso(row.scheduled_at) if row else None
-
-    def get_schedule_kind(self, obj):
-        if hasattr(obj, "_schedule_kind"):
-            return getattr(obj, "_schedule_kind", None) or None
-        row = self._open_outreach(obj)
-        return row.kind if row else None
-
-    def get_schedule_raw_time(self, obj):
-        if hasattr(obj, "_schedule_raw_time"):
-            value = getattr(obj, "_schedule_raw_time", None) or ""
-            return value or None
-        row = self._open_outreach(obj)
+        row = self._outreach_row(obj)
         if not row:
             return None
-        return (row.raw_time_text or "") or None
+        value = row.get("scheduled_at") if isinstance(row, dict) else None
+        return self._local_iso(value)
+
+    def get_schedule_kind(self, obj):
+        row = self._outreach_row(obj)
+        if not row:
+            return None
+        return row.get("kind") or None
+
+    def get_schedule_raw_time(self, obj):
+        row = self._outreach_row(obj)
+        if not row:
+            return None
+        value = row.get("raw_time_text") or ""
+        return value or None
 
 
 class CallPauseSerializer(serializers.Serializer):
