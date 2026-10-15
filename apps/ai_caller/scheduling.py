@@ -467,11 +467,11 @@ def schedule_callback_request(
 
 def schedule_reminder_for_missed_call(call: Call) -> Optional[ScheduledOutreach]:
     """
-    After a not-attended call, queue a reminder using settings.reminder_timeframe_hours.
-    Skips if patient already completed, is blocked, exhausted attempts, or has a
-    pending patient callback.
+    After a not-attended or voicemail call, queue a reminder using
+    settings.reminder_timeframe_hours. Skips if patient already completed, is
+    blocked, exhausted attempts, or has a pending patient callback.
     """
-    if not call or call.status != Call.Status.NOT_ATTENDED:
+    if not call or call.status not in Call.MISSED_STATUSES:
         return None
 
     patient = call.patient
@@ -493,7 +493,7 @@ def schedule_reminder_for_missed_call(call: Call) -> Optional[ScheduledOutreach]
     settings_obj = CallerSettings.load(user)
     trigger_cap = max(1, int(settings_obj.call_trigger_count or 1))
     not_attended_count = Call.objects.filter(
-        patient=patient, status=Call.Status.NOT_ATTENDED
+        patient=patient, status__in=Call.MISSED_STATUSES
     ).count()
     if not_attended_count >= trigger_cap:
         cancel_scheduled_for_patient(
@@ -554,7 +554,7 @@ def due_scheduled_outreaches(settings_obj, *, limit: int):
     ).values_list("patient_id", flat=True)
     in_progress_patient_ids = Call.objects.filter(
         user=settings_obj.user,
-        status=Call.Status.IN_PROGRESS,
+        status__in=Call.ACTIVE_STATUSES,
     ).values_list("patient_id", flat=True)
 
     qs = (
