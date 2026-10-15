@@ -230,6 +230,40 @@ class _JsonbArrayLength(Func):
     output_field = IntegerField()
 
 
+def _apply_call_search(queryset, search):
+    """Filter calls by patient fields, call id, or retell id (icontains)."""
+    search = (search or "").strip()
+    if not search:
+        return queryset
+
+    queryset = queryset.annotate(
+        _patient_full_name=Concat(
+            "patient__first_name",
+            Value(" "),
+            "patient__last_name",
+            output_field=CharField(),
+        ),
+        _dob_text=Cast("patient__dob", CharField()),
+        _call_id_text=Cast("id", CharField()),
+    )
+
+    match = (
+        Q(patient__first_name__icontains=search)
+        | Q(patient__last_name__icontains=search)
+        | Q(_patient_full_name__icontains=search)
+        | Q(patient__doctor__icontains=search)
+        | Q(patient__phone_number__icontains=search)
+        | Q(patient__service_name__icontains=search)
+        | Q(_dob_text__icontains=search)
+        | Q(_call_id_text__icontains=search)
+        | Q(retell_call_id__icontains=search)
+    )
+    if search.isdigit():
+        match |= Q(pk=int(search))
+
+    return queryset.filter(match)
+
+
 def get_call_queryset(
     *,
     user=None,
@@ -253,32 +287,25 @@ def get_call_queryset(
     ordering = (ordering or "").strip().lower()
 
     if search:
-        queryset = queryset.annotate(
-            _patient_full_name=Concat(
-                "patient__first_name", Value(" "), "patient__last_name"
-            ),
-            _dob_text=Cast("patient__dob", CharField()),
-        ).filter(
-            Q(patient__first_name__icontains=search)
-            | Q(patient__last_name__icontains=search)
-            | Q(_patient_full_name__icontains=search)
-            | Q(patient__doctor__icontains=search)
-            | Q(_dob_text__icontains=search)
-        )
+        queryset = _apply_call_search(queryset, search)
 
     if source and source != "all":
         queryset = queryset.filter(patient__source=source)
     if statuses:
         queryset = queryset.filter(status__in=statuses)
     elif exclude_queued:
-        # List default: hide dial-queue / scheduled rows.
-        queryset = queryset.exclude(
-            status__in=[
-                Call.Status.QUEUED,
-                Call.Status.SCHEDULED,
-                Call.Status.PAUSED,
-            ]
-        )
+        dial_queue = [
+            Call.Status.QUEUED,
+            Call.Status.SCHEDULED,
+            Call.Status.PAUSED,
+        ]
+        # List default: hide dial-queue rows, but still allow exact call-id search.
+        if search.isdigit():
+            queryset = queryset.exclude(
+                Q(status__in=dial_queue) & ~Q(pk=int(search))
+            )
+        else:
+            queryset = queryset.exclude(status__in=dial_queue)
     if patient_id:
         queryset = queryset.filter(patient_id=patient_id)
     if retell_call_id:
