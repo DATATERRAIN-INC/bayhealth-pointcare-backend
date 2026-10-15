@@ -2,6 +2,15 @@ from django.db import models
 
 
 class SmsConversation(models.Model):
+    class Status(models.TextChoices):
+        SENT = "sent", "Sent"
+        REPLIED = "replied", "Replied"
+        LIVE_AGENT = "live_agent", "Live Agent"
+        COMPLETED = "completed", "Completed"
+        # Legacy values kept for reads until data is migrated.
+        ONGOING = "ongoing", "Ongoing"
+        ENDED = "ended", "Ended"
+
     chat_id = models.CharField(max_length=128, unique=True)
     patient = models.ForeignKey(
         "ai_caller.Patient",
@@ -41,7 +50,12 @@ class SmsConversation(models.Model):
     dial_call_sid = models.CharField(max_length=64, blank=True, default="")
     transfer_status = models.CharField(max_length=32, blank=True, default="")
     flow = models.CharField(max_length=16, default="adult")
-    status = models.CharField(max_length=32, default="ongoing")
+    status = models.CharField(
+        max_length=32,
+        choices=Status.choices,
+        default=Status.SENT,
+        db_index=True,
+    )
     step = models.CharField(max_length=32, default="identity")
     transcript = models.TextField(blank=True)
     # SMS → live-agent voice bridge (one mix recording of both sides).

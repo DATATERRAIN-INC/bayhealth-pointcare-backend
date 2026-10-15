@@ -51,6 +51,60 @@ from apps.ai_sms.prompt import (
 
 logger = logging.getLogger(__name__)
 
+# Active conversations still waiting on / mid patient reply.
+_OPEN_SMS_STATUSES = (
+    SmsConversation.Status.SENT,
+    SmsConversation.Status.REPLIED,
+    SmsConversation.Status.ONGOING,  # legacy
+)
+
+
+def _normalize_sms_status(raw: str) -> str:
+    """Map flow/legacy status strings onto sent / replied / live_agent / completed."""
+    value = (raw or "").strip().lower().replace(" ", "_")
+    if value in {
+        SmsConversation.Status.LIVE_AGENT,
+        "liveagent",
+        "live_agent_requested",
+        "transfer",
+    }:
+        return SmsConversation.Status.LIVE_AGENT
+    if value in {
+        SmsConversation.Status.COMPLETED,
+        SmsConversation.Status.ENDED,
+        "ended",
+        "complete",
+        "done",
+    }:
+        return SmsConversation.Status.COMPLETED
+    if value in {
+        SmsConversation.Status.REPLIED,
+        SmsConversation.Status.ONGOING,
+        "ongoing",
+        "replied",
+        "in_progress",
+    }:
+        return SmsConversation.Status.REPLIED
+    if value in {SmsConversation.Status.SENT, "sent"}:
+        return SmsConversation.Status.SENT
+    return SmsConversation.Status.REPLIED
+
+
+def _close_open_sms_for_number(phone: str) -> None:
+    SmsConversation.objects.filter(
+        to_number=phone, status__in=_OPEN_SMS_STATUSES
+    ).update(status=SmsConversation.Status.COMPLETED)
+
+
+def _mark_patient_replied(conversation: SmsConversation) -> None:
+    """Promote sent/legacy-ongoing → replied on first inbound patient message."""
+    if conversation.status in {
+        SmsConversation.Status.SENT,
+        SmsConversation.Status.ONGOING,
+        "",
+    }:
+        conversation.status = SmsConversation.Status.REPLIED
+
 _SLOT_1 = "August 28th at 3 PM"
 _SLOT_2 = "August 31st at 5 PM"
 
@@ -415,7 +469,7 @@ def _flow_reply(step: str, text: str, variables: Dict[str, str]):
 
     if step == "not_sure":
         if answer == "yes":
-            return _live_agent_message(number), "ended", "ended"
+            return _live_agent_message(number), "ended", "live_agent"
         if answer == "no":
             return _barriers_ask(service), "barriers", "ongoing"
         return (
@@ -446,7 +500,7 @@ def _flow_reply(step: str, text: str, variables: Dict[str, str]):
                 "Thank you for letting me know. I can connect you with a team member "
                 "who can answer your questions.\n\n" + _live_agent_message(number),
                 "ended",
-                "ended",
+                "live_agent",
             )
         elif number == "5":
             return (
@@ -466,7 +520,7 @@ def _flow_reply(step: str, text: str, variables: Dict[str, str]):
         if number == "1":
             return _booked_message(service, number), "ended", "ended"
         if number == "2":
-            return _live_agent_message(number), "ended", "ended"
+            return _live_agent_message(number), "ended", "live_agent"
         if number == "3":
             return (
                 "Absolutely. We'll have our team follow up with you. Thank you for your time.",
@@ -541,7 +595,7 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
     word = _word(text)
     if word in {"stop", "end", "cancel", "unsubscribe"}:
         conversation.step = "ended"
-        conversation.status = "ended"
+        conversation.status = SmsConversation.Status.COMPLETED
         _remember(conversation, "Patient", text)
         conversation.save(update_fields=["step", "status", "transcript"])
         return ""
@@ -573,7 +627,11 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
         _remember(conversation, "Patient", text)
         _remember(conversation, "Agent", reply)
         conversation.step = "ended"
-        conversation.status = "ended"
+        conversation.status = (
+            SmsConversation.Status.LIVE_AGENT
+            if intent == "live_agent"
+            else SmsConversation.Status.COMPLETED
+        )
         conversation.save(update_fields=["step", "status", "transcript"])
         return reply
 
@@ -599,7 +657,7 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
         elif answer == "no":
             reply = "Sorry about that! Please disregard this message."
             conversation.step = "ended"
-            conversation.status = "ended"
+            conversation.status = SmsConversation.Status.COMPLETED
         else:
             return None
         _remember(conversation, "Agent", reply)
@@ -651,7 +709,7 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
             _remember(conversation, "Patient", text)
             reply = "No problem, thank you for your time. Have a great day."
             conversation.step = "ended"
-            conversation.status = "ended"
+            conversation.status = SmsConversation.Status.COMPLETED
             _remember(conversation, "Agent", reply)
             conversation.save(update_fields=["step", "status", "transcript"])
             return reply
@@ -665,7 +723,7 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
         _remember(conversation, "Patient", text)
         reply = "Absolutely. We'll follow up with you then. Thank you."
         conversation.step = "ended"
-        conversation.status = "ended"
+        conversation.status = SmsConversation.Status.COMPLETED
         _remember(conversation, "Agent", reply)
         conversation.save(update_fields=["step", "status", "transcript"])
         return reply
@@ -677,14 +735,14 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
                 "I'll connect you with a team member now — you'll receive a call shortly."
             )
             conversation.step = "ended"
-            conversation.status = "ended"
+            conversation.status = SmsConversation.Status.LIVE_AGENT
         elif answer == "no":
             reply = _call_us(
                 "No problem. If you need anything, you can reach us at "
                 "{{office_phone}}. Have a great day."
             )
             conversation.step = "ended"
-            conversation.status = "ended"
+            conversation.status = SmsConversation.Status.COMPLETED
         else:
             return None
         _remember(conversation, "Agent", reply)
@@ -701,7 +759,7 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
     _remember(conversation, "Patient", text)
     _remember(conversation, "Agent", reply)
     conversation.step = new_step
-    conversation.status = new_status
+    conversation.status = _normalize_sms_status(new_status)
     conversation.save(update_fields=["step", "status", "transcript"])
     return reply
 
@@ -802,7 +860,8 @@ def _minor_next(step: str, text: str, variables: Dict[str, str]):
     # After identity is confirmed, schedule / live-agent requests go straight to transfer.
     if step not in {"identity"} and intent in {"schedule", "live_agent"}:
         reason = "live_agent" if intent == "live_agent" else "schedule"
-        return _minor_connect_message(reason), "ended", "ended"
+        end_status = "live_agent" if intent == "live_agent" else "ended"
+        return _minor_connect_message(reason), "ended", end_status
 
     if step == "identity":
         if answer == "yes":
@@ -852,7 +911,7 @@ def _minor_next(step: str, text: str, variables: Dict[str, str]):
 
     if step in {"disclose_no", "query_connect"}:
         if answer == "yes" or intent in {"schedule", "live_agent"}:
-            return _minor_connect_message("live_agent"), "ended", "ended"
+            return _minor_connect_message("live_agent"), "ended", "live_agent"
         if answer == "no":
             return (
                 "No problem at all. Thank you for your time. Please take care, and have a great day.",
@@ -919,7 +978,7 @@ def _minor_next(step: str, text: str, variables: Dict[str, str]):
         if intent == "schedule" or _wants_schedule(text):
             return _minor_connect_message("schedule"), "ended", "ended"
         if intent == "live_agent":
-            return _minor_connect_message("live_agent"), "ended", "ended"
+            return _minor_connect_message("live_agent"), "ended", "live_agent"
         if intent in {"question", "other"}:
             return _minor_offer_connect_for_query(), "query_connect", "ongoing"
         if answer == "yes":
@@ -937,11 +996,11 @@ def _minor_next(step: str, text: str, variables: Dict[str, str]):
         if intent == "schedule" or _wants_schedule(text):
             return _minor_connect_message("schedule"), "ended", "ended"
         if intent == "live_agent" or answer == "yes":
-            return _minor_connect_message("question"), "ended", "ended"
+            return _minor_connect_message("question"), "ended", "live_agent"
         if answer == "no":
             return _minor_goodbye(), "ended", "ended"
         # Free-form question/request → connect them with someone who can help.
-        return _minor_connect_message("question"), "ended", "ended"
+        return _minor_connect_message("question"), "ended", "live_agent"
 
     return (
         closed_reply(_sms_from_number() or "the office"),
@@ -958,7 +1017,7 @@ def _minor_scripted_reply(conversation, text: str) -> Optional[str]:
     word = _word(text)
     if word in {"stop", "end", "cancel", "unsubscribe"}:
         conversation.step = "ended"
-        conversation.status = "ended"
+        conversation.status = SmsConversation.Status.COMPLETED
         _remember(conversation, "Guardian", text)
         conversation.save(update_fields=["step", "status", "transcript"])
         return ""
@@ -980,7 +1039,11 @@ def _minor_scripted_reply(conversation, text: str) -> Optional[str]:
         _remember(conversation, "Guardian", text)
         _remember(conversation, "Agent", reply)
         conversation.step = "ended"
-        conversation.status = "ended"
+        conversation.status = (
+            SmsConversation.Status.LIVE_AGENT
+            if intent == "live_agent"
+            else SmsConversation.Status.COMPLETED
+        )
         conversation.save(update_fields=["step", "status", "transcript"])
         return reply
 
@@ -1001,7 +1064,7 @@ def _minor_scripted_reply(conversation, text: str) -> Optional[str]:
     _remember(conversation, "Guardian", text)
     _remember(conversation, "Agent", reply)
     conversation.step = new_step
-    conversation.status = new_status
+    conversation.status = _normalize_sms_status(new_status)
     conversation.save(update_fields=["step", "status", "transcript"])
     return reply
 
@@ -1094,13 +1157,19 @@ def _apply_conversational_side_effects(conversation, text: str, reply: str) -> N
     if reply:
         _remember(conversation, "Agent", reply)
 
-    if _wants_schedule(text) or _wants_live_agent(text) or (
+    connecting = (
         "you'll receive a call shortly" in lowered_reply
         or "you will receive a call shortly" in lowered_reply
         or "connect you with" in lowered_reply
+    )
+    if _wants_live_agent(text) or (
+        connecting and not _wants_schedule(text)
     ):
         conversation.step = "ended"
-        conversation.status = "ended"
+        conversation.status = SmsConversation.Status.LIVE_AGENT
+    elif _wants_schedule(text) or connecting:
+        conversation.step = "ended"
+        conversation.status = SmsConversation.Status.COMPLETED
     elif (conversation.step or "") == "identity" and _yn(text) == "yes":
         conversation.step = "disclose" if (conversation.flow or "") == "minor" else "consent"
     elif (conversation.step or "") in {"consent", "disclose"} and _yn(text) == "yes":
@@ -1111,7 +1180,7 @@ def _apply_conversational_side_effects(conversation, text: str, reply: str) -> N
         _yn(text) == "yes" or _wants_schedule(text)
     ):
         conversation.step = "ended"
-        conversation.status = "ended"
+        conversation.status = SmsConversation.Status.COMPLETED
 
     conversation.save(update_fields=["step", "status", "transcript"])
 
@@ -1513,7 +1582,7 @@ def start_sms_conversation(
     if sms_err:
         return {"ok": False, "error": sms_err, "status_code": 502}
 
-    SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
+    _close_open_sms_for_number(phone)
     actor_user = actor or getattr(patient, "user", None) if patient else actor
     conversation = SmsConversation.objects.create(
         chat_id=chat_id,
@@ -1530,7 +1599,7 @@ def start_sms_conversation(
         transfer_number_index=0,
         agent_id=chat_agent_id,
         flow="adult",
-        status="ongoing",
+        status=SmsConversation.Status.SENT,
         step="identity",
         transcript=f"Agent: {greeting}",
     )
@@ -1539,7 +1608,8 @@ def start_sms_conversation(
         "ok": True,
         "chat_id": chat_id,
         "message_sid": message_sid,
-        "status": "ongoing",
+        "status": SmsConversation.Status.SENT,
+        "step": conversation.step or "identity",
         "from_number": from_number,
         "phone_last4": _phone_last4(phone),
         "agent_id": chat_agent_id,
@@ -1608,7 +1678,7 @@ def start_minor_sms_conversation(
         return {"ok": False, "error": sms_err, "status_code": 502}
 
     chat_id = f"minor-{uuid.uuid4().hex}"
-    SmsConversation.objects.filter(to_number=phone, status="ongoing").update(status="ended")
+    _close_open_sms_for_number(phone)
     actor_user = actor or getattr(patient, "user", None) if patient else actor
     conversation = SmsConversation.objects.create(
         chat_id=chat_id,
@@ -1628,7 +1698,7 @@ def start_minor_sms_conversation(
         transfer_numbers=numbers,
         transfer_number_index=0,
         flow="minor",
-        status="ongoing",
+        status=SmsConversation.Status.SENT,
         step="identity",
         transcript=f"Agent: {greeting}",
     )
@@ -1637,7 +1707,8 @@ def start_minor_sms_conversation(
         "ok": True,
         "chat_id": chat_id,
         "message_sid": message_sid,
-        "status": "ongoing",
+        "status": SmsConversation.Status.SENT,
+        "step": conversation.step or "identity",
         "from_number": from_number,
         "phone_last4": _phone_last4(phone),
         "provider": "twilio",
@@ -1658,7 +1729,7 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
         return ""
 
     conversation = (
-        SmsConversation.objects.filter(to_number=phone, status="ongoing")
+        SmsConversation.objects.filter(to_number=phone, status__in=_OPEN_SMS_STATUSES)
         .order_by("-created_at")
         .first()
     )
@@ -1678,6 +1749,11 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
 
     if message_sid and conversation.last_inbound_sid == message_sid:
         return ""
+
+    # First (or any) patient reply while still "sent" → "replied".
+    _mark_patient_replied(conversation)
+    if conversation.status == SmsConversation.Status.REPLIED:
+        conversation.save(update_fields=["status", "updated_at"])
 
     if (conversation.flow or "adult") == "minor":
         scripted = _minor_scripted_reply(conversation, text)
