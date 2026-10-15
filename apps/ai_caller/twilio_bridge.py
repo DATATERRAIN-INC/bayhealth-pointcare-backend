@@ -1411,6 +1411,8 @@ def start_leg_recording_for_call(session: Dict[str, Any], call_sid: str) -> None
 
 
 def announce_you_can_speak_now(session: Dict[str, Any], conference_sid: str) -> None:
+    from apps.ai_caller.models import Call
+
     session = dict(session or {})
     if session.get("spoke_now") or not conference_sid:
         return
@@ -1435,6 +1437,14 @@ def announce_you_can_speak_now(session: Dict[str, Any], conference_sid: str) -> 
         )
     except Exception:
         logger.exception("Failed to announce connected session=%s", session_id)
+        return
+
+    try:
+        set_transfer_call_status(session, Call.Status.CONNECT_LIVE_AGENT)
+    except Exception:
+        logger.exception(
+            "Failed to set connect_live_agent status session=%s", session_id
+        )
 
 
 def _delayed_start_leg_recording(session_id: str, call_sid: str, leg: str) -> None:
@@ -1622,8 +1632,16 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
         )
         return
     elif not patient and not provider:
-        mix = str(session.get("humans_transcript") or "")
-        mix_items = None
+        if mix_items:
+            # Diarization produced structured, timestamped turns but didn't
+            # confidently split into patient + live_agent (e.g. only one
+            # voice cluster detected). Keep those turns intact instead of
+            # flattening everything into a single unlabeled wall of text —
+            # a partially-labeled transcript is still better than one blob.
+            mix = ""
+        else:
+            mix = str(session.get("humans_transcript") or "")
+            mix_items = None
     elif provider and not patient:
         # Provider-only is safe (live agent inbound). Persist it.
         mix = ""

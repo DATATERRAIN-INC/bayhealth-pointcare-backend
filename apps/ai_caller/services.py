@@ -62,7 +62,8 @@ def _patient_has_call_status(*statuses):
 def _filter_patients_by_call_status(queryset, call_status):
     """
     Filter patients by effective call_status (same priority as PatientSerializer):
-    in_progress > waiting > paused > scheduled > queued > latest call status.
+    active (in_progress/ongoing/connect_live_agent) > waiting > paused >
+    scheduled > queued > latest call status.
     """
     statuses = _parse_status_list(call_status)
     if not statuses or "all" in statuses:
@@ -73,13 +74,13 @@ def _filter_patients_by_call_status(queryset, call_status):
     if not statuses:
         return queryset.none()
 
-    has_in_progress = _patient_has_call_status(Call.Status.IN_PROGRESS)
+    has_active = _patient_has_call_status(*Call.ACTIVE_STATUSES)
     has_waiting = _patient_has_call_status(Call.Status.WAITING)
     has_paused = _patient_has_call_status(Call.Status.PAUSED)
     has_scheduled = _patient_has_call_status(Call.Status.SCHEDULED)
     has_queued = _patient_has_call_status(Call.Status.QUEUED)
     has_open_dial = _patient_has_call_status(
-        Call.Status.IN_PROGRESS,
+        *Call.ACTIVE_STATUSES,
         Call.Status.WAITING,
         Call.Status.PAUSED,
         Call.Status.SCHEDULED,
@@ -88,24 +89,27 @@ def _filter_patients_by_call_status(queryset, call_status):
 
     match = Q()
     for status in statuses:
-        if status == Call.Status.IN_PROGRESS:
-            match |= Q(_has_in_progress=True) | has_in_progress
+        if status in Call.ACTIVE_STATUSES:
+            # A patient only has one truly active call at a time, so an
+            # exact match on the requested active status is enough.
+            match |= Q(_active_call_status=status) | _patient_has_call_status(status)
         elif status == Call.Status.WAITING:
-            match |= has_waiting & ~has_in_progress
+            match |= has_waiting & ~has_active
         elif status == Call.Status.PAUSED:
-            match |= has_paused & ~has_in_progress & ~has_waiting
+            match |= has_paused & ~has_active & ~has_waiting
         elif status == Call.Status.SCHEDULED:
-            match |= has_scheduled & ~has_in_progress & ~has_waiting & ~has_paused
+            match |= has_scheduled & ~has_active & ~has_waiting & ~has_paused
         elif status == Call.Status.QUEUED:
             match |= (
                 has_queued
-                & ~has_in_progress
+                & ~has_active
                 & ~has_waiting
                 & ~has_paused
                 & ~has_scheduled
             )
         else:
-            # completed / not_attended / callback — latest status, no open dial row
+            # completed / not_attended / voicemail_reached / callback —
+            # latest status, no open dial row
             match |= (
                 Q(_latest_call_status=status)
                 & ~has_open_dial
@@ -149,9 +153,9 @@ def get_patient_queryset(
     latest_call = Call.objects.filter(patient_id=OuterRef("pk")).order_by(
         "-started_at", "-id"
     )
-    has_in_progress = Call.objects.filter(
-        patient_id=OuterRef("pk"), status=Call.Status.IN_PROGRESS
-    )
+    active_call = Call.objects.filter(
+        patient_id=OuterRef("pk"), status__in=Call.ACTIVE_STATUSES
+    ).order_by("-started_at", "-id")
     queryset = queryset.annotate(
         _latest_call_status=Subquery(latest_call.values("status")[:1]),
         _latest_call_id=Subquery(latest_call.values("id")[:1]),
@@ -162,7 +166,7 @@ def get_patient_queryset(
         _latest_live_agent_recording_url=Subquery(
             latest_call.values("live_agent_recording_url")[:1]
         ),
-        _has_in_progress=Exists(has_in_progress),
+        _active_call_status=Subquery(active_call.values("status")[:1]),
     ).prefetch_related(
         Prefetch(
             "calls",
@@ -367,8 +371,15 @@ def get_call_summary_counts(*, user):
         ),
         completed=Count("id", filter=Q(status=Call.Status.COMPLETED)),
         in_progress=Count("id", filter=Q(status=Call.Status.IN_PROGRESS)),
+        ongoing=Count("id", filter=Q(status=Call.Status.ONGOING)),
+        connect_live_agent=Count(
+            "id", filter=Q(status=Call.Status.CONNECT_LIVE_AGENT)
+        ),
         waiting=Count("id", filter=Q(status=Call.Status.WAITING)),
         not_attended=Count("id", filter=Q(status=Call.Status.NOT_ATTENDED)),
+        voicemail_reached=Count(
+            "id", filter=Q(status=Call.Status.VOICEMAIL_REACHED)
+        ),
         callback=Count("id", filter=Q(status=Call.Status.CALLBACK)),
         queued=Count("id", filter=Q(status__in=dial_queue)),
         scheduled=Count("id", filter=Q(status=Call.Status.SCHEDULED)),
@@ -675,6 +686,12 @@ def _map_retell_status(raw_status, *, disconnection_reason="", event=""):
     reason = (disconnection_reason or "").strip().lower()
     event = (event or "").strip().lower()
 
+    # Voicemail/answering-machine is tracked as its own status rather than
+    # folded into a generic not-attended bucket.
+    voicemail_reasons = {"voicemail_reached", "machine_detected"}
+    if reason in voicemail_reasons or status == "voicemail":
+        return Call.Status.VOICEMAIL_REACHED
+
     not_attended_reasons = {
         "dial_no_answer",
         "dial_busy",
@@ -683,12 +700,10 @@ def _map_retell_status(raw_status, *, disconnection_reason="", event=""):
         "no_answer",
         "busy",
         "failed",
-        "voicemail_reached",
-        "machine_detected",
     }
     if reason in not_attended_reasons:
         return Call.Status.NOT_ATTENDED
-    if status in {"not_connected", "failed", "busy", "no_answer", "voicemail", "error"}:
+    if status in {"not_connected", "failed", "busy", "no_answer", "error"}:
         return Call.Status.NOT_ATTENDED
 
     # Answered then hung up (user/agent) still counts as completed.
@@ -697,7 +712,11 @@ def _map_retell_status(raw_status, *, disconnection_reason="", event=""):
     if event in {"call_ended", "call_analyzed"}:
         return Call.Status.COMPLETED
 
-    if status in {"ongoing", "registered", "in_progress", "ringing"}:
+    # Picked up and the conversation is live right now.
+    if status == "ongoing":
+        return Call.Status.ONGOING
+    # Dialing / ringing, not yet answered.
+    if status in {"registered", "in_progress", "ringing"}:
         return Call.Status.IN_PROGRESS
     return Call.Status.IN_PROGRESS
 
@@ -991,9 +1010,9 @@ def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
             "status_code": 400,
         }
 
-    # Allow the claimed/queued row itself; block any other in-progress call.
+    # Allow the claimed/queued row itself; block any other active call.
     in_progress_qs = Call.objects.filter(
-        patient=patient, status=Call.Status.IN_PROGRESS
+        patient=patient, status__in=Call.ACTIVE_STATUSES
     )
     if existing_call is not None:
         in_progress_qs = in_progress_qs.exclude(pk=existing_call.pk)
@@ -1009,7 +1028,7 @@ def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
             1, int(CallerSettings.load(patient.user).call_trigger_count or 1)
         )
         not_attended_count = Call.objects.filter(
-            patient=patient, status=Call.Status.NOT_ATTENDED
+            patient=patient, status__in=Call.MISSED_STATUSES
         ).count()
         if not_attended_count >= trigger_cap:
             return {
@@ -1234,9 +1253,9 @@ def consecutive_not_attended_streak(patient) -> int:
     if patient is None:
         return 0
     outcome_statuses = {
-        Call.Status.NOT_ATTENDED,
         Call.Status.COMPLETED,
         Call.Status.CALLBACK,
+        *Call.MISSED_STATUSES,
     }
     streak = 0
     for row in (
@@ -1245,7 +1264,7 @@ def consecutive_not_attended_streak(patient) -> int:
         .only("id", "status")
         .iterator()
     ):
-        if row.status == Call.Status.NOT_ATTENDED:
+        if row.status in Call.MISSED_STATUSES:
             streak += 1
             continue
         break
@@ -1254,10 +1273,10 @@ def consecutive_not_attended_streak(patient) -> int:
 
 def maybe_trigger_sms_after_missed_call(call):
     """
-    When text SMS is enabled and consecutive not_attended hits
+    When text SMS is enabled and consecutive not_attended/voicemail hits
     sms_trigger_after_calls, start adult or guardian SMS once for this streak.
     """
-    if not call or call.status != Call.Status.NOT_ATTENDED:
+    if not call or call.status not in Call.MISSED_STATUSES:
         return None
 
     patient = call.patient
@@ -1385,11 +1404,14 @@ def update_call_from_retell_payload(payload):
     if previous_status == Call.Status.CALLBACK:
         call.status = Call.Status.CALLBACK
     elif stay_on_transfer:
-        call.status = (
-            Call.Status.WAITING
-            if previous_status == Call.Status.WAITING
-            else Call.Status.IN_PROGRESS
-        )
+        # Retell says the call ended, but the patient is still on the Twilio
+        # warm-transfer leg (waiting for, or talking to, a live agent) —
+        # keep whichever of those two states was already recorded instead of
+        # letting Retell's mapped_status (completed/not_attended) win.
+        if previous_status in {Call.Status.WAITING, Call.Status.CONNECT_LIVE_AGENT}:
+            call.status = previous_status
+        else:
+            call.status = Call.Status.IN_PROGRESS
     else:
         call.status = mapped_status
 
@@ -1411,13 +1433,12 @@ def update_call_from_retell_payload(payload):
         if not call.ended_at or ended_at > call.ended_at:
             call.ended_at = ended_at
     elif not call.ended_at and (
-        call.status in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED}
+        call.status in {Call.Status.COMPLETED, *Call.MISSED_STATUSES}
         or (
             call.status == Call.Status.CALLBACK
             and (
                 event.lower() in {"call_ended", "call_analyzed"}
-                or mapped_status
-                in {Call.Status.COMPLETED, Call.Status.NOT_ATTENDED}
+                or mapped_status in {Call.Status.COMPLETED, *Call.MISSED_STATUSES}
             )
         )
     ):
@@ -1453,7 +1474,8 @@ def update_call_from_retell_payload(payload):
             )
 
     # Twilio default Voice URL / carrier-iOS voicemail "answers" but is not a
-    # real patient. Treat as not_attended when those stock phrases appear.
+    # real patient. Treat as voicemail when those stock phrases appear, even
+    # if Retell's disconnection_reason didn't flag it.
     if (
         previous_status != Call.Status.CALLBACK
         and call.status == Call.Status.COMPLETED
@@ -1461,9 +1483,9 @@ def update_call_from_retell_payload(payload):
             call.retell_transcript or call.transcript or []
         )
     ):
-        call.status = Call.Status.NOT_ATTENDED
+        call.status = Call.Status.VOICEMAIL_REACHED
         dialer_logger.info(
-            "CALL_NON_HUMAN_ANSWER retell_call_id=%s -> not_attended",
+            "CALL_NON_HUMAN_ANSWER retell_call_id=%s -> voicemail_reached",
             call_id,
         )
 
@@ -1499,8 +1521,9 @@ def update_call_from_retell_payload(payload):
     # If the agent agreed to call back but never invoked the tool, infer from transcript.
     if call.status in {
         Call.Status.COMPLETED,
-        Call.Status.NOT_ATTENDED,
         Call.Status.IN_PROGRESS,
+        Call.Status.ONGOING,
+        *Call.MISSED_STATUSES,
     }:
         maybe_schedule_callback_from_transcript(call)
         call.refresh_from_db(fields=["status"])
@@ -1514,8 +1537,8 @@ def update_call_from_retell_payload(payload):
             exclude_source_call=call,
         )
     elif (
-        call.status == Call.Status.NOT_ATTENDED
-        and previous_status != Call.Status.NOT_ATTENDED
+        call.status in Call.MISSED_STATUSES
+        and previous_status not in Call.MISSED_STATUSES
     ):
         schedule_reminder_for_missed_call(call)
         maybe_trigger_sms_after_missed_call(call)
@@ -1554,13 +1577,13 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
     missing_transcript = Q(transcript=[]) | Q(transcript__isnull=True)
     qs = (
         base.filter(
-            Q(status=Call.Status.IN_PROGRESS)
+            Q(status__in=Call.ACTIVE_STATUSES)
             | (
                 Q(
                     status__in=[
                         Call.Status.CALLBACK,
                         Call.Status.COMPLETED,
-                        Call.Status.NOT_ATTENDED,
+                        *Call.MISSED_STATUSES,
                     ]
                 )
                 & missing_transcript
@@ -1569,7 +1592,7 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
         )
         .annotate(
             _sync_priority=Case(
-                When(status=Call.Status.IN_PROGRESS, then=0),
+                When(status__in=Call.ACTIVE_STATUSES, then=0),
                 When(status=Call.Status.CALLBACK, then=1),
                 default=2,
                 output_field=IntegerField(),
@@ -1689,7 +1712,7 @@ def queued_calls_due_for_outbound(settings_obj=None, limit=None):
     ).values_list("patient_id", flat=True)
 
     in_progress_ids = Call.objects.filter(
-        status=Call.Status.IN_PROGRESS,
+        status__in=Call.ACTIVE_STATUSES,
         user=user,
     ).values_list("patient_id", flat=True)
 
@@ -1698,14 +1721,14 @@ def queued_calls_due_for_outbound(settings_obj=None, limit=None):
             user=user,
             started_at__gte=day_start,
             started_at__lt=day_end,
-            status__in=[Call.Status.IN_PROGRESS, Call.Status.COMPLETED],
+            status__in=[*Call.ACTIVE_STATUSES, Call.Status.COMPLETED],
         ).values_list("patient_id", flat=True)
     )
 
     from django.db.models import Count
 
     exhausted_ids = (
-        Call.objects.filter(user=user, status=Call.Status.NOT_ATTENDED)
+        Call.objects.filter(user=user, status__in=Call.MISSED_STATUSES)
         .values("patient_id")
         .annotate(attempts=Count("id"))
         .filter(attempts__gte=trigger_cap)
@@ -1724,7 +1747,7 @@ def queued_calls_due_for_outbound(settings_obj=None, limit=None):
     ).values_list("patient_id", flat=True)
 
     ever_not_attended_ids = Call.objects.filter(
-        user=user, status=Call.Status.NOT_ATTENDED
+        user=user, status__in=Call.MISSED_STATUSES
     ).values_list("patient_id", flat=True)
 
     queryset = (
@@ -1797,7 +1820,7 @@ def _run_scheduled_outbound_for_settings(settings_obj):
     max_concurrent = max(1, int(settings_obj.max_calls_per_run or 1))
     in_progress_count = Call.objects.filter(
         user=settings_obj.user,
-        status=Call.Status.IN_PROGRESS,
+        status__in=Call.ACTIVE_STATUSES,
     ).count()
     slots_free = max(0, max_concurrent - in_progress_count)
 
