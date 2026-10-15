@@ -189,7 +189,7 @@ class PatientSerializer(serializers.ModelSerializer):
         if not started_at:
             return None
         end = ended_at
-        if end is None and status == Call.Status.IN_PROGRESS:
+        if end is None and status in Call.ACTIVE_STATUSES:
             end = timezone.now()
         if end is None:
             return None
@@ -224,13 +224,22 @@ class PatientSerializer(serializers.ModelSerializer):
     def get_call_status(self, obj):
         """
         Current dial status for this patient.
-        Priority: in_progress > latest real call outcome > paused/scheduled/queued.
-        Queue rows (queued/scheduled/paused) do not override a newer not_attended/completed/callback.
+        Priority: active call (in_progress/ongoing/connect_live_agent) >
+        latest real call outcome > paused/scheduled/queued.
+        Queue rows (queued/scheduled/paused) do not override a newer
+        not_attended/voicemail_reached/completed/callback.
         """
-        if getattr(obj, "_has_in_progress", None) or Call.objects.filter(
-            patient=obj, status=Call.Status.IN_PROGRESS
-        ).exists():
-            return Call.Status.IN_PROGRESS
+        if hasattr(obj, "_active_call_status"):
+            active_status = obj._active_call_status
+        else:
+            active_status = (
+                Call.objects.filter(patient=obj, status__in=Call.ACTIVE_STATUSES)
+                .order_by("-started_at", "-id")
+                .values_list("status", flat=True)
+                .first()
+            )
+        if active_status:
+            return active_status
         if Call.objects.filter(patient=obj, status=Call.Status.WAITING).exists():
             return Call.Status.WAITING
 

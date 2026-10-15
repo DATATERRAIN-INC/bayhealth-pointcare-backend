@@ -245,8 +245,15 @@ class CallViewSet(viewsets.ModelViewSet):
                 ).count(),
                 "completed": queryset.filter(status=Call.Status.COMPLETED).count(),
                 "in_progress": queryset.filter(status=Call.Status.IN_PROGRESS).count(),
+                "ongoing": queryset.filter(status=Call.Status.ONGOING).count(),
+                "connect_live_agent": queryset.filter(
+                    status=Call.Status.CONNECT_LIVE_AGENT
+                ).count(),
                 "waiting": queryset.filter(status=Call.Status.WAITING).count(),
                 "not_attended": queryset.filter(status=Call.Status.NOT_ATTENDED).count(),
+                "voicemail_reached": queryset.filter(
+                    status=Call.Status.VOICEMAIL_REACHED
+                ).count(),
                 "callback": queryset.filter(status=Call.Status.CALLBACK).count(),
                 # Waiting dial pool (ready-now + future scheduled + paused).
                 "queued": queryset.filter(

@@ -121,6 +121,9 @@ class Call(models.Model):
         SCHEDULED = "scheduled", "Scheduled"
         PAUSED = "paused", "Paused"
         IN_PROGRESS = "in_progress", "In Progress"
+        ONGOING = "ongoing", "Ongoing"
+        VOICEMAIL_REACHED = "voicemail_reached", "Voicemail Reached"
+        CONNECT_LIVE_AGENT = "connect_live_agent", "Connect Live Agent"
         WAITING = "waiting", "Waiting"
         COMPLETED = "completed", "Completed"
         NOT_ATTENDED = "not_attended", "Not Attended"
@@ -130,6 +133,16 @@ class Call(models.Model):
     class Flow(models.TextChoices):
         OUTBOUND = "outbound", "Outbound"
         GUARDIAN = "guardian", "Guardian"
+
+    # Statuses that mean "the call is still live" — used wherever code needs
+    # to treat an active call as a single bucket (duration calc, patient-level
+    # status aggregation, dialer concurrency limits).
+    ACTIVE_STATUSES = (Status.IN_PROGRESS, Status.ONGOING, Status.CONNECT_LIVE_AGENT)
+
+    # Statuses that mean "no human was reached" — voicemail is tracked
+    # separately from a plain no-answer/busy/failed dial, but both still
+    # count toward retry caps and missed-call reminders the same way.
+    MISSED_STATUSES = (Status.NOT_ATTENDED, Status.VOICEMAIL_REACHED)
 
     user = models.ForeignKey(
         "users.User",
@@ -161,7 +174,7 @@ class Call(models.Model):
     retell_call_id = models.CharField(max_length=120, unique=True, null=True, blank=True)
     flow = models.CharField(max_length=16, choices=Flow.choices)
     status = models.CharField(
-        max_length=16,
+        max_length=32,
         choices=Status.choices,
         default=Status.IN_PROGRESS,
     )
@@ -203,7 +216,9 @@ class Call(models.Model):
         """
         if not self.started_at:
             return None
-        end = self.ended_at or (timezone.now() if self.status == self.Status.IN_PROGRESS else None)
+        end = self.ended_at or (
+            timezone.now() if self.status in self.ACTIVE_STATUSES else None
+        )
         if not end:
             return None
         return max(0, int((end - self.started_at).total_seconds()))
