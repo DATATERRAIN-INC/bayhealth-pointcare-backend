@@ -344,7 +344,7 @@ class StartMinorSmsConversationView(APIView):
                 "message": result.get("message") or "Minor SMS conversation started.",
             },
             status=status.HTTP_200_OK,
-        }
+        )
 
 
 @method_decorator(csrf_exempt, name="dispatch")
