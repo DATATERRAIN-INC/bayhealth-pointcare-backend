@@ -523,11 +523,25 @@ class CallSerializer(serializers.ModelSerializer):
 
 class CallPauseSerializer(serializers.Serializer):
     """
-    PUT body:
-      {"status": "paused"|"cancel"|"queued"|"scheduled"}
-    Also accepts legacy {"paused": true|false}.
+    PUT/PATCH body:
+      {"call_ids": [1] | [1, 2, 3], "status": "paused"|"cancel"|"queued"|"scheduled"}
+    Also accepts legacy {"ids": [...]} and {"paused": true|false}.
     """
 
+    call_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        allow_empty=False,
+        min_length=1,
+        required=False,
+        help_text="One or more call ids to update.",
+    )
+    # Legacy alias for call_ids.
+    ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        allow_empty=False,
+        min_length=1,
+        required=False,
+    )
     status = serializers.ChoiceField(
         choices=[
             Call.Status.CANCEL,
@@ -542,6 +556,21 @@ class CallPauseSerializer(serializers.Serializer):
     def validate(self, attrs):
         if "status" not in attrs and "paused" not in attrs:
             raise serializers.ValidationError("Provide status (or paused).")
+        raw_ids = attrs.get("call_ids") or attrs.get("ids")
+        if not raw_ids:
+            raise serializers.ValidationError(
+                {"call_ids": "Provide call_ids (array of call ids)."}
+            )
+        # Dedupe while preserving order.
+        seen = set()
+        unique_ids = []
+        for call_id in raw_ids:
+            if call_id in seen:
+                continue
+            seen.add(call_id)
+            unique_ids.append(call_id)
+        attrs["call_ids"] = unique_ids
+        attrs["ids"] = unique_ids
         return attrs
 
 

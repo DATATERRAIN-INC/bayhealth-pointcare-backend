@@ -1,5 +1,5 @@
 from django.urls import include, path
-from rest_framework.routers import DefaultRouter
+from rest_framework.routers import DefaultRouter, Route
 
 from apps.ai_caller.views import (
     CallViewSet,
@@ -12,14 +12,37 @@ from apps.ai_caller.views import (
 )
 from apps.ai_caller import twiml_views
 
+
+class CallBulkUpdateRouter(DefaultRouter):
+    """List route also accepts PUT/PATCH (ids come from the request body)."""
+
+    routes = [
+        Route(
+            url=r"^{prefix}{trailing_slash}$",
+            mapping={
+                "get": "list",
+                "post": "create",
+                "put": "update",
+                "patch": "partial_update",
+            },
+            name="{basename}-list",
+            detail=False,
+            initkwargs={"suffix": "List"},
+        ),
+        *DefaultRouter.routes[1:],
+    ]
+
+
 router = DefaultRouter()
 router.register("patients", PatientViewSet, basename="patients")
-router.register("calls", CallViewSet, basename="calls")
 router.register(
     "scheduled-outreach",
     ScheduledOutreachViewSet,
     basename="scheduled-outreach",
 )
+
+call_router = CallBulkUpdateRouter()
+call_router.register("calls", CallViewSet, basename="calls")
 
 urlpatterns = [
     path(
@@ -127,5 +150,6 @@ urlpatterns = [
         twiml_views.warm_transfer_status,
         name="twilio-warm-transfer-status",
     ),
+    path("", include(call_router.urls)),
     path("", include(router.urls)),
 ]

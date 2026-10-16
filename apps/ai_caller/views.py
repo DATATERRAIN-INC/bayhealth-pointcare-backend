@@ -191,23 +191,21 @@ class CallViewSet(viewsets.ModelViewSet):
             pass
 
     def update(self, request, *args, **kwargs):
-        """Update dial-queue call status: paused / cancel / queued / scheduled."""
-        call = Call.objects.filter(pk=kwargs.get("pk"), user=request.user).first()
-        if not call:
-            return error_response("Call not found.", 404)
-        if call.status not in {
-            Call.Status.QUEUED,
-            Call.Status.SCHEDULED,
-            Call.Status.PAUSED,
-        }:
-            return error_response(
-                "Only queued, scheduled, or paused calls can be updated.",
-                400,
-            )
+        """Update dial-queue call status for one or many ids from the body."""
+        return self._update_call_statuses(request)
 
+    def partial_update(self, request, *args, **kwargs):
+        return self._update_call_statuses(request)
+
+    def _update_call_statuses(self, request):
+        """
+        Body: {"call_ids": [1] | [1, 2], "status": "cancel"|"paused"|"queued"|"scheduled"}
+        Path/query call id is ignored — ids come only from the body.
+        """
         serializer = CallPauseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        ids = data["call_ids"]
         new_status = (data.get("status") or "").strip().lower()
 
         # Legacy body: {"paused": true|false} → map to status.
@@ -216,41 +214,87 @@ class CallViewSet(viewsets.ModelViewSet):
                 Call.Status.PAUSED if data["paused"] else Call.Status.QUEUED
             )
 
-        if new_status == Call.Status.CANCEL:
-            ScheduledOutreach.objects.filter(
-                queued_call_id=call.pk,
-                status=ScheduledOutreach.Status.SCHEDULED,
-            ).update(
-                status=ScheduledOutreach.Status.CANCELLED,
-                error_message="Call cancelled",
-                updated_at=timezone.now(),
-            )
-            call.status = Call.Status.CANCEL
-            call.is_paused = False
-        elif new_status == Call.Status.PAUSED:
-            call.status = Call.Status.PAUSED
-            call.is_paused = True
-        elif new_status in {Call.Status.QUEUED, Call.Status.SCHEDULED}:
-            # Resume. Prefer explicit status; if outreach is open and client
-            # sends queued, still keep scheduled so Celery waits for scheduled_at.
-            has_outreach = ScheduledOutreach.objects.filter(
-                queued_call_id=call.pk,
-                status=ScheduledOutreach.Status.SCHEDULED,
-            ).exists()
-            if has_outreach:
-                call.status = Call.Status.SCHEDULED
-            else:
-                call.status = Call.Status.QUEUED
-            call.is_paused = False
-        else:
+        if new_status not in {
+            Call.Status.CANCEL,
+            Call.Status.PAUSED,
+            Call.Status.QUEUED,
+            Call.Status.SCHEDULED,
+        }:
             return error_response("Invalid status.", 400)
 
-        call.updated_by = request.user
-        call.save(update_fields=["status", "is_paused", "updated_by", "updated_at"])
-        return Response(CallSerializer(call).data)
+        editable = {
+            Call.Status.QUEUED,
+            Call.Status.SCHEDULED,
+            Call.Status.PAUSED,
+        }
+        found = {
+            c.pk: c
+            for c in Call.objects.filter(pk__in=ids, user=request.user).select_related(
+                "patient"
+            )
+        }
+        updated = []
+        skipped = []
 
-    def partial_update(self, request, *args, **kwargs):
-        return self.update(request, *args, **kwargs)
+        for call_id in ids:
+            call = found.get(call_id)
+            if not call:
+                skipped.append({"id": call_id, "reason": "Call not found."})
+                continue
+            if call.status not in editable:
+                skipped.append(
+                    {
+                        "id": call_id,
+                        "reason": "Only queued, scheduled, or paused calls can be updated.",
+                    }
+                )
+                continue
+
+            if new_status == Call.Status.CANCEL:
+                ScheduledOutreach.objects.filter(
+                    queued_call_id=call.pk,
+                    status=ScheduledOutreach.Status.SCHEDULED,
+                ).update(
+                    status=ScheduledOutreach.Status.CANCELLED,
+                    error_message="Call cancelled",
+                    updated_at=timezone.now(),
+                )
+                call.status = Call.Status.CANCEL
+                call.is_paused = False
+            elif new_status == Call.Status.PAUSED:
+                call.status = Call.Status.PAUSED
+                call.is_paused = True
+            else:
+                # Resume queued/scheduled.
+                has_outreach = ScheduledOutreach.objects.filter(
+                    queued_call_id=call.pk,
+                    status=ScheduledOutreach.Status.SCHEDULED,
+                ).exists()
+                call.status = (
+                    Call.Status.SCHEDULED if has_outreach else Call.Status.QUEUED
+                )
+                call.is_paused = False
+
+            call.updated_by = request.user
+            call.save(
+                update_fields=["status", "is_paused", "updated_by", "updated_at"]
+            )
+            updated.append(call)
+
+        if not updated and skipped:
+            first_reason = skipped[0].get("reason") or "No calls updated."
+            return error_response(first_reason, 404 if "not found" in first_reason.lower() else 400)
+
+        return Response(
+            {
+                "updated_count": len(updated),
+                "skipped_count": len(skipped),
+                "updated": CallSerializer(
+                    updated, many=True, context={"request": request}
+                ).data,
+                "skipped": skipped,
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):
