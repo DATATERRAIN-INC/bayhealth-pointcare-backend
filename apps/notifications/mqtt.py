@@ -4,14 +4,19 @@ Topics are built from Scope and Channel rows. Nothing here names a scope or chan
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from django.conf import settings
+from django.db import transaction
 from synccast import synccast
 from synccast.core.topic import SyncCastTopicBuilder
 
 from apps.notifications.models import Channel, Scope
 
 logger = logging.getLogger(__name__)
+
+# Background senders for SyncCast pushes (see publish).
+_SEND_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mqtt-send")
 
 synccast.set_credentials(
     app_id=settings.MQTT_APP_ID,
@@ -66,15 +71,27 @@ def publish(user_id, data, *, channel_names=None):
     if channel_names is not None:
         names = [name for name in channel_names if name]
         channels = channels.filter(name__in=names)
-    for channel in channels:
-        try:
-            send(user_id, channel, data)
-        except Exception:
-            logger.exception(
-                "MQTT send failed user=%s channel=%s",
-                user_id,
-                channel.name,
-            )
+    channels = list(channels)
+    if not channels:
+        return
+
+    def send_all():
+        for channel in channels:
+            try:
+                send(user_id, channel, data)
+            except Exception:
+                logger.exception(
+                    "MQTT send failed user=%s channel=%s",
+                    user_id,
+                    channel.name,
+                )
+
+    # SyncCast is an HTTPS call (~0.3-2s each). Send in the background once the
+    # change is committed, so API requests and Celery tasks never wait on it.
+    if getattr(settings, "MQTT_SEND_IN_BACKGROUND", True):
+        transaction.on_commit(lambda: _SEND_POOL.submit(send_all))
+    else:
+        send_all()
 
 
 def publish_app_notification(user_id, notification=None):

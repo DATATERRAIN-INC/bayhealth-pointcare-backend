@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
 from apps.notifications.mqtt import publish_app_notification, publish_call_change
 
@@ -10,6 +10,7 @@ def _channel(name):
     return SimpleNamespace(name=name, scope=SimpleNamespace(name="scope"))
 
 
+@override_settings(MQTT_SEND_IN_BACKGROUND=False)
 class PublishCallChangeTests(SimpleTestCase):
     def test_uses_channels_named_like_the_status(self):
         call = SimpleNamespace(pk=1, user_id=2, status="in_progress")
@@ -25,6 +26,7 @@ class PublishCallChangeTests(SimpleTestCase):
         self.assertEqual(send.call_count, 2)
 
 
+@override_settings(MQTT_SEND_IN_BACKGROUND=False)
 class PublishAppNotificationTests(SimpleTestCase):
     def test_sends_the_notification_list_shape(self):
         notification = SimpleNamespace(id=4)

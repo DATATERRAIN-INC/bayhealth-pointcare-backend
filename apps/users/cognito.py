@@ -4,6 +4,8 @@ import hmac
 import json
 import uuid
 
+import threading
+
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -84,19 +86,45 @@ def _aws_credentials():
     return {}
 
 
-def _public_client():
+# boto3 clients are thread-safe. Reusing one keeps its HTTPS connection open, so
+# each token check is one round trip instead of a new TLS handshake + client build.
+_CLIENTS = {}
+_CLIENTS_LOCK = threading.Lock()
+
+
+def _cached_client(kind, build):
     credentials = _aws_credentials()
-    if credentials:
-        return boto3.client("cognito-idp", region_name=settings.AWS_REGION, **credentials)
-    return boto3.client(
-        "cognito-idp",
-        region_name=settings.AWS_REGION,
-        config=Config(signature_version=UNSIGNED),
-    )
+    key = (kind, settings.AWS_REGION, credentials.get("aws_access_key_id", ""))
+    client = _CLIENTS.get(key)
+    if client is None:
+        with _CLIENTS_LOCK:
+            client = _CLIENTS.get(key)
+            if client is None:
+                client = build(credentials)
+                _CLIENTS[key] = client
+    return client
+
+
+def _public_client():
+    def build(credentials):
+        if credentials:
+            return boto3.client("cognito-idp", region_name=settings.AWS_REGION, **credentials)
+        return boto3.client(
+            "cognito-idp",
+            region_name=settings.AWS_REGION,
+            config=Config(signature_version=UNSIGNED),
+        )
+
+    return _cached_client("public", build)
 
 
 def _admin_client():
-    return boto3.client("cognito-idp", region_name=settings.AWS_REGION, **_aws_credentials())
+    return _cached_client(
+        "admin",
+        lambda credentials: boto3.client(
+            "cognito-idp", region_name=settings.AWS_REGION, **credentials
+        ),
+    )
 
 
 def raise_for_client_error(exc, *, login=False):

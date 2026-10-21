@@ -220,6 +220,9 @@ def login_user(data):
 def logout_user(*, access_token, refresh_token):
     if not access_token:
         raise CognitoError("Access token is required.", "NotAuthorizedException", 401)
+    from apps.users.authentication import forget_verified_token
+
+    forget_verified_token(access_token)
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise CognitoError("refresh_token is required.", "InvalidParameterException", 400)
 

@@ -617,6 +617,11 @@ def tag_ai_segment(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return tagged
 
 
+def is_log_url(url: str) -> bool:
+    """Retell's public_log_url (…/public.log) is a debug log, not audio."""
+    return (url or "").split("?", 1)[0].strip().lower().endswith(".log")
+
+
 def merge_ai_and_humans(ai_items, humans_items) -> List[Dict[str, Any]]:
     return list(tag_ai_segment(ai_items or [])) + list(humans_items or [])
 
@@ -702,7 +707,8 @@ def save_humans_transcript_for_call(
         if sid and call.warm_transfer_session_id != sid:
             call.warm_transfer_session_id = sid[:64]
             update_fields.append("warm_transfer_session_id")
-        if recording_url and recording_url != (call.recording_url or ""):
+        # recording_url holds the AI (Retell) audio; only fill it when empty.
+        if recording_url and not (call.recording_url or "").strip():
             call.recording_url = recording_url[:1024]
             update_fields.append("recording_url")
         if live_agent_recording_url and live_agent_recording_url != (
@@ -742,7 +748,8 @@ def save_humans_transcript_for_call(
         else:
             humans = existing
 
-    if recording_url:
+    # recording_url holds the AI (Retell) audio; only fill it when empty.
+    if recording_url and not (call.recording_url or "").strip():
         call.recording_url = recording_url[:1024]
     if live_agent_recording_url:
         call.live_agent_recording_url = live_agent_recording_url[:1024]
