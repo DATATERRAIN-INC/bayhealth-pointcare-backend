@@ -207,6 +207,12 @@ TWILIO_MINOR_SMS_FROM_NUMBER = os.getenv("TWILIO_MINOR_SMS_FROM_NUMBER", "")
 TWILIO_VOICE = os.getenv("TWILIO_VOICE", "Joanna")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 CALL_TRANSCRIPTION_MODEL = os.getenv("CALL_TRANSCRIPTION_MODEL", "")
+# Live-agent transcripts: optional second model (e.g. "gpt-4o-transcribe") that
+# re-writes each whisper-1 sentence. Off by default: on noisy test calls it was
+# less accurate than whisper-1 alone (wrong dates/names). Empty = whisper-1 only.
+CALL_TRANSCRIPTION_REFINE_MODEL = os.getenv(
+    "CALL_TRANSCRIPTION_REFINE_MODEL", ""
+)
 WARM_TRANSFER_ENABLED = os.getenv("WARM_TRANSFER_ENABLED", "false").lower() in (
     "1",
     "true",

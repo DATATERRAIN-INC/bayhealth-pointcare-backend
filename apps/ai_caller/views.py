@@ -159,6 +159,7 @@ class CallViewSet(viewsets.ModelViewSet):
             exclude_queued=exclude_queued,
             ordering=self.request.query_params.get("ordering", ""),
             light=light,
+            user_sentiment=self.request.query_params.get("user_sentiment", ""),
         )
 
     def list(self, request, *args, **kwargs):

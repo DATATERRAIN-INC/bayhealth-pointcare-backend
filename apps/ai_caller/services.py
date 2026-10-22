@@ -285,6 +285,18 @@ def _apply_call_search(queryset, search):
     return queryset.filter(match)
 
 
+_SENTIMENT_FILTER_VALUES = {"positive", "neutral", "negative", "unknown", "pending"}
+
+
+def _parse_sentiment_list(value):
+    """?user_sentiment=Negative or Negative,Neutral → ["negative", "neutral"]."""
+    return [
+        part
+        for part in _parse_status_list(value)
+        if part in _SENTIMENT_FILTER_VALUES
+    ]
+
+
 def get_call_queryset(
     *,
     user=None,
@@ -296,6 +308,7 @@ def get_call_queryset(
     exclude_queued=False,
     ordering="",
     light=False,
+    user_sentiment="",
 ):
     queryset = Call.objects.select_related("patient").all()
     if user is not None:
@@ -312,6 +325,13 @@ def get_call_queryset(
 
     if source and source != "all":
         queryset = queryset.filter(patient__source=source)
+    sentiments = _parse_sentiment_list(user_sentiment)
+    if sentiments:
+        match = Q()
+        for value in sentiments:
+            # "pending" = not analysed by Retell yet (blank).
+            match |= Q(user_sentiment="") if value == "pending" else Q(user_sentiment__iexact=value)
+        queryset = queryset.filter(match)
     if statuses:
         queryset = queryset.filter(status__in=statuses)
     elif exclude_queued:
@@ -1119,9 +1139,7 @@ def place_outbound_call_for_patient(patient_id, *, user=None, call_id=None):
         }
 
     # Allow the claimed/queued row itself; block any other active call.
-    in_progress_qs = Call.objects.filter(
-        patient=patient, status__in=Call.ACTIVE_STATUSES
-    )
+    in_progress_qs = Call.objects.filter(Call.line_busy_q(), patient=patient)
     if existing_call is not None:
         in_progress_qs = in_progress_qs.exclude(pk=existing_call.pk)
     if in_progress_qs.exists():
@@ -1817,6 +1835,9 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
     qs = (
         base.filter(
             Q(status__in=Call.ACTIVE_STATUSES)
+            # Waiting for a live agent: Retell sync keeps it while the transfer is
+            # live, and finishes a leftover row whose transfer already ended.
+            | Q(status=Call.Status.WAITING)
             | (
                 Q(
                     status__in=[
@@ -1931,6 +1952,27 @@ def is_within_calling_window(settings_obj=None, when=None):
     return start <= current <= end
 
 
+def next_callback_time(settings_obj, now=None):
+    """When to call back: now + reminder hours, moved into the calling window.
+
+    Before the window opens → that day's start time; after it closes → the
+    next day's start time. Returns an aware datetime in the settings timezone.
+    """
+    tz = resolve_timezone(settings_obj.timezone)
+    hours = max(1, int(settings_obj.reminder_timeframe_hours or 1))
+    target = ((now or timezone.now()) + timedelta(hours=hours)).astimezone(tz)
+    start = _as_time(settings_obj.start_time)
+    end = _as_time(settings_obj.end_time)
+    current = target.time().replace(second=0, microsecond=0)
+    if current < start:
+        target = target.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+    elif current > end:
+        target = (target + timedelta(days=1)).replace(
+            hour=start.hour, minute=start.minute, second=0, microsecond=0
+        )
+    return target
+
+
 def _local_day_bounds(settings_obj):
     tz = resolve_timezone(settings_obj.timezone)
     local_now = timezone.now().astimezone(tz)
@@ -1959,7 +2001,7 @@ def queued_calls_due_for_outbound(settings_obj=None, limit=None):
     ).values_list("patient_id", flat=True)
 
     in_progress_ids = Call.objects.filter(
-        status__in=Call.ACTIVE_STATUSES,
+        Call.line_busy_q(),
         user=user,
     ).values_list("patient_id", flat=True)
 
@@ -2066,8 +2108,8 @@ def _run_scheduled_outbound_for_settings(settings_obj):
 
     max_concurrent = max(1, int(settings_obj.max_calls_per_run or 1))
     in_progress_count = Call.objects.filter(
+        Call.line_busy_q(),
         user=settings_obj.user,
-        status__in=Call.ACTIVE_STATUSES,
     ).count()
     slots_free = max(0, max_concurrent - in_progress_count)
 

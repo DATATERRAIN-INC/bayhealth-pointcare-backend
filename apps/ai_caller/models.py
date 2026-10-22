@@ -144,6 +144,22 @@ class Call(models.Model):
     # count toward retry caps and missed-call reminders the same way.
     MISSED_STATUSES = (Status.NOT_ATTENDED, Status.VOICEMAIL_REACHED)
 
+    # A patient on hold for a live agent is still on the phone. Only a recent
+    # WAITING row counts, so a stuck/leftover row can never hold a line forever.
+    WAITING_LINE_MAX_AGE_SECONDS = 60 * 60
+
+    @classmethod
+    def line_busy_q(cls):
+        """Calls using one of the "max calls at once" lines (and not to be re-dialed)."""
+        from datetime import timedelta
+
+        from django.db.models import Q
+
+        recent = timezone.now() - timedelta(seconds=cls.WAITING_LINE_MAX_AGE_SECONDS)
+        return Q(status__in=cls.ACTIVE_STATUSES) | Q(
+            status=cls.Status.WAITING, updated_at__gte=recent
+        )
+
     user = models.ForeignKey(
         "users.User",
         on_delete=models.CASCADE,

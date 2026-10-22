@@ -622,6 +622,11 @@ def _ensure_agent(configured_id: str, from_number: str = "") -> Tuple[str, str]:
     return _create_agent(_AGENT_NAME_PATIENT, llm_id)
 
 
+def doctor_display_name(name: str) -> str:
+    """The script says "Dr. {{name}}", so a stored "Dr John" must not become "Dr. Dr John"."""
+    return re.sub(r"^\s*(dr\.?|doctor)\s+", "", (name or "").strip(), flags=re.I)
+
+
 def place_retell_care_call(
     *,
     phone_number: str,
@@ -667,7 +672,7 @@ def place_retell_care_call(
     if not transfer or len(_digits(transfer)) < 10:
         return {"ok": False, "error": "Invalid transfer_number.", "status_code": 400}
 
-    who = (name or "").strip() or (patient_name or "").strip() or "there"
+    who = doctor_display_name(name) or (patient_name or "").strip() or "there"
     patient = (patient_name or "").strip() or who
     service = (service_name or "").strip() or "care"
     payload: Dict[str, Any] = {

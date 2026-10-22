@@ -19,7 +19,7 @@ import time
 import uuid
 import wave
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape
 
@@ -154,6 +154,10 @@ def _phone_cache_key(digits: str) -> str:
 
 
 def _queue_scope(session: Dict[str, Any]) -> str:
+    # Fixed when the session is created: failover changes transfer_number.
+    stored = str(session.get("queue_scope") or "")
+    if stored:
+        return stored
     user_id = session.get("user_id")
     if user_id:
         return f"user:{user_id}"
@@ -165,8 +169,13 @@ def _queue_key(scope: str) -> str:
     return f"warm_transfer:queue:{scope}"
 
 
-def _active_key(scope: str) -> str:
-    return f"warm_transfer:active:{scope}"
+def _agent_key(scope: str, number: str) -> str:
+    """Which patient session holds this live agent right now."""
+    return f"warm_transfer:agent:{scope}:{_phone_digits(number)}"
+
+
+# A live-agent hold older than this is a leftover (e.g. a crashed call) — free it.
+_AGENT_HOLD_MAX_SECONDS = 3 * 60 * 60
 
 
 def _index_session(cache, session: Dict[str, Any]) -> None:
@@ -358,29 +367,167 @@ def _dequeue(cache, scope: str, session_id: str) -> None:
     cache.set(key, rows, timeout=_SESSION_TTL_SECONDS)
 
 
-def _maybe_notify_agent_of_new_waiter(cache, scope: str) -> None:
-    """Play the agent a private tone the FIRST time a caller starts waiting.
+def _agent_numbers(session: Dict[str, Any]) -> List[str]:
+    """This account's live agents, in priority order."""
+    numbers = [
+        str(n).strip()
+        for n in (
+            (session or {}).get("transfer_numbers")
+            or (session or {}).get("live_agent_numbers")
+            or [(session or {}).get("transfer_number")]
+        )
+        if str(n or "").strip()
+    ]
+    unique: List[str] = []
+    for number in numbers:
+        if _phone_digits(number) not in {_phone_digits(u) for u in unique}:
+            unique.append(number)
+    return unique
 
-    Only fires on the empty-queue -> one-waiter transition, so the agent
-    hears one cue per new queue forming, not once per caller in a long line.
+
+def _agent_holder(cache, scope: str, number: str) -> Dict[str, Any]:
+    """The live session holding this agent, or {} when the agent is free.
+
+    Self-healing: a hold whose session ended, moved to another agent, or is
+    hours old is cleared, so an agent never stays "busy" forever.
     """
+    key = _agent_key(scope, number)
+    holder_sid = str(cache.get(key) or "")
+    if not holder_sid:
+        return {}
+    holder = load_session(holder_sid)
+    stale = (
+        not holder
+        or holder.get("agent_released")
+        or holder.get("conference_ended")
+        or _phone_digits(str(holder.get("assigned_agent") or "")) != _phone_digits(number)
+        or (time.time() - _session_started_at(holder)) > _AGENT_HOLD_MAX_SECONDS
+    )
+    if stale:
+        if cache.get(key) == holder_sid:
+            cache.delete(key)
+        return {}
+    return holder
+
+
+def _reserve_free_agent(cache, scope: str, session: Dict[str, Any], *, skip=()) -> str:
+    """Atomically take the first free agent (in priority order). "" when all are busy."""
+    sid = str(session.get("session_id") or "")
+    skipped = {_phone_digits(n) for n in skip}
+    for number in _agent_numbers(session):
+        if _phone_digits(number) in skipped:
+            continue
+        if _agent_holder(cache, scope, number):
+            continue
+        if cache.add(_agent_key(scope, number), sid, timeout=_SESSION_TTL_SECONDS):
+            return number
+    return ""
+
+
+def _release_agent(cache, scope: str, session: Dict[str, Any]) -> None:
+    number = str(session.get("assigned_agent") or "")
+    sid = str(session.get("session_id") or "")
+    if number and str(cache.get(_agent_key(scope, number)) or "") == sid:
+        cache.delete(_agent_key(scope, number))
+
+
+def _tried_numbers(session: Dict[str, Any]) -> List[str]:
+    tried = set(session.get("tried_agents") or [])
+    return [n for n in _agent_numbers(session) if _phone_digits(n) in tried]
+
+
+def _assign_agent(session: Dict[str, Any], number: str) -> Dict[str, Any]:
+    """Mark `number` as this patient's agent (the next dial goes to them)."""
+    numbers = _agent_numbers(session)
+    digits = [_phone_digits(n) for n in numbers]
+    tried = list(session.get("tried_agents") or [])
+    if _phone_digits(number) not in tried:
+        tried.append(_phone_digits(number))
+    session.update(
+        {
+            "queue_state": "active",
+            "agent_claimed": True,
+            "assigned_agent": number,
+            "transfer_number": number,
+            "live_agent_number": number,
+            "transfer_number_index": (
+                digits.index(_phone_digits(number)) if _phone_digits(number) in digits else 0
+            ),
+            "tried_agents": tried,
+            "b_dialed": False,
+            "dial_call_sid": "",
+        }
+    )
+    return session
+
+
+def _lock(cache, scope: str, owner: str, *, tries: int = 40) -> bool:
+    lock = f"warm_transfer:admit:{scope}"
+    for _ in range(tries):
+        if cache.add(lock, owner, timeout=10):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _unlock(cache, scope: str) -> None:
+    cache.delete(f"warm_transfer:admit:{scope}")
+
+
+def _busy_agent_sessions(cache, scope: str, session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    holders = []
+    for number in _agent_numbers(session):
+        holder = _agent_holder(cache, scope, number)
+        if holder and holder.get("session_id") != session.get("session_id"):
+            holders.append(holder)
+    return holders
+
+
+def _notify_busy_agents_of_new_waiter(cache, scope: str, session: Dict[str, Any]) -> None:
+    """Private beep to every agent who is on a call: a patient is now waiting.
+
+    Call outside the queue lock — each beep is a Twilio API request."""
+    for holder in _busy_agent_sessions(cache, scope, session):
+        notify_agent_waiting_tone(holder)
+
+
+def _wait_for_agent(cache, scope: str, session: Dict[str, Any], *, front: bool = False) -> None:
+    sid = str(session.get("session_id") or "")
+    rows = [str(item) for item in (cache.get(_queue_key(scope)) or []) if str(item) != sid]
+    rows = [sid, *rows] if front else [*rows, sid]
+    cache.set(_queue_key(scope), rows, timeout=_SESSION_TTL_SECONDS)
+    session["queue_state"] = "waiting"
+    session["agent_claimed"] = False
+    session["assigned_agent"] = ""
+    session["waiting_since"] = time.time()
+    session["wait_token"] = uuid.uuid4().hex
+
+
+# All agents busy this long → offer the patient a callback instead of holding.
+def _max_wait_seconds() -> int:
+    return int(getattr(settings, "WARM_TRANSFER_MAX_WAIT_SECONDS", 180) or 180)
+
+
+def _schedule_long_wait_offer(session: Dict[str, Any]) -> None:
+    """Check back after the max wait (Celery). Without Celery the patient just keeps holding."""
+    sid = str(session.get("session_id") or "")
+    token = str(session.get("wait_token") or "")
+    if not sid or not token:
+        return
     try:
-        already_waiting = bool(cache.get(_queue_key(scope)) or [])
+        from apps.ai_caller.tasks import offer_callback_after_long_wait
+
+        offer_callback_after_long_wait.apply_async(
+            args=[sid, token], countdown=_max_wait_seconds()
+        )
     except Exception:
-        already_waiting = True  # fail safe: skip rather than spam on error
-    if already_waiting:
-        return
-    active_sid = str(cache.get(_active_key(scope)) or "")
-    if not active_sid or not _slot_busy(active_sid):
-        return
-    active_session = load_session(active_sid)
-    if active_session:
-        notify_agent_waiting_tone(active_session)
+        wt_logger.exception("LONG_WAIT_OFFER_SCHEDULE_FAILED session=%s", sid)
 
 
 def admit_patient_to_agent(session: Dict[str, Any]) -> str:
     """
-    One patient talks to the live agent. Everyone else stays a waiting call.
+    Give this patient the first free live agent; with every agent busy, the
+    patient waits on hold and each busy agent hears a short beep.
 
     Returns "active" or "waiting".
     """
@@ -396,40 +543,38 @@ def admit_patient_to_agent(session: Dict[str, Any]) -> str:
         return "waiting"
     scope = _queue_scope(session)
     cache = _session_cache()
-    lock = f"warm_transfer:admit:{scope}"
-    locked = False
-    for _ in range(8):
-        if cache.add(lock, sid, timeout=10):
-            locked = True
-            break
-        time.sleep(0.05)
-    if not locked:
-        _maybe_notify_agent_of_new_waiter(cache, scope)
-        _enqueue(cache, scope, sid)
-        session["queue_state"] = "waiting"
-        session["agent_claimed"] = False
-        save_session(session)
-        wt_logger.info("AGENT_QUEUE_WAIT session=%s scope=%s reason=lock", sid, scope)
-        return "waiting"
+    locked = _lock(cache, scope, sid)
+    busy_agents: List[Dict[str, Any]] = []
     try:
-        active = str(cache.get(_active_key(scope)) or "")
-        if active == sid or not _slot_busy(active):
-            cache.set(_active_key(scope), sid, timeout=_SESSION_TTL_SECONDS)
-            _dequeue(cache, scope, sid)
-            session["queue_state"] = "active"
-            session["agent_claimed"] = True
+        number = _reserve_free_agent(cache, scope, session) if locked else ""
+        if number:
+            _assign_agent(session, number)
             save_session(session)
-            wt_logger.info("AGENT_QUEUE_ACTIVE session=%s scope=%s", sid, scope)
+            wt_logger.info("AGENT_QUEUE_ACTIVE session=%s scope=%s agent=%s", sid, scope, number)
             return "active"
-        _maybe_notify_agent_of_new_waiter(cache, scope)
-        _enqueue(cache, scope, sid)
-        session["queue_state"] = "waiting"
-        session["agent_claimed"] = False
+        busy_agents = _busy_agent_sessions(cache, scope, session)
+        _wait_for_agent(cache, scope, session)
         save_session(session)
-        wt_logger.info("AGENT_QUEUE_WAIT session=%s scope=%s behind=%s", sid, scope, active)
-        return "waiting"
+        wt_logger.info(
+            "AGENT_QUEUE_WAIT session=%s scope=%s reason=%s",
+            sid,
+            scope,
+            "all_agents_busy" if locked else "lock",
+        )
     finally:
-        cache.delete(lock)
+        if locked:
+            _unlock(cache, scope)
+    if session.get("queue_state") == "waiting":
+        for holder in busy_agents:
+            notify_agent_waiting_tone(holder)  # outside the lock (Twilio API calls)
+        _schedule_long_wait_offer(session)
+    if not locked:
+        # Could not check the agents just now — try again so a free agent is used.
+        promote_next_waiting(scope)
+        session = load_session(sid) or session
+        if session.get("queue_state") == "active":
+            return "active"  # an agent was free after all (already being dialed)
+    return "waiting"
 
 
 def transfer_call_should_stay_open(retell_call_id: str) -> bool:
@@ -471,7 +616,7 @@ def set_transfer_call_status(session: Dict[str, Any], status: str) -> None:
 
 
 def release_agent_slot(session: Dict[str, Any]) -> None:
-    """Free the live agent and connect the next waiting patient."""
+    """Free this patient's live agent and give them to the next waiting patient."""
     session = load_session(str((session or {}).get("session_id") or "")) or dict(
         session or {}
     )
@@ -480,41 +625,46 @@ def release_agent_slot(session: Dict[str, Any]) -> None:
         return
     scope = _queue_scope(session)
     cache = _session_cache()
-    was_active = bool(session.get("agent_claimed")) or str(
-        cache.get(_active_key(scope)) or ""
-    ) == sid
-    _dequeue(cache, scope, sid)
+    had_agent = bool(session.get("assigned_agent")) or bool(session.get("agent_claimed"))
+    locked = _lock(cache, scope, sid)
+    try:
+        _dequeue(cache, scope, sid)
+        _release_agent(cache, scope, session)
+    finally:
+        if locked:
+            _unlock(cache, scope)
+    dial_sid = str(session.get("dial_call_sid") or "").strip()
+    if dial_sid and not session.get("spoke_now"):
+        # Patient left while their agent's phone was still ringing: stop it, so the
+        # agent is free and no late "no-answer" re-opens this finished call.
+        _hangup_call(dial_sid)
     session["agent_released"] = True
     session["conference_ended"] = True
     session["agent_claimed"] = False
     session["queue_state"] = "ended"
     save_session(session)
-    if str(cache.get(_active_key(scope)) or "") == sid:
-        cache.delete(_active_key(scope))
     # Also after a callback offer: a scheduled callback sets CALLBACK, which
     # set_transfer_call_status never overwrites; a hang-up must not leave the
     # call "in progress" forever (that blocks every future dial).
     set_transfer_call_status(session, "completed")
-    if was_active:
+    if had_agent:
         promote_next_waiting(scope)
     restore_inbound_voice_url(session)
 
 
 def promote_next_waiting(scope: str) -> None:
-    """Dial the live agent into the next patient's own conference."""
+    """Connect waiting patients (longest wait first) to every free live agent."""
     scope = (scope or "").strip()
     if not scope:
         return
     cache = _session_cache()
-    lock = f"warm_transfer:admit:{scope}"
-    if not cache.add(lock, "promote", timeout=10):
+    if not _lock(cache, scope, "promote", tries=100):
+        wt_logger.warning("AGENT_QUEUE_PROMOTE_LOCK_BUSY scope=%s", scope)
         return
-    chosen = None
+    promoted: List[Dict[str, Any]] = []
     try:
-        if _slot_busy(str(cache.get(_active_key(scope)) or "")):
-            return
         rows = [str(item) for item in (cache.get(_queue_key(scope)) or [])]
-        remaining = []
+        remaining: List[str] = []
         for sid in rows:
             session = load_session(sid)
             if (
@@ -523,28 +673,30 @@ def promote_next_waiting(scope: str) -> None:
                 or session.get("conference_ended")
                 or not session.get("call_sid")
             ):
+                continue  # hung up while waiting
+            if session.get("hold_offer_in_progress"):
+                remaining.append(sid)  # answering the callback offer: keep their place
                 continue
-            if chosen is None:
-                chosen = session
+            # Never re-ring an agent who already missed this patient on this call.
+            number = _reserve_free_agent(
+                cache, scope, session, skip=_tried_numbers(session)
+            )
+            if not number:
+                remaining.append(sid)  # no suitable agent free: keep their place in line
                 continue
-            remaining.append(sid)
+            _assign_agent(session, number)
+            save_session(session)
+            promoted.append(session)
+            wt_logger.info(
+                "AGENT_QUEUE_PROMOTE session=%s scope=%s agent=%s", sid, scope, number
+            )
         cache.set(_queue_key(scope), remaining, timeout=_SESSION_TTL_SECONDS)
-        if chosen is None:
-            return
-        sid = str(chosen.get("session_id") or "")
-        cache.set(_active_key(scope), sid, timeout=_SESSION_TTL_SECONDS)
-        chosen["queue_state"] = "active"
-        chosen["agent_claimed"] = True
-        chosen["b_dialed"] = False
-        save_session(chosen)
-        wt_logger.info("AGENT_QUEUE_PROMOTE session=%s scope=%s", sid, scope)
     finally:
-        cache.delete(lock)
-    if not chosen:
-        return
-    set_transfer_call_status(chosen, "in_progress")
-    announce_connecting(chosen)
-    start_coordinator_leg(chosen)
+        _unlock(cache, scope)
+    for chosen in promoted:
+        set_transfer_call_status(chosen, "in_progress")
+        announce_connecting(chosen)
+        start_coordinator_leg(chosen)
 
 
 def split_stereo_wav(audio: bytes) -> Tuple[bytes, bytes]:
@@ -877,14 +1029,31 @@ def _ring_url() -> str:
     return "https://sdk.twilio.com/js/client/sounds/releases/1.0.0/outgoing.mp3"
 
 
-def conference_wait_twiml() -> str:
-    """Conference waitUrl: loop ring tone until the live agent joins."""
-    ring = escape(_ring_url())
+# Twilio re-requests the waitUrl when its TwiML finishes, so a finite ring makes
+# the hold message repeat (every ~30-40s) and follows a change from "agent
+# being dialed" to "waiting for a free agent".
+_WAIT_RING_LOOPS = 8
+
+
+def conference_wait_twiml(session: Optional[Dict[str, Any]] = None) -> str:
+    """Conference waitUrl, played while the patient is alone in their room.
+
+    Agent being dialed → ringback. All agents busy → the hold message, then
+    ringback, repeated until an agent is free.
+    """
+    session_id = str((session or {}).get("session_id") or "")
+    if not session_id:
+        ring_forever = f'<Play loop="0">{escape(_ring_url())}</Play>'
+        return '<?xml version="1.0" encoding="UTF-8"?>' f"<Response>{ring_forever}</Response>"
+    ring = f'<Play loop="{_WAIT_RING_LOOPS}">{escape(_ring_url())}</Play>'
+    hold = ""
+    if str((session or {}).get("queue_state") or "") == "waiting":
+        hold = _say(HOLD_MESSAGE)
+    # Explicitly come back here, so the hold message repeats and follows state changes.
+    again = escape(_abs_url("/api/ai-call/twilio/warm-transfer/wait/", session_id))
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        f'<Play loop="0">{ring}</Play>'
-        "</Response>"
+        f'<Response>{hold}{ring}<Redirect method="POST">{again}</Redirect></Response>'
     )
 
 
@@ -904,7 +1073,9 @@ def join_conference_twiml(session: Dict[str, Any], *, is_host: bool) -> str:
             leg="mix",
         )
     )
-    end_on_exit = "true" if is_host else "false"
+    # Either side leaving ends the call: the agent hanging up must not leave the
+    # patient in a silent room (and frees the agent for the next patient).
+    end_on_exit = "true"
     record_attrs = ""
     if is_host:
         record_attrs = (
@@ -923,6 +1094,7 @@ def join_conference_twiml(session: Dict[str, Any], *, is_host: bool) -> str:
         f'statusCallback="{status_cb}" statusCallbackEvent="start join end" '
         f'statusCallbackMethod="POST">{conf}</Conference>'
         "</Dial>"
+        f"{_say(CALL_ENDED_MESSAGE) if is_host else ''}"
         "</Response>"
     )
 
@@ -944,9 +1116,23 @@ def inbound_connect_twiml(session: Dict[str, Any]) -> str:
     return join_conference_twiml(session, is_host=True)
 
 
+def agent_briefing_text(session: Dict[str, Any]) -> str:
+    """What the live agent hears on answering, before meeting the patient."""
+    name = str((session or {}).get("name") or "").strip()
+    if not name or name.lower() == "there":
+        name = "a patient"
+    service = str((session or {}).get("service_name") or "").strip()
+    about = f" about {service}" if service and service.lower() != "care" else ""
+    return f"Bay Area Community Health transfer. Connecting you with {name}{about}."
+
+
 def participant_join_twiml(session: Dict[str, Any]) -> str:
-    """Person B joins the same conference."""
-    return join_conference_twiml(session, is_host=False)
+    """Person B (live agent) hears who is waiting, then joins the same conference.
+
+    The <Say> runs on the agent's call leg only, so the patient never hears it.
+    """
+    body = join_conference_twiml(session, is_host=False)
+    return body.replace("<Response>", f"<Response>{_say(agent_briefing_text(session))}", 1)
 
 
 def speak_now_twiml() -> str:
@@ -1041,11 +1227,16 @@ def next_agent_twiml() -> str:
     )
 
 
+HOLD_MESSAGE = "Please hold. A live agent is helping another caller. You are still in line."
+# Played to the patient after the live agent hangs up (the conference has ended).
+CALL_ENDED_MESSAGE = "Thank you for calling Bay Area Community Health. Goodbye."
+
+
 def hold_twiml() -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f"{_say('Please hold. A live agent is helping another caller. You are still in line.')}"
+        f"{_say(HOLD_MESSAGE)}"
         "</Response>"
     )
 
@@ -1244,77 +1435,100 @@ _AGENT_FAIL_STATUSES = frozenset(
 
 def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") -> bool:
     """
-    If the current live agent did not answer, dial the next active number.
-    Returns True when another dial was started.
+    This patient's agent did not answer (or could not be dialed): free that
+    agent and dial the next FREE agent this patient has not tried yet.
+    All other agents busy → back to the front of the waiting line.
+    Every agent tried → ask the patient for a callback time.
+    Returns True when the patient is being handled (dial, wait, or callback).
     """
     session = load_session(str((session or {}).get("session_id") or "")) or dict(
         session or {}
     )
     session_id = str(session.get("session_id") or "")
-    numbers = [
-        str(n).strip()
-        for n in (session.get("transfer_numbers") or session.get("live_agent_numbers") or [])
-        if str(n).strip()
-    ]
+    if session.get("agent_released") or session.get("conference_ended"):
+        return False  # the patient already left
+    numbers = _agent_numbers(session)
+    scope = _queue_scope(session)
+    cache = _session_cache()
+    previous = str(session.get("assigned_agent") or session.get("transfer_number") or "")
+
+    # Drop the agent who did not answer so they cannot join late.
+    _hangup_call(str(session.get("dial_call_sid") or "").strip())
+    session["dial_call_sid"] = ""
+    session["b_dialed"] = False
+    session["provider_recording_started"] = False
+    tried = list(session.get("tried_agents") or [])
+    if previous and _phone_digits(previous) not in tried:
+        tried.append(_phone_digits(previous))
+    session["tried_agents"] = tried
+
     if len(numbers) < 2:
-        # No other agent to try (e.g. the only agent's dial could not be placed):
-        # ask the patient for a callback time instead of leaving them on hold.
+        # No other agent to try: ask the patient for a callback time.
         session["status"] = "agent_unreachable"
         save_session(session)
         return offer_agent_unreachable_callback(session)
 
+    nxt = ""
+    untried = [n for n in numbers if _phone_digits(n) not in tried]
+    locked = _lock(cache, scope, session_id)
     try:
-        idx = int(session.get("transfer_number_index") or 0)
-    except (TypeError, ValueError):
-        idx = 0
-    next_idx = idx + 1
-    if next_idx >= len(numbers):
-        dialer_logger = logging.getLogger("ai_caller.dialer")
+        _release_agent(cache, scope, session)
+        if locked:
+            already_tried = [n for n in numbers if _phone_digits(n) in tried]
+            nxt = _reserve_free_agent(cache, scope, session, skip=already_tried)
+        if nxt:
+            attempts = list(session.get("failover_attempts") or [])
+            attempts.append(
+                {"from": previous, "to": nxt, "reason": reason or "no_answer"}
+            )
+            session["failover_attempts"] = attempts
+            _assign_agent(session, nxt)
+            session["status"] = "failover_dialing"
+            save_session(session)
+        elif untried:
+            # Agents left to try, but all are on calls: wait for the first free one.
+            _wait_for_agent(cache, scope, session, front=True)
+            session["status"] = "waiting_for_agent"
+            save_session(session)
+        else:
+            session["status"] = "agent_unreachable"
+            save_session(session)
+    finally:
+        if locked:
+            _unlock(cache, scope)
+
+    dialer_logger = logging.getLogger("ai_caller.dialer")
+    if not nxt and not untried:
         dialer_logger.info(
             "AGENT_FAILOVER_EXHAUSTED session=%s reason=%s tried=%s",
             session_id,
             reason or "unknown",
-            len(numbers),
+            len(tried),
         )
-        session["status"] = "agent_unreachable"
-        save_session(session)
-        # Ask the patient for a callback time (no more agents left).
         offer_agent_unreachable_callback(session)
         return True
+    if not nxt:
+        dialer_logger.info(
+            "AGENT_FAILOVER_WAIT session=%s reason=%s from=%s busy_untried=%s",
+            session_id,
+            reason or "no_answer",
+            previous,
+            len(untried),
+        )
+        set_transfer_call_status(session, "waiting")
+        announce_hold(session)
+        _notify_busy_agents_of_new_waiter(cache, scope, session)
+        _schedule_long_wait_offer(session)
+        # The agent who did not answer is free again — offer them to others in line.
+        promote_next_waiting(scope)
+        return True
 
-    previous = numbers[idx] if idx < len(numbers) else session.get("transfer_number")
-    nxt = numbers[next_idx]
-    attempts = list(session.get("failover_attempts") or [])
-    attempts.append(
-        {
-            "from": previous,
-            "to": nxt,
-            "reason": reason or "no_answer",
-            "index": next_idx,
-        }
-    )
-    session["failover_attempts"] = attempts
-    session["transfer_number_index"] = next_idx
-    session["transfer_number"] = nxt
-    session["live_agent_number"] = nxt
-    # Drop the agent who did not answer so they cannot join this conference late
-    # and end up in the room with the next agent.
-    old_dial = str(session.get("dial_call_sid") or "").strip()
-    _hangup_call(old_dial)
-    session["b_dialed"] = False
-    session["dial_call_sid"] = ""
-    session["provider_recording_started"] = False
-    session["status"] = "failover_dialing"
-    save_session(session)
-
-    dialer_logger = logging.getLogger("ai_caller.dialer")
     dialer_logger.info(
-        "AGENT_FAILOVER session=%s reason=%s from=%s to=%s index=%s",
+        "AGENT_FAILOVER session=%s reason=%s from=%s to=%s",
         session_id,
         reason or "no_answer",
         previous,
         nxt,
-        next_idx,
     )
     logger.info(
         "Failing over live agent session=%s %s -> %s (%s)",
@@ -1398,6 +1612,177 @@ def offer_agent_unreachable_callback(session: Dict[str, Any]) -> bool:
         return False
 
 
+def offer_callback_to_long_waiter(session_id: str, wait_token: str) -> bool:
+    """Still waiting after the max wait → step the patient out to a callback offer."""
+    session = load_session(session_id)
+    if (
+        not session
+        or session.get("queue_state") != "waiting"
+        or session.get("agent_released")
+        or session.get("conference_ended")
+        or session.get("hold_offer_in_progress")
+        or str(session.get("wait_token") or "") != str(wait_token or "")
+    ):
+        return False  # connected, hung up, or a newer wait started
+    patient_sid = str(session.get("call_sid") or "").strip()
+    client = _twilio_client()
+    if client is None or not patient_sid:
+        return False
+    scope = _queue_scope(session)
+    cache = _session_cache()
+    if not _lock(cache, scope, session_id):
+        return False
+    try:
+        session = load_session(session_id) or session
+        if session.get("queue_state") != "waiting" or session.get("hold_offer_in_progress"):
+            return False  # promoted or already being offered meanwhile
+        session["hold_offer_in_progress"] = True
+        session["stepped_out_conference_sid"] = session.get("conference_sid") or ""
+        save_session(session)
+    finally:
+        _unlock(cache, scope)
+    try:
+        client.calls(patient_sid).update(
+            url=_abs_url("/api/ai-call/twilio/warm-transfer/long-wait-offer/", session_id),
+            method="POST",
+            # Know if they hang up while answering (frees their place in line).
+            status_callback=_abs_url("/api/ai-call/twilio/warm-transfer/status/", session_id),
+            status_callback_method="POST",
+        )
+    except Exception:
+        wt_logger.exception("LONG_WAIT_OFFER_FAILED session=%s", session_id)
+        session["hold_offer_in_progress"] = False
+        save_session(session)
+        return False
+    wt_logger.info("LONG_WAIT_OFFER session=%s waited=%ss", session_id, _max_wait_seconds())
+    return True
+
+
+def long_wait_offer_twiml(session: Dict[str, Any]) -> str:
+    session_id = str((session or {}).get("session_id") or "")
+    choice_url = escape(_abs_url("/api/ai-call/twilio/warm-transfer/long-wait-choice/", session_id))
+    keep_holding = escape(
+        _abs_url("/api/ai-call/twilio/warm-transfer/long-wait-choice/", session_id, choice="hold")
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Gather input="speech dtmf" numDigits="1" timeout="8" speechTimeout="auto" '
+        f'action="{choice_url}" method="POST">'
+        f"{_say('Sorry for the wait. All of our agents are still helping other callers. Would you like us to call you back instead? Press 1 or say yes for a callback. Press 2 or say no to keep holding.')}"
+        "</Gather>"
+        f'<Redirect method="POST">{keep_holding}</Redirect>'
+        "</Response>"
+    )
+
+
+def _spoken_callback_time(when: datetime, tz) -> str:
+    local = when.astimezone(tz)
+    today = datetime.now(tz).date()
+    clock = local.strftime("%I:%M %p").lstrip("0").replace(":00 ", " ")
+    if local.date() == today:
+        return f"today at {clock}"
+    if (local.date() - today).days == 1:
+        return f"tomorrow at {clock}"
+    return f"on {local.strftime('%A')} at {clock}"
+
+
+def schedule_long_wait_callback(session: Dict[str, Any]) -> str:
+    """Book the callback at the Settings time. Returns what to tell the patient ("" on failure)."""
+    from apps.ai_caller.models import Call, CallerSettings
+    from apps.ai_caller.scheduling import schedule_callback_request
+    from apps.ai_caller.services import next_callback_time, resolve_timezone
+
+    retell_call_id = str(session.get("retell_call_id") or "").strip()
+    call = Call.objects.filter(retell_call_id=retell_call_id).first() if retell_call_id else None
+    if call is None or call.patient is None:
+        return ""
+    user = call.user or getattr(call.patient, "user", None)
+    if user is None:
+        return ""
+    settings_obj = CallerSettings.load(user)
+    when = next_callback_time(settings_obj)
+    row, error = schedule_callback_request(
+        call=call,
+        raw_time_text="Callback offered after a long hold",
+        scheduled_at=when,
+    )
+    if error or not row:
+        wt_logger.warning("LONG_WAIT_CALLBACK_FAILED session=%s err=%s", session.get("session_id"), error)
+        return ""
+    return _spoken_callback_time(when, resolve_timezone(settings_obj.timezone))
+
+
+_CALLBACK_YES_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok|okay|alright|call me back|call back|callback)\b", re.I
+)
+_KEEP_HOLDING_RE = re.compile(r"\b(no|nope|hold|wait|keep|stay)\b", re.I)
+
+
+def wants_long_wait_callback(speech: str, digits: str) -> bool:
+    """Press 1 / "yes, call me back" → True. Press 2 / "no, I'll hold" → False.
+    Mixed answers ("no, please keep me on hold") favour holding."""
+    digits = (digits or "").strip()
+    if digits:
+        return digits == "1"
+    speech = speech or ""
+    return bool(_CALLBACK_YES_RE.search(speech)) and not _KEEP_HOLDING_RE.search(speech)
+
+
+def handle_long_wait_choice(session: Dict[str, Any], *, speech: str, digits: str, choice: str) -> str:
+    """Patient answered the offer: book the callback, or go back on hold in the same place."""
+    session_id = str(session.get("session_id") or "")
+    wants_callback = choice != "hold" and wants_long_wait_callback(speech, digits)
+    if wants_callback:
+        when_text = schedule_long_wait_callback(session)
+        if when_text:
+            session["hold_offer_in_progress"] = False
+            session["status"] = "callback_scheduled"
+            save_session(session)
+            release_agent_slot(session)  # leaves the line; CALLBACK stays (never overwritten)
+            wt_logger.info("LONG_WAIT_CALLBACK session=%s when=%s", session_id, when_text)
+            return (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<Response>"
+                f"{_say(f'Thank you. We will call you back {when_text}. Goodbye.')}"
+                "<Hangup/>"
+                "</Response>"
+            )
+    # Keep holding (said no, pressed 2, no answer, or booking failed).
+    if session.get("agent_released") or session.get("conference_ended"):
+        # Their place was lost (e.g. a delayed hang-up signal): never leave them
+        # holding with no line — book the callback instead.
+        when_text = schedule_long_wait_callback(session)
+        message = (
+            f"We are sorry for the wait. We will call you back {when_text}. Goodbye."
+            if when_text
+            else "We are sorry for the wait. Our team will call you back. Goodbye."
+        )
+        return f'<?xml version="1.0" encoding="UTF-8"?><Response>{_say(message)}<Hangup/></Response>'
+    scope = _queue_scope(session)
+    cache = _session_cache()
+    locked = _lock(cache, scope, session_id)
+    try:
+        rows = [str(r) for r in (cache.get(_queue_key(scope)) or [])]
+        if session_id not in rows:
+            cache.set(_queue_key(scope), [session_id, *rows], timeout=_SESSION_TTL_SECONDS)
+        session = load_session(session_id) or session
+        session["hold_offer_in_progress"] = False
+        session["wait_token"] = uuid.uuid4().hex  # restart the max-wait clock
+        save_session(session)
+    finally:
+        if locked:
+            _unlock(cache, scope)
+    _schedule_long_wait_offer(session)
+    promote_next_waiting(_queue_scope(session))  # an agent may have freed meanwhile
+    body = inbound_connect_twiml(load_session(session_id) or session)
+    return body.replace(
+        "<Response>",
+        f"<Response>{_say('Okay. Please continue to hold. You are still in line.')}",
+        1,
+    )
+
+
 def schedule_callback_from_warm_transfer_speech(
     session: Dict[str, Any], *, speech: str
 ) -> tuple:
@@ -1444,6 +1829,10 @@ def maybe_failover_on_agent_status(
     session = load_session(str((session or {}).get("session_id") or "")) or dict(
         session or {}
     )
+    if session.get("agent_released") or session.get("conference_ended"):
+        # The patient's call is over: never re-open it or ring another agent.
+        _hangup_call(str(session.get("dial_call_sid") or "").strip())
+        return False
     dial_sid = str(session.get("dial_call_sid") or "").strip()
     call_sid = (call_sid or "").strip()
     # Only react to the agent (dial) leg, not the patient inbound leg.
@@ -1649,6 +2038,12 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
         session["conference_sid"] = conference_sid
         save_session(session)
     # Conference over → live-agent talk ended; extend full-call duration.
+    latest = load_session(str(session.get("session_id") or "")) or session
+    if event == "end" and (
+        latest.get("hold_offer_in_progress")
+        or (conference_sid and conference_sid == latest.get("stepped_out_conference_sid"))
+    ):
+        return  # the hold room they left to answer the callback offer
     if event == "end":
         extend_call_ended_at(session)
         release_agent_slot(session)
@@ -1669,12 +2064,7 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
                 daemon=True,
             ).start()
         session = load_session(str(session.get("session_id") or "")) or session
-        if (
-            str(session.get("queue_state") or "") == "waiting"
-            and inbound_sid
-            and join_call == inbound_sid
-        ):
-            announce_hold(session)
+        # A waiting patient hears the hold message from the waitUrl (repeating).
     if event != "join" or session.get("spoke_now") or not conference_sid:
         return
     count = 0
@@ -1694,17 +2084,6 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
             return
     if count >= 2:
         announce_you_can_speak_now(session, conference_sid)
-
-
-def whisper_twiml(session: Dict[str, Any]) -> str:
-    name = str(session.get("name") or "the caller")
-    service = str(session.get("service_name") or "care")
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        f"{_say('Hi, this is a Bay Area Community Health care coordinator. I am connecting ' + name + ' about ' + service + '. I will introduce you both, then leave.')}"
-        "</Response>"
-    )
 
 
 def dial_status_twiml(dial_status: str) -> str:
@@ -2123,6 +2502,15 @@ def _finalize_leg_persist(session_id: str, *, speaker: str = "") -> Dict[str, An
     return session
 
 
+def _stt_context(session: Dict[str, Any]) -> str:
+    """Whisper prompt with the real names so they are spelled right."""
+    name = str((session or {}).get("name") or "").strip()
+    service = str((session or {}).get("service_name") or "").strip()
+    who = f"{name}, a patient," if name and name != "there" else "a patient"
+    about = f" about a {service}" if service else ""
+    return f"A phone call between {who} and a Bay Area Community Health care coordinator{about}."
+
+
 def persist_humans_transcript(
     session: Dict[str, Any],
     *,
@@ -2204,10 +2592,10 @@ def persist_humans_transcript(
 
     if speaker == "patient" and right_audio:
         patient_detailed = transcribe_recording_detailed(
-            left_audio or audio, filename="patient.wav"
+            left_audio or audio, filename="patient.wav", context=_stt_context(session)
         )
         provider_detailed = transcribe_recording_detailed(
-            right_audio, filename="provider_from_dual.wav"
+            right_audio, filename="provider_from_dual.wav", context=_stt_context(session)
         )
         patient_text = str(patient_detailed.get("text") or "")
         provider_text = str(provider_detailed.get("text") or "")
@@ -2241,7 +2629,9 @@ def persist_humans_transcript(
         segments = patient_detailed.get("segments") or []
     elif speaker == "patient":
         # Mono mix fallback: diarize so we don't store one Patient wall.
-        detailed = transcribe_recording_detailed(audio, filename="patient.wav")
+        detailed = transcribe_recording_detailed(
+            audio, filename="patient.wav", context=_stt_context(session)
+        )
         text = str(detailed.get("text") or "")
         segments = detailed.get("segments") or []
         latest_for_stt = load_session(session_id) or session
@@ -2296,7 +2686,9 @@ def persist_humans_transcript(
             leg_updates["patient_segments"] = segments
     else:
         detailed = (
-            transcribe_recording_detailed(audio, filename=f"{speaker}.wav")
+            transcribe_recording_detailed(
+                audio, filename=f"{speaker}.wav", context=_stt_context(session)
+            )
             if audio
             else {"text": "", "segments": []}
         )
@@ -2647,6 +3039,7 @@ def prepare_retell_bridge(
             session_data["transfer_numbers"] = extra_numbers
             session_data["transfer_number"] = extra_numbers[0]
             session_data["transfer_number_index"] = 0
+    session_data["queue_scope"] = _queue_scope(session_data)
     session = save_session(session_data)
     _schedule_voice_url_restore(session_id)
     wt_logger.info(
