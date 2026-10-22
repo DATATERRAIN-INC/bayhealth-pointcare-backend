@@ -15,7 +15,6 @@ ORG_NAME = "Bay Area Community Health"
 NODE_OPENING = "opening_identity"
 NODE_LANGUAGE = "language_preference"
 NODE_PURPOSE = "purpose"
-NODE_CONTACT = "contact_information"
 NODE_RENEWAL = "renewal_status"
 NODE_RENEWAL_OFFER = "renewal_followup_offer"
 NODE_POINTCARE = "pointcare_registration"
@@ -71,7 +70,7 @@ You are {agent}, a friendly enrollment specialist from {ORG_NAME} (BACH).
 You are on an outbound Medi-Cal renewal & retention call with {{{{patient_name}}}}.
 
 BRANCHING FLOW (follow edges exactly — do not invent skips):
-01 opening_identity → 01b language_preference → 02 purpose → 03 contact_information → 04 renewal_status
+01 opening_identity → 01b language_preference → 02 purpose → 04 renewal_status
 04 YES → 04a changes_check
   - no changes → 09 benefits (skip household/work/support/docs)
   - changes → 05 household_income → 09 benefits (skip work/support/docs)
@@ -96,8 +95,10 @@ GLOBAL RULES:
 - NEVER make the patient repeat a yes/no already given.
 - Do NOT call save_progress or schedule_appointment — both disabled (cause silent waits). Use transition_to_* with parameters only.
 - Never leave silence after an answer — transition in the same turn.
+  Exception: after asking a question (e.g. the language question), always wait for the patient's reply first.
 - Understand natural language. No "Unsure" path.
 - Never disclose Medi-Cal details before identity is verified.
+- Never ask the patient to confirm or update their address, phone number, or email.
 - Callback request → callback_end. DNC → record_dnc then end (only in allowed states).
 
 TRANSFER RULES:
@@ -325,22 +326,33 @@ If wrong person/refuse/voicemail: callback_end or end_call as appropriate.
 ## Node 01b Language preference
 When you ENTER this state, speak promptly and ask ONLY:
 "Is it okay to continue in English, or would you prefer another language?"
-STOP and WAIT for their answer.
+Then STOP. End your turn and WAIT for the patient to answer THIS question.
+The "yes" / "speaking" / "that's me" they said BEFORE this question confirmed their
+identity. It is NOT an answer to the language question — never treat it as "English is fine".
+NEVER call transition_to_purpose in the same turn you ask the question.
+NEVER decide the language yourself. Silence, "hello?", "what?", or noise is not an answer:
+repeat the question once, briefly, and wait again.
 Supported languages (say this list if they ask how many / which languages you speak):
 English, Spanish, Hindi, Chinese (Mandarin), and Vietnamese.
 Example: "I can continue in English, Spanish, Hindi, Chinese, or Vietnamese. Which would you prefer?"
 Then WAIT for their choice.
-- English / fine / okay / yes → immediately transition_to_purpose
-  Pass preferred_language="English".
-- Another language named (e.g. Spanish) → briefly acknowledge, continue in that language when you can, then immediately transition_to_purpose
-  Pass preferred_language to what they asked for.
+Only AFTER the patient replies to the language question:
+- English / fine / okay / yes → transition_to_purpose with preferred_language="English".
+- Another language named (e.g. Spanish) → briefly acknowledge, continue in that language when you can,
+  then transition_to_purpose with preferred_language set to what they asked for.
 FORBIDDEN: Medi-Cal intro, renewal, contact questions, goodbye. Do not invent languages outside the list.
 """.strip(),
             "edges": [
                 _edge(
                     NODE_PURPOSE,
-                    "REQUIRED next after language is settled.",
-                    _json_props({"preferred_language": {"type": "string"}}),
+                    (
+                        "Only after the patient has answered the language question asked in this "
+                        "state (their earlier identity 'yes' does not count)."
+                    ),
+                    _json_props(
+                        {"preferred_language": {"type": "string"}},
+                        required=["preferred_language"],
+                    ),
                 ),
             ],
         },
@@ -356,50 +368,15 @@ FORBIDDEN here:
 - Do NOT ask if renewal is already completed.
 - Do NOT ask address / phone / email / household / income.
 - Do NOT say that's all / goodbye / end the call.
-If they can talk (yes / okay / continue): immediately transition_to_contact_information.
+If they can talk (yes / okay / continue): immediately transition_to_renewal_status.
 If busy: transition_to_callback_end.
 """.strip(),
             "edges": [
                 _edge(
-                    NODE_CONTACT,
+                    NODE_RENEWAL,
                     "REQUIRED next after purpose + good-time yes.",
                 ),
                 _edge(NODE_CALLBACK, "Patient is busy and wants a callback."),
-            ],
-        },
-        {
-            "name": NODE_CONTACT,
-            "state_prompt": """
-## Node 03 Contact Information
-When you ENTER this state, FIRST say:
-"Let me quickly confirm your contact information so you don't miss any important notices."
-Then ask about ALL THREE, one at a time, WAIT each time. For each, offer an update:
-
-1) Address:
-- "Is your current address still {{address}}? Do you need to update it?"
-- If address unknown: "What is your current address?"
-- IMPORTANT meaning of answers:
-  - "yes" / "still correct" / "same" / "no update" / "No" to updating → KEEP current address. Do NOT ask for address again.
-  - "need to update" / gives a new address → capture new address once, then move on.
-
-2) Phone:
-- "Is this the best phone number to reach you, or do you need to update your phone number?"
-- "same" / "yes" / "no update" / "No" to updating → KEEP current number. Do NOT re-ask.
-- Only if they want to update → ask for the new number once.
-
-3) Email:
-- "Do you need to add or update an email address, or are you all set with email?"
-- "no" / "same" / "all set" / skip → move on. Do NOT interrogate.
-- If they want to add/update → ask once, accept even partial, move on.
-
-FORBIDDEN: renewal, household, goodbye, end call, treating "No I don't need to update" as missing info.
-When all three are done: immediately transition_to_renewal_status.
-""".strip(),
-            "edges": [
-                _edge(
-                    NODE_RENEWAL,
-                    "REQUIRED next after contact checks.",
-                ),
             ],
         },
         {
