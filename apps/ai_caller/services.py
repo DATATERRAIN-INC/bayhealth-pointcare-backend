@@ -1,6 +1,7 @@
 from datetime import date, datetime, time, timedelta
 import json
 import logging
+import re
 
 from django.conf import settings
 from django.db.models import (
@@ -46,7 +47,7 @@ from apps.ai_caller.retell import (
     place_retell_guardian_call,
 )
 from apps.ai_caller.serializers import PatientSerializer, PatientUploadSerializer
-from apps.ai_caller.transcript_merge import merge_ai_and_humans
+from apps.ai_caller.transcript_merge import is_log_url, merge_ai_and_humans
 from common.excel import parse_patient_upload
 from common.s3 import upload_bytes
 
@@ -79,13 +80,6 @@ def _filter_patients_by_call_status(queryset, call_status):
     has_paused = _patient_has_call_status(Call.Status.PAUSED)
     has_scheduled = _patient_has_call_status(Call.Status.SCHEDULED)
     has_queued = _patient_has_call_status(Call.Status.QUEUED)
-    has_open_dial = _patient_has_call_status(
-        *Call.ACTIVE_STATUSES,
-        Call.Status.WAITING,
-        Call.Status.PAUSED,
-        Call.Status.SCHEDULED,
-        Call.Status.QUEUED,
-    )
 
     match = Q()
     for status in statuses:
@@ -108,11 +102,13 @@ def _filter_patients_by_call_status(queryset, call_status):
                 & ~has_scheduled
             )
         else:
-            # completed / not_attended / voicemail_reached / callback —
-            # latest status, no open dial row
+            # completed / not_attended / voicemail_reached / callback — same
+            # rule as the status chip: no live call, latest real outcome. A
+            # pending reminder/callback row does not hide the outcome.
             match |= (
-                Q(_latest_call_status=status)
-                & ~has_open_dial
+                Q(_latest_real_status=status)
+                & ~has_active
+                & ~has_waiting
             )
     return queryset.filter(match)
 
@@ -150,8 +146,10 @@ def get_patient_queryset(
     if upload_id.isdigit():
         queryset = queryset.filter(upload_id=int(upload_id))
 
+    # Queue/reminder rows have no started_at; Postgres puts NULLs first in DESC,
+    # so they must go last or they hide the patient's real latest call.
     latest_call = Call.objects.filter(patient_id=OuterRef("pk")).order_by(
-        "-started_at", "-id"
+        F("started_at").desc(nulls_last=True), "-id"
     )
     active_call = Call.objects.filter(
         patient_id=OuterRef("pk"), status__in=Call.ACTIVE_STATUSES
@@ -167,10 +165,29 @@ def get_patient_queryset(
             latest_call.values("live_agent_recording_url")[:1]
         ),
         _active_call_status=Subquery(active_call.values("status")[:1]),
+        # Same rules as PatientSerializer.get_call_status, computed in this one
+        # query instead of 2 extra queries per patient row.
+        _has_waiting_call=Exists(
+            Call.objects.filter(patient_id=OuterRef("pk"), status=Call.Status.WAITING)
+        ),
+        _latest_real_status=Subquery(
+            Call.objects.filter(patient_id=OuterRef("pk"))
+            .exclude(
+                status__in=[
+                    Call.Status.QUEUED,
+                    Call.Status.SCHEDULED,
+                    Call.Status.PAUSED,
+                ]
+            )
+            .order_by("-ended_at", "-started_at", "-id")
+            .values("status")[:1]
+        ),
     ).prefetch_related(
         Prefetch(
             "calls",
-            queryset=Call.objects.order_by("-started_at", "-id").only(
+            queryset=Call.objects.order_by(
+                F("started_at").desc(nulls_last=True), "-id"
+            ).only(
                 "id", "started_at", "flow", "status", "retell_call_id", "patient_id"
             ),
             to_attr="_try_calls",
@@ -708,18 +725,12 @@ def _transcript_has_non_human_answer(items) -> bool:
     return False
 
 
-def _map_retell_status(raw_status, *, disconnection_reason="", event=""):
-    status = (raw_status or "").strip().lower()
-    reason = (disconnection_reason or "").strip().lower()
-    event = (event or "").strip().lower()
-
-    # Voicemail/answering-machine is tracked as its own status rather than
-    # folded into a generic not-attended bucket.
-    voicemail_reasons = {"voicemail_reached", "machine_detected"}
-    if reason in voicemail_reasons or status == "voicemail":
-        return Call.Status.VOICEMAIL_REACHED
-
-    not_attended_reasons = {
+# Retell disconnection_reason values (docs.retellai.com get-call).
+_VOICEMAIL_REASONS = frozenset({"voicemail_reached", "machine_detected"})
+# The call never reached a person: dial failures, carrier/telephony blocks,
+# IVR menus, account limits, and Retell errors before anyone joined.
+_NOT_REACHED_REASONS = frozenset(
+    {
         "dial_no_answer",
         "dial_busy",
         "dial_failed",
@@ -727,16 +738,86 @@ def _map_retell_status(raw_status, *, disconnection_reason="", event=""):
         "no_answer",
         "busy",
         "failed",
+        "invalid_destination",
+        "ivr_reached",
+        "user_declined",
+        "marked_as_spam",
+        "network_blocked",
+        "telephony_provider_permission_denied",
+        "telephony_provider_unavailable",
+        "sip_routing_error",
+        "registered_call_timeout",
+        "error_user_not_joined",
+        "error_no_audio_received",
+        "concurrency_limit_reached",
+        "no_concurrency_fallback",
+        "no_valid_payment",
+        "credit_exhausted",
+        "budget_reached",
+        "scam_detected",
     }
-    if reason in not_attended_reasons:
+)
+# The AI handed the patient to a person — the patient was reached.
+_TRANSFER_REASONS = frozenset(
+    {"call_transfer", "transfer_bridged", "transfer_cancelled", "call_take_over"}
+)
+
+
+def _patient_spoke(data):
+    """True / False when the Retell payload shows whether the patient said
+    anything; None when it carries no transcript to judge from."""
+    if not isinstance(data, dict):
+        return None
+    for key in ("transcript_object", "transcript_with_tool_calls"):
+        entries = data.get(key)
+        if isinstance(entries, list):
+            return any(
+                isinstance(entry, dict)
+                and _map_speaker(entry.get("role") or entry.get("speaker")) == "patient"
+                and str(entry.get("content") or entry.get("text") or "").strip()
+                for entry in entries
+            )
+    text = data.get("transcript")
+    if isinstance(text, str) and text.strip():
+        return bool(re.search(r"(^|\n)\s*user\s*:\s*\S", text, re.I))
+    return None
+
+
+def _map_retell_status(
+    raw_status,
+    *,
+    disconnection_reason="",
+    event="",
+    in_voicemail=False,
+    patient_spoke=None,
+):
+    status = (raw_status or "").strip().lower()
+    reason = (disconnection_reason or "").strip().lower()
+    event = (event or "").strip().lower()
+
+    # Voicemail/answering-machine is tracked as its own status rather than
+    # folded into a generic not-attended bucket. Retell's post-call analysis
+    # (call_analysis.in_voicemail) also catches voicemails the live detector missed.
+    if reason in _VOICEMAIL_REASONS or status == "voicemail":
+        return Call.Status.VOICEMAIL_REACHED
+    if in_voicemail and reason not in _TRANSFER_REASONS:
+        return Call.Status.VOICEMAIL_REACHED
+
+    if reason in _NOT_REACHED_REASONS:
         return Call.Status.NOT_ATTENDED
     if status in {"not_connected", "failed", "busy", "no_answer", "error"}:
         return Call.Status.NOT_ATTENDED
 
-    # Answered then hung up (user/agent) still counts as completed.
-    if status in {"ended", "completed", "done", "analyzed"}:
-        return Call.Status.COMPLETED
-    if event in {"call_ended", "call_analyzed"}:
+    ended = status in {"ended", "completed", "done", "analyzed"} or event in {
+        "call_ended",
+        "call_analyzed",
+    }
+    if ended:
+        # Picked up but the patient never said a word (silent pickup, instant
+        # hang-up, Retell error before they spoke) — nobody was reached.
+        if patient_spoke is False and reason not in _TRANSFER_REASONS:
+            return Call.Status.NOT_ATTENDED
+        # Answered then hung up (user/agent) still counts as completed.
         return Call.Status.COMPLETED
 
     # Picked up and the conversation is live right now.
@@ -1334,7 +1415,9 @@ def maybe_trigger_sms_after_missed_call(call):
         start_sms_conversation_for_patient,
     )
 
-    if SmsConversation.objects.filter(patient=patient, status="ongoing").exists():
+    if SmsConversation.objects.filter(
+        patient=patient, status__in=["sent", "replied", "ongoing"]
+    ).exists():
         dialer_logger.info(
             "SMS_AUTO_SKIP patient_id=%s reason=ongoing_sms streak=%s",
             patient.id,
@@ -1390,6 +1473,61 @@ def maybe_trigger_sms_after_missed_call(call):
     return result
 
 
+# Outcomes that end a call. Only a live warm transfer may move a call back out.
+_FINAL_CALL_STATUSES = frozenset(
+    {
+        Call.Status.COMPLETED,
+        Call.Status.NOT_ATTENDED,
+        Call.Status.VOICEMAIL_REACHED,
+        Call.Status.CALLBACK,
+        Call.Status.CANCEL,
+    }
+)
+
+
+def _first_callback_check(call) -> bool:
+    """True once per call: the OpenAI callback check runs on the first completed update only."""
+    try:
+        from apps.ai_caller.twilio_bridge import _session_cache
+
+        return bool(
+            _session_cache().add(
+                f"ai_caller:callback_check:{call.retell_call_id or call.pk}",
+                1,
+                timeout=7 * 24 * 3600,
+            )
+        )
+    except Exception:
+        return True
+
+
+def _cancel_callbacks_from_call(call, *, reason=""):
+    """Cancel patient-callback outreaches created from this call (and their queued dials)."""
+    rows = ScheduledOutreach.objects.filter(
+        source_call=call,
+        kind=ScheduledOutreach.Kind.CALLBACK_REQUESTED,
+        status=ScheduledOutreach.Status.SCHEDULED,
+    )
+    queued_call_ids = list(
+        rows.exclude(queued_call_id__isnull=True).values_list("queued_call_id", flat=True)
+    )
+    count = rows.update(
+        status=ScheduledOutreach.Status.CANCELLED,
+        error_message=(reason or "")[:512],
+        updated_at=timezone.now(),
+    )
+    if queued_call_ids:
+        Call.objects.filter(
+            id__in=queued_call_ids,
+            status__in=[Call.Status.QUEUED, Call.Status.SCHEDULED, Call.Status.PAUSED],
+        ).delete()
+    if count:
+        dialer_logger.info(
+            "CALLBACK_CANCELLED_VOICEMAIL call_id=%s cancelled=%s", call.id, count
+        )
+    return count
+
+
 def update_call_from_retell_payload(payload):
     """Update call status/transcript from Retell webhook or get-call payload."""
     if not isinstance(payload, dict):
@@ -1410,12 +1548,23 @@ def update_call_from_retell_payload(payload):
     if not raw_status and event.lower() in {"call_ended", "call_analyzed"}:
         raw_status = "ended"
 
+    analysis = data.get("call_analysis") if isinstance(data.get("call_analysis"), dict) else {}
+    patient_spoke = _patient_spoke(data)
+    if patient_spoke is None and call.retell_transcript:
+        patient_spoke = any(
+            isinstance(item, dict)
+            and item.get("speaker") == "patient"
+            and str(item.get("text") or "").strip()
+            for item in call.retell_transcript
+        )
     mapped_status = _map_retell_status(
         raw_status,
         disconnection_reason=str(
             data.get("disconnection_reason") or data.get("disconnect_reason") or ""
         ),
         event=event,
+        in_voicemail=analysis.get("in_voicemail") is True,
+        patient_spoke=patient_spoke,
     )
     # Keep callback if patient already asked to be called later on this call.
     # While the patient is still on the Twilio transfer (on the line with the
@@ -1428,8 +1577,25 @@ def update_call_from_retell_payload(payload):
         stay_on_transfer = transfer_call_should_stay_open(call_id)
     except Exception:
         stay_on_transfer = False
-    if previous_status == Call.Status.CALLBACK:
+    if (
+        previous_status == Call.Status.CALLBACK
+        and mapped_status == Call.Status.VOICEMAIL_REACHED
+        and not stay_on_transfer
+    ):
+        # Retell says this call reached voicemail (often only in call_analyzed,
+        # after call_ended). A callback inferred from the greeting
+        # ("leave a message, I'll call back") is not a patient request — undo it.
+        _cancel_callbacks_from_call(call, reason="Call reached voicemail")
+        call.status = Call.Status.VOICEMAIL_REACHED
+    elif previous_status == Call.Status.CALLBACK:
         call.status = Call.Status.CALLBACK
+    elif (
+        previous_status in _FINAL_CALL_STATUSES
+        and mapped_status in {Call.Status.IN_PROGRESS, Call.Status.ONGOING}
+        and not stay_on_transfer
+    ):
+        # A late call_started / stale poll must not reopen a finished call.
+        call.status = previous_status
     elif stay_on_transfer:
         # Retell says the call ended, but the patient is still on the Twilio
         # warm-transfer leg (waiting for, or talking to, a live agent) —
@@ -1494,7 +1660,15 @@ def update_call_from_retell_payload(payload):
             item["segment"] = "ai"
         # Keep non-empty lines only.
         ai_items = [item for item in ai_items if (item.get("text") or "").strip()]
-        if ai_items or not (call.retell_transcript or []):
+        existing_ai = call.retell_transcript or []
+        # Ended payloads carry Retell's final transcript. A mid-call snapshot
+        # that lands late (slow poll) must never replace a longer saved one.
+        final_payload = str(data.get("call_status") or "").strip().lower() in {
+            "ended",
+            "not_connected",
+            "error",
+        } or event.lower() in {"call_ended", "call_analyzed"}
+        if (ai_items and (final_payload or len(ai_items) >= len(existing_ai))) or not existing_ai:
             call.retell_transcript = ai_items
             call.transcript = merge_ai_and_humans(
                 ai_items, call.live_agent_transcript or []
@@ -1529,10 +1703,38 @@ def update_call_from_retell_payload(payload):
         call.decline_reason = reason
         update_fields.append("decline_reason")
 
-    recording = data.get("recording_url") or data.get("public_log_url") or ""
-    if recording and not (call.recording_url or "").strip():
-        call.recording_url = str(recording)[:1024]
+    # recording_url is the AI (Retell) call audio — the "AI Call recording"
+    # player. public_log_url is a debug log, never audio.
+    recording = str(data.get("recording_url") or "").strip()[:1024]
+    current_recording = (call.recording_url or "").strip()
+    if recording and recording != current_recording:
+        call.recording_url = recording
         update_fields.append("recording_url")
+    elif not recording and is_log_url(current_recording):
+        call.recording_url = ""
+        update_fields.append("recording_url")
+
+    # Retell Call History details. Only overwrite with values Retell actually
+    # sent — call_started has no end reason and analysis arrives last.
+    retell_details = {
+        "disconnection_reason": str(
+            data.get("disconnection_reason") or data.get("disconnect_reason") or ""
+        ).strip()[:64],
+        "retell_call_status": str(data.get("call_status") or "").strip()[:32],
+        "user_sentiment": str(analysis.get("user_sentiment") or "").strip()[:16],
+    }
+    if (call.retell_call_status or "") in {"ended", "not_connected", "error"} and retell_details[
+        "retell_call_status"
+    ] in {"registered", "ongoing"}:
+        retell_details["retell_call_status"] = ""  # stale poll / late call_started
+    for field, value in retell_details.items():
+        if value and value != getattr(call, field):
+            setattr(call, field, value)
+            update_fields.append(field)
+    successful = analysis.get("call_successful")
+    if isinstance(successful, bool) and successful != call.call_successful:
+        call.call_successful = successful
+        update_fields.append("call_successful")
 
     call.save(update_fields=update_fields)
     dialer_logger.info(
@@ -1545,13 +1747,11 @@ def update_call_from_retell_payload(payload):
         str(data.get("disconnection_reason") or "")[:80],
     )
 
-    # If the agent agreed to call back but never invoked the tool, infer from transcript.
-    if call.status in {
-        Call.Status.COMPLETED,
-        Call.Status.IN_PROGRESS,
-        Call.Status.ONGOING,
-        *Call.MISSED_STATUSES,
-    }:
+    # If the agent agreed to call back but never invoked the tool, infer from
+    # transcript — only once a patient actually finished a conversation. A
+    # voicemail greeting ("I'll call you back") is not a callback request, and
+    # live calls are checked when they end.
+    if call.status == Call.Status.COMPLETED and _first_callback_check(call):
         maybe_schedule_callback_from_transcript(call)
         call.refresh_from_db(fields=["status"])
 
@@ -1588,7 +1788,7 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
     """
     Fallback when Retell webhooks are missing/misconfigured:
     - refresh in_progress rows from Retell get-call
-    - backfill transcript for callback/completed/not_attended rows that still
+    - backfill transcript for recent callback/completed/voicemail rows that still
       have none (callback is set mid-call via tool, so webhook sync used to skip them)
     """
     from datetime import timedelta
@@ -1599,9 +1799,21 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
     if user is not None:
         base = base.filter(user=user)
 
-    # Avoid endlessly re-polling ancient empty rows.
-    recent_cutoff = timezone.now() - timedelta(days=7)
+    # Retell has the transcript as soon as a call ends, so only backfill
+    # recent rows. Not-attended calls have no transcript to fetch — re-polling
+    # them every few seconds only burns Retell requests.
+    recent_cutoff = timezone.now() - timedelta(hours=2)
     missing_transcript = Q(transcript=[]) | Q(transcript__isnull=True)
+    # Retell's post-call analysis (sentiment, outcome, in_voicemail) lands a few
+    # seconds after the call ends — usually after our call_ended update. Keep
+    # re-checking just-ended calls until it arrives, so it is stored even when
+    # the call_analyzed webhook is not delivered.
+    awaiting_analysis = (
+        Q(retell_call_status="ended")
+        & Q(user_sentiment="")
+        & Q(call_successful__isnull=True)
+        & Q(ended_at__gte=timezone.now() - timedelta(minutes=30))
+    )
     qs = (
         base.filter(
             Q(status__in=Call.ACTIVE_STATUSES)
@@ -1610,10 +1822,18 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
                     status__in=[
                         Call.Status.CALLBACK,
                         Call.Status.COMPLETED,
-                        *Call.MISSED_STATUSES,
+                        Call.Status.VOICEMAIL_REACHED,
                     ]
                 )
                 & missing_transcript
+                & Q(started_at__gte=recent_cutoff)
+            )
+            | (awaiting_analysis & ~Q(status=Call.Status.CANCEL))
+            # Callback requested mid-call: the row is no longer "active" but the
+            # call is still running — keep syncing until Retell says it ended.
+            | (
+                Q(status=Call.Status.CALLBACK)
+                & ~Q(retell_call_status__in=["ended", "not_connected", "error"])
                 & Q(started_at__gte=recent_cutoff)
             )
         )

@@ -194,7 +194,14 @@ class SmsConversationListView(APIView):
 
         status_filter = (request.query_params.get("status") or "").strip()
         if status_filter:
-            qs = qs.filter(status=status_filter)
+            # Legacy rows still hold "ended" / "ongoing" until data is migrated.
+            legacy = {
+                SmsConversation.Status.COMPLETED: SmsConversation.Status.ENDED,
+                SmsConversation.Status.REPLIED: SmsConversation.Status.ONGOING,
+            }.get(status_filter)
+            qs = qs.filter(
+                status__in=[status_filter, legacy] if legacy else [status_filter]
+            )
         flow_filter = (request.query_params.get("flow") or "").strip()
         if flow_filter:
             qs = qs.filter(flow=flow_filter)
@@ -365,6 +372,7 @@ class SmsWebhookView(APIView):
             from_number=params.get("From", ""),
             body=params.get("Body", ""),
             message_sid=params.get("MessageSid", ""),
+            to_number=params.get("To", ""),
         )
         return HttpResponse(_EMPTY_TWIML, content_type="text/xml")
 

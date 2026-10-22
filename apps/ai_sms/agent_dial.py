@@ -64,14 +64,22 @@ def _transfer_list(conversation: SmsConversation) -> List[str]:
     return [single] if single else []
 
 
+_CONNECTING_NOW = ("i'll connect you", "i will connect you", "i'm connecting you", "connecting you now")
+
+
 def _is_transfer_reply(reply: str) -> bool:
-    text = (reply or "").lower()
-    return (
-        "connect you with" in text
-        or "you'll receive a call shortly" in text
-        or "you will receive a call shortly" in text
-        or "please call" in text
-    )
+    """True only when the reply tells the patient a call is on its way.
+
+    Offers ("I can connect you with… Reply YES or NO") and office-number
+    replies ("please call us at…") must not start a dial.
+    """
+    text = (reply or "").lower().replace("\u2019", "'")
+    if "receive a call shortly" in text:
+        return True
+    # "I'll connect you…" is a promise unless it is still asking them.
+    if "?" in text or "reply yes" in text:
+        return False
+    return any(phrase in text for phrase in _CONNECTING_NOW)
 
 
 def agent_answer_twiml(conversation: SmsConversation) -> str:
@@ -161,21 +169,54 @@ def dial_live_agent(conversation: SmsConversation, *, reason: str = "") -> bool:
     answer_url = f"{base}/api/ai-sms/agent-dial/answer/{conversation.chat_id}/"
     status_url = f"{base}/api/ai-sms/agent-dial/status/{conversation.chat_id}/"
 
-    response = requests.post(
-        f"{_TWILIO_API}/Accounts/{sid}/Calls.json",
-        auth=(sid, token),
-        data={
-            "To": destination,
-            "From": from_number,
-            "Url": answer_url,
-            "Method": "POST",
-            "StatusCallback": status_url,
-            "StatusCallbackMethod": "POST",
-            "StatusCallbackEvent": "initiated ringing answered completed",
-            "Timeout": "25",
-        },
-        timeout=25,
-    )
+    try:
+        response = requests.post(
+            f"{_TWILIO_API}/Accounts/{sid}/Calls.json",
+            auth=(sid, token),
+            data={
+                "To": destination,
+                "From": from_number,
+                "Url": answer_url,
+                "Method": "POST",
+                "StatusCallback": status_url,
+                "StatusCallbackMethod": "POST",
+                "StatusCallbackEvent": "initiated ringing answered completed",
+                "Timeout": "25",
+            },
+            timeout=25,
+        )
+    except requests.ConnectionError as exc:
+        # Never reached Twilio — no call exists, try the next agent.
+        logger.warning(
+            "SMS agent dial request error chat=%s to=%s err=%s",
+            conversation.chat_id,
+            destination,
+            exc,
+        )
+        return failover_to_next_live_agent(conversation, reason="dial_request_error")
+    except requests.RequestException as exc:
+        # Sent but no answer back (e.g. read timeout): Twilio may have placed the
+        # call. Wait for its status callback (it adopts the CallSid) rather than
+        # ringing a second agent at the same time.
+        logger.warning(
+            "SMS agent dial unconfirmed chat=%s to=%s err=%s",
+            conversation.chat_id,
+            destination,
+            exc,
+        )
+        conversation.transfer_number = destination
+        conversation.transfer_number_index = idx
+        conversation.dial_call_sid = ""
+        conversation.transfer_status = "dialing"
+        conversation.save(
+            update_fields=[
+                "transfer_number",
+                "transfer_number_index",
+                "dial_call_sid",
+                "transfer_status",
+            ]
+        )
+        return True
     try:
         payload = response.json()
     except Exception:
@@ -279,8 +320,17 @@ def maybe_failover_on_agent_status(
     conversation: SmsConversation, *, call_status: str, call_sid: str = ""
 ) -> bool:
     status = (call_status or "").strip().lower()
+    if (
+        call_sid
+        and not (conversation.dial_call_sid or "").strip()
+        and conversation.transfer_status in {"dialing", "failover_dialing"}
+    ):
+        # Dial request timed out before Twilio returned the CallSid — adopt it now.
+        conversation.dial_call_sid = call_sid.strip()
+        conversation.save(update_fields=["dial_call_sid"])
     if status not in _AGENT_FAIL_STATUSES:
-        if status in {"in-progress", "answered", "ringing"}:
+        # "ringing" is not an answer: keep dialing state so no-answer/busy can fail over.
+        if status in {"in-progress", "answered"}:
             if conversation.transfer_status in {"dialing", "failover_dialing"}:
                 conversation.transfer_status = "bridging"
                 conversation.save(update_fields=["transfer_status"])

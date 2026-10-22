@@ -247,6 +247,22 @@ def _party_numbers(*values: str) -> list:
     return found
 
 
+# A transfer happens during the call that created its session. Older unclaimed
+# sessions (calls that never transferred) must not grab a new inbound transfer.
+_INBOUND_SESSION_MAX_AGE_SECONDS = 60 * 60
+
+
+def _session_started_at(session: Dict[str, Any]) -> float:
+    """Epoch seconds when the session was created (updated_at for older rows)."""
+    created = session.get("created_at")
+    if isinstance(created, (int, float)):
+        return float(created)
+    try:
+        return datetime.fromisoformat(str(session.get("updated_at") or "")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def resolve_inbound_session(
     *,
     call_sid: str = "",
@@ -277,9 +293,14 @@ def resolve_inbound_session(
             for session in sessions:
                 if str(session.get("call_sid") or "") == call_sid:
                     return session
+        # Only sessions from the last hour, so a new transfer never binds to an
+        # earlier call's leftover session (e.g. a rehearsal call to the same phone).
+        cutoff = time.time() - _INBOUND_SESSION_MAX_AGE_SECONDS
+        sessions = [s for s in sessions if _session_started_at(s) >= cutoff]
         parties = _party_numbers(from_number, to_number, caller, called)
         for party in parties:
-            for session in sessions:
+            # Same phone on two recent sessions: the newest call is the one transferring.
+            for session in sorted(sessions, key=_session_started_at, reverse=True):
                 if session.get("conference_ended") or session.get("agent_released"):
                     continue
                 bound = str(session.get("call_sid") or "")
@@ -470,8 +491,10 @@ def release_agent_slot(session: Dict[str, Any]) -> None:
     save_session(session)
     if str(cache.get(_active_key(scope)) or "") == sid:
         cache.delete(_active_key(scope))
-    if not session.get("callback_offer_started"):
-        set_transfer_call_status(session, "completed")
+    # Also after a callback offer: a scheduled callback sets CALLBACK, which
+    # set_transfer_call_status never overwrites; a hang-up must not leave the
+    # call "in progress" forever (that blocks every future dial).
+    set_transfer_call_status(session, "completed")
     if was_active:
         promote_next_waiting(scope)
     restore_inbound_voice_url(session)
@@ -641,6 +664,30 @@ def extend_call_ended_at(
     )
 
 
+def _human_recording_url(session: Dict[str, Any]) -> str:
+    """Best audio of the patient <-> live agent talk, both voices first.
+
+    Order: patient dual-channel (both voices) > conference mix (both voices)
+    > live-agent leg > patient mono leg.
+    """
+    s = session or {}
+    candidates = []
+    if s.get("patient_recording_dual"):
+        candidates += [s.get("patient_recording_s3_url"), s.get("patient_recording_url")]
+    candidates += [
+        s.get("mix_recording_s3_url"),
+        s.get("mix_recording_url"),
+        s.get("provider_recording_s3_url"),
+        s.get("provider_recording_url"),
+        s.get("patient_recording_s3_url"),
+        s.get("patient_recording_url"),
+    ]
+    for url in candidates:
+        if str(url or "").strip():
+            return str(url).strip()
+    return ""
+
+
 def _sync_call_twilio_ids(
     session: Dict[str, Any],
     *,
@@ -668,7 +715,8 @@ def _sync_call_twilio_ids(
         or str((session or {}).get("patient_recording_url") or "")
     ).strip()
     agent_url = (
-        live_agent_recording_url
+        _human_recording_url(session)
+        or live_agent_recording_url
         or str((session or {}).get("provider_recording_s3_url") or "")
         or str((session or {}).get("provider_recording_url") or "")
     ).strip()
@@ -676,7 +724,9 @@ def _sync_call_twilio_ids(
     if twilio_call_sid and call.warm_transfer_session_id != twilio_call_sid:
         call.warm_transfer_session_id = twilio_call_sid[:64]
         update_fields.append("warm_transfer_session_id")
-    if patient_url and patient_url != (call.recording_url or ""):
+    # recording_url is the AI (Retell) call audio. Only use a Twilio leg when
+    # Retell has not provided one; Retell's own recording replaces it later.
+    if patient_url and not (call.recording_url or "").strip():
         call.recording_url = patient_url[:1024]
         update_fields.append("recording_url")
     if agent_url and agent_url != (call.live_agent_recording_url or ""):
@@ -1137,6 +1187,14 @@ def start_coordinator_leg(session: Dict[str, Any]) -> None:
     destination = str(session.get("transfer_number") or "").strip()
     from_number = _from_number()
     if client is None or not destination or not from_number:
+        logger.error(
+            "Cannot dial live agent session=%s client=%s destination=%s from=%s",
+            session_id,
+            client is not None,
+            bool(destination),
+            bool(from_number),
+        )
+        failover_to_next_live_agent(session, reason="dial_not_configured")
         return
     session["b_dialed"] = True
     save_session(session)
@@ -1199,7 +1257,11 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
         if str(n).strip()
     ]
     if len(numbers) < 2:
-        return False
+        # No other agent to try (e.g. the only agent's dial could not be placed):
+        # ask the patient for a callback time instead of leaving them on hold.
+        session["status"] = "agent_unreachable"
+        save_session(session)
+        return offer_agent_unreachable_callback(session)
 
     try:
         idx = int(session.get("transfer_number_index") or 0)
@@ -1574,13 +1636,20 @@ def handle_conference_status(session: Dict[str, Any], payload: Dict[str, str]) -
     event = (
         payload.get("StatusCallbackEvent") or payload.get("EventName") or ""
     ).strip().lower()
+    # Twilio sends "participant-join" / "conference-end"; accept the short forms too.
+    event = {
+        "participant-join": "join",
+        "participant-leave": "leave",
+        "conference-start": "start",
+        "conference-end": "end",
+    }.get(event, event)
     conference_sid = (payload.get("ConferenceSid") or "").strip()
     join_call = (payload.get("CallSid") or "").strip()
     if conference_sid:
         session["conference_sid"] = conference_sid
         save_session(session)
     # Conference over → live-agent talk ended; extend full-call duration.
-    if event in {"end", "conference-end"}:
+    if event == "end":
         extend_call_ended_at(session)
         release_agent_slot(session)
         return
@@ -1739,6 +1808,14 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
     elif dual_ok and patient and provider:
         mix = ""
         mix_items = None
+    elif patient and provider and not dual_ok and session.get("mix_failed"):
+        # Mix diarization failed — per-leg text is the best we will get.
+        mix = ""
+        mix_items = None
+        wt_logger.info(
+            "TRANSFER_PERSIST_LEGS_AFTER_MIX_FAIL retell_call_id=%s",
+            retell_call_id,
+        )
     elif patient and provider and not dual_ok:
         # Mono legs only — do not persist a fused interleave; wait for mix.
         wt_logger.info(
@@ -1762,6 +1839,11 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
         mix = ""
         mix_items = None
         patient_segments = []
+    elif session.get("mix_failed"):
+        # Patient-only mono and the mix could not be diarized — keep the text.
+        mix = ""
+        mix_items = None
+        provider_segments = []
     else:
         # Patient-only mono is usually a fused two-person wall — wait for
         # provider + mix diarize instead of flashing humans=1 in the UI.
@@ -1785,15 +1867,16 @@ def _persist_to_db(session: Dict[str, Any]) -> None:
             else ""
         )
     )
-    live_agent_recording_url = (
-        str(session.get("provider_recording_s3_url") or "")
-        or str(session.get("provider_recording_url") or "")
-    )
+    live_agent_recording_url = _human_recording_url(session)
     twilio_call_sid = str(
         session.get("call_sid") or session.get("dial_call_sid") or ""
     ).strip()
     patient_offset = _recording_offset(session, "patient")
     provider_offset = _recording_offset(session, "provider")
+    if dual_ok:
+        # Both speakers came from the patient recording (left/right channel or
+        # diarized), so their times share the patient recording's clock.
+        provider_offset = patient_offset
     # If one leg has no wall-clock, keep relative-only merge (both 0).
     if not patient_offset or not provider_offset:
         patient_offset = 0.0
@@ -1900,10 +1983,11 @@ def _persist_mix_transcript(
     )
     # Never store an undiarized mixed wall as the humans transcript.
     if not diarized_items:
-        patch_session(
+        session = patch_session(
             session_id,
             {
                 "mix_saved": True,
+                "mix_failed": True,
                 "mix_recording_url": recording_url,
                 "mix_recording_sid": recording_sid,
                 **({"mix_recording_s3_url": s3_url} if s3_url else {}),
@@ -1913,6 +1997,10 @@ def _persist_mix_transcript(
             "TRANSFER_FAIL session=%s leg=mix reason=no_diarization",
             session_id,
         )
+        # Per-leg transcripts were held back waiting for this mix; save them now
+        # so the live-agent conversation is not lost.
+        if session.get("patient_transcript") or session.get("provider_transcript"):
+            _persist_to_db(session)
         return load_session(session_id) or session
 
     text = " ".join(
@@ -1966,8 +2054,9 @@ def _finalize_leg_persist(session_id: str, *, speaker: str = "") -> Dict[str, An
     dual_ok = bool(
         session.get("dual_channel_split") or session.get("diarized_from_patient_mono")
     )
-    # Mono patient+provider STT is not a reliable split — wait for mix diarize.
-    if both_ready and not dual_ok:
+    # Mono patient+provider STT is not a reliable split — wait for mix diarize
+    # (unless the mix already failed; then the legs are all we have).
+    if both_ready and not dual_ok and not session.get("mix_failed"):
         patient_recording = (
             str(session.get("patient_recording_s3_url") or "")
             or str(session.get("patient_recording_url") or "")
@@ -2532,6 +2621,7 @@ def prepare_retell_bridge(
 
     session_data: Dict[str, Any] = {
         "session_id": session_id,
+        "created_at": time.time(),
         "name": name,
         "service_name": service_name,
         "phone_number": normalize_phone(phone_number),

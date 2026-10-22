@@ -27,7 +27,7 @@ from apps.ai_caller.retell import (
     _retell_request,
     normalize_phone,
 )
-from apps.ai_caller.services import _combine_phone, _resolve_live_agent_numbers
+from apps.ai_caller.services import _combine_phone, _is_minor, _resolve_live_agent_numbers
 from apps.ai_sms.models import SmsConversation
 from apps.ai_sms.prompt import (
     assist_ask,
@@ -90,10 +90,24 @@ def _normalize_sms_status(raw: str) -> str:
     return SmsConversation.Status.REPLIED
 
 
-def _close_open_sms_for_number(phone: str) -> None:
-    SmsConversation.objects.filter(
+def _close_open_sms_for_number(phone: str, from_number: str = "") -> None:
+    """Close open chats to this patient on the same Twilio line.
+
+    The adult and minor (guardian) flows use different numbers, so starting one
+    must not close the other.
+    """
+    open_rows = SmsConversation.objects.filter(
         to_number=phone, status__in=_OPEN_SMS_STATUSES
-    ).update(status=SmsConversation.Status.COMPLETED)
+    )
+    line = normalize_phone(from_number)
+    if line:
+        ids = [
+            row.pk
+            for row in open_rows.only("pk", "from_number")
+            if normalize_phone(row.from_number or "") == line
+        ]
+        open_rows = SmsConversation.objects.filter(pk__in=ids)
+    open_rows.update(status=SmsConversation.Status.COMPLETED)
 
 
 def _mark_patient_replied(conversation: SmsConversation) -> None:
@@ -254,12 +268,20 @@ def _yn(text: str) -> str:
     lowered = (text or "").strip().lower()
     tokens = [re.sub(r"[^a-z]", "", t) for t in lowered.split() if t]
     first = tokens[0] if tokens else ""
-    yes_words = {"y", "yes", "yeah", "yep", "sure", "ok", "okay", "alreadydidit"}
+    yes_words = {
+        "y", "yes", "yeah", "yep", "sure", "ok", "okay", "alreadydidit",
+        "yup", "yea", "ya", "yah", "yess", "correct",
+    }
+    # Only when they are the whole reply ("absolutely not" must stay a no).
+    yes_whole = {
+        "absolutely", "ofcourse", "thatsme", "itsme", "thisisme", "speaking",
+        "thatsright", "right", "yesplease", "definitely",
+    }
     no_words = {
         "n", "no", "nope", "nah", "notyet", "maybe", "maybelater", "later",
         "notnow", "notrightnow", "idontknow", "idonotknow",
     }
-    if word in yes_words or first in yes_words:
+    if word in yes_words or first in yes_words or word in yes_whole:
         return "yes"
     if word in no_words or first in no_words:
         return "no"
@@ -271,44 +293,74 @@ def _yn(text: str) -> str:
     return ""
 
 
+# Words that, just before a request phrase, mean the patient is NOT asking for it
+# ("don't call me", "I already have an appointment", "no need to schedule").
+_NEGATION_WORDS = frozenset(
+    {
+        "no", "not", "dont", "don't", "never", "stop", "already", "didnt", "didn't",
+        "wont", "won't", "doesnt", "doesn't", "cant", "can't", "cannot", "without",
+        "havent", "haven't", "hasnt", "hasn't",
+    }
+)
+_NEGATION_WINDOW = 4
+
+
+def _requests_phrase(text: str, phrases: Tuple[str, ...]) -> bool:
+    """True when a phrase appears (substring, so "reschedule" counts) and isn't negated.
+
+    Only words in the same clause count as negation: "No rush, call me" is a request.
+    """
+    lowered = (text or "").lower().replace("’", "'")
+    for phrase in phrases:
+        for match in re.finditer(re.escape(phrase), lowered):
+            clause = re.split(r"[,.;:!?\n]", lowered[: match.start()])[-1]
+            before = re.findall(r"[a-z']+", clause)[-_NEGATION_WINDOW:]
+            if any(word in _NEGATION_WORDS for word in before):
+                continue
+            return True
+    return False
+
+
+# A bare "appointment" is not a request ("I have an appointment next week").
+_SCHEDULE_PHRASES = (
+    "schedule",
+    "get an appointment",
+    "booking",
+    "book an",
+    "book a",
+    "book for",
+    "set up an appointment",
+    "make an appointment",
+    "need an appointment",
+    "want an appointment",
+)
+
+_LIVE_AGENT_PHRASES = (
+    "live agent",
+    "real person",
+    "human",
+    "speak to someone",
+    "talk to someone",
+    "speak with someone",
+    "talk with someone",
+    "call me",
+    "connect me",
+    "transfer me",
+    "team member",
+    "representative",
+)
+
+
 def _wants_schedule(text: str) -> bool:
-    lowered = (text or "").lower()
-    return any(
-        phrase in lowered
-        for phrase in (
-            "schedule",
-            "appointment",
-            "booking",
-            "book an",
-            "book a",
-            "book for",
-            "set up an appointment",
-            "make an appointment",
-            "need an appointment",
-            "want an appointment",
-        )
-    )
+    # "It's scheduled for Nov 15" describes an existing appointment, not a request.
+    cleaned = re.sub(r"\b(re)?scheduled\b", " ", (text or "").lower())
+    return _requests_phrase(cleaned, _SCHEDULE_PHRASES)
 
 
 def _wants_live_agent(text: str) -> bool:
-    lowered = (text or "").lower()
-    return any(
-        phrase in lowered
-        for phrase in (
-            "live agent",
-            "real person",
-            "human",
-            "speak to someone",
-            "talk to someone",
-            "speak with someone",
-            "talk with someone",
-            "call me",
-            "connect me",
-            "transfer me",
-            "team member",
-            "representative",
-        )
-    )
+    # "human papillomavirus" (HPV) is a service name, not a request for a person.
+    cleaned = re.sub(r"\bhuman\s+papilloma", " ", (text or "").lower())
+    return _requests_phrase(cleaned, _LIVE_AGENT_PHRASES)
 
 
 def _is_question_query(text: str) -> bool:
@@ -399,6 +451,25 @@ def _choice(text: str) -> str:
     return match.group(1) if match else ""
 
 
+# Sent when no model answered. A YES / NO right after it answers this offer.
+_FALLBACK_CONNECT_OFFER = (
+    "Thanks for your message — I can help with that. "
+    "Would you like me to connect you with a team member? Reply YES or NO."
+)
+
+
+def _last_agent_text(conversation) -> str:
+    last = ""
+    for line in (conversation.transcript or "").splitlines():
+        if line.startswith("Agent:"):
+            last = line[len("Agent:"):].strip()
+    return last
+
+
+def _answers_fallback_offer(conversation, answer: str) -> bool:
+    return answer in {"yes", "no"} and _last_agent_text(conversation) == _FALLBACK_CONNECT_OFFER
+
+
 def _resume_step(conversation) -> str:
     step = conversation.step or "identity"
     if step != "chat":
@@ -429,6 +500,45 @@ def _past_date(text: str) -> bool:
         except ValueError:
             continue
         return found < date.today()
+    return False
+
+
+_MENU_PICK = re.compile(r"\s*(?:option\s*|#\s*)?([1-5])\s*(?:[.)\-:]\s*[a-z ]*)?\s*", re.I)
+_MONTHS = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+    r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+)
+_DATE_ANSWER = re.compile(
+    r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"
+    rf"|\b(?:{_MONTHS})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?\b"
+    rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:{_MONTHS})\b",
+    re.I,
+)
+
+
+def _menu_pick(text: str) -> str:
+    """The number when the whole reply is a menu pick ("2", "2.", "#2", "2 - Transportation")."""
+    match = _MENU_PICK.fullmatch(text or "")
+    return match.group(1) if match else ""
+
+
+def _flow_recognizes(step: str, text: str) -> bool:
+    """True for non-yes/no answers the scripted flow handles exactly (menu numbers,
+    BOOKED / NOT SURE, appointment dates). Anything else goes to the model."""
+    lowered = (text or "").strip().lower()
+    if step == "barriers":
+        return bool(_menu_pick(text))
+    if step == "assist":
+        return _menu_pick(text) in {"1", "2", "3", "4"}
+    if step == "screening":
+        short_answer = "?" not in lowered and len(lowered.split()) <= 6
+        return (
+            lowered in {"booked", "already booked", "unsure", "notsure"}
+            or "already have an appointment" in lowered
+            or ("not sure" in lowered and short_answer)
+        )
+    if step == "appointment":
+        return "missed" in lowered or bool(_DATE_ANSWER.search(text or ""))
     return False
 
 
@@ -611,6 +721,8 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
     step = conversation.step or "identity"
     answer = _yn(text)
     intent = _minor_intent(text)
+    if _answers_fallback_offer(conversation, answer):
+        step = "query_connect"
 
     # After early gates, schedule / live-agent requests connect immediately.
     if step not in {"identity", "consent"} and intent in {"schedule", "live_agent"}:
@@ -635,16 +747,21 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
         conversation.save(update_fields=["step", "status", "transcript"])
         return reply
 
+    # Menu numbers, BOOKED / NOT SURE and dates are exact flow answers, not free-form.
+    flow_answer = _flow_recognizes(_resume_step(conversation), text)
+
     # Free-form (not bare yes/no) → conversational model.
     if intent not in {"yes", "no"} and step in {
         "identity", "consent", "moment", "consent_no", "moment_later", "screening",
         "schedule", "not_sure", "barriers", "assist", "followup", "appointment", "chat",
-        "closing", "question",
+        "closing", "question", "query_connect",
     }:
         # Keep a few keyword clarifications on consent scripted.
         if step == "consent" and any(
             p in text.lower() for p in ("why", "what is this", "what's this", "who is this")
         ):
+            pass
+        elif flow_answer:
             pass
         else:
             return None
@@ -728,7 +845,9 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
         conversation.save(update_fields=["step", "status", "transcript"])
         return reply
 
-    if step == "consent_no":
+    # consent_no: patient declined the AI. query_connect: we offered a team member
+    # after the conversational model was unavailable. Both are a YES/NO connect offer.
+    if step in {"consent_no", "query_connect"}:
         _remember(conversation, "Patient", text)
         if answer == "yes":
             reply = (
@@ -754,7 +873,11 @@ def _scripted_reply(conversation, text: str, variables: Dict[str, str]) -> Optio
         return None
     reply, new_step, new_status = flowed
     # If flow only re-asked because unclear, prefer conversational model.
-    if answer == "" and intent in {"question", "other", "schedule", "live_agent"}:
+    if (
+        answer == ""
+        and not flow_answer
+        and intent in {"question", "other", "schedule", "live_agent"}
+    ):
         return None
     _remember(conversation, "Patient", text)
     _remember(conversation, "Agent", reply)
@@ -1031,6 +1154,8 @@ def _minor_scripted_reply(conversation, text: str) -> Optional[str]:
     intent = _minor_intent(text)
     step = conversation.step or "identity"
     variables = _minor_variables(conversation)
+    if _answers_fallback_offer(conversation, intent):
+        step = "query_connect"
 
     # Clear connect intents after identity — keep scripted for reliable dial trigger text.
     if step != "identity" and intent in {"schedule", "live_agent"}:
@@ -1150,26 +1275,24 @@ def _openai_conversational_reply(conversation, text: str) -> str:
 
 def _apply_conversational_side_effects(conversation, text: str, reply: str) -> None:
     """Update step/status when the LLM reply is clearly ending or connecting."""
-    lowered_reply = (reply or "").lower()
-    lowered_text = (text or "").lower()
     speaker = "Guardian" if (conversation.flow or "") == "minor" else "Patient"
     _remember(conversation, speaker, text)
     if reply:
         _remember(conversation, "Agent", reply)
 
-    connecting = (
-        "you'll receive a call shortly" in lowered_reply
-        or "you will receive a call shortly" in lowered_reply
-        or "connect you with" in lowered_reply
-    )
-    if _wants_live_agent(text) or (
-        connecting and not _wants_schedule(text)
-    ):
+    # Only a reply that tells them a call is coming ends the chat as a transfer
+    # (same check that starts the agent dial). Offers like "Would you like me to
+    # connect you…?" keep the conversation open for their YES / NO.
+    from apps.ai_sms.agent_dial import _is_transfer_reply
+
+    connecting = _is_transfer_reply(reply)
+    if connecting:
         conversation.step = "ended"
-        conversation.status = SmsConversation.Status.LIVE_AGENT
-    elif _wants_schedule(text) or connecting:
-        conversation.step = "ended"
-        conversation.status = SmsConversation.Status.COMPLETED
+        conversation.status = (
+            SmsConversation.Status.COMPLETED
+            if _wants_schedule(text) and not _wants_live_agent(text)
+            else SmsConversation.Status.LIVE_AGENT
+        )
     elif (conversation.step or "") == "identity" and _yn(text) == "yes":
         conversation.step = "disclose" if (conversation.flow or "") == "minor" else "consent"
     elif (conversation.step or "") in {"consent", "disclose"} and _yn(text) == "yes":
@@ -1330,12 +1453,16 @@ def send_twilio_sms(to_number: str, body: str, from_number: str = "") -> Tuple[s
     last_error = ""
     chunks = [text[i : i + _SMS_LIMIT] for i in range(0, len(text), _SMS_LIMIT)]
     for chunk in chunks:
-        response = requests.post(
-            f"{_TWILIO_API}/Accounts/{sid}/Messages.json",
-            auth=(sid, token),
-            data={"To": to_number, "From": from_number, "Body": chunk},
-            timeout=25,
-        )
+        try:
+            response = requests.post(
+                f"{_TWILIO_API}/Accounts/{sid}/Messages.json",
+                auth=(sid, token),
+                data={"To": to_number, "From": from_number, "Body": chunk},
+                timeout=25,
+            )
+        except requests.RequestException as exc:
+            logger.warning("Twilio SMS request error err=%s", exc)
+            return message_sid, "Could not reach Twilio to send the SMS."
         try:
             payload = response.json()
         except Exception:
@@ -1357,12 +1484,16 @@ def point_twilio_webhook(webhook_url: str, phone_number: str = "") -> None:
     if err:
         return
     from_number = (phone_number or from_number).strip()
-    listed = requests.get(
-        f"{_TWILIO_API}/Accounts/{sid}/IncomingPhoneNumbers.json",
-        auth=(sid, token),
-        params={"PhoneNumber": from_number},
-        timeout=25,
-    )
+    try:
+        listed = requests.get(
+            f"{_TWILIO_API}/Accounts/{sid}/IncomingPhoneNumbers.json",
+            auth=(sid, token),
+            params={"PhoneNumber": from_number},
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Twilio number lookup failed for SMS webhook err=%s", exc)
+        return
     try:
         numbers = (listed.json() or {}).get("incoming_phone_numbers") or []
     except Exception:
@@ -1372,12 +1503,15 @@ def point_twilio_webhook(webhook_url: str, phone_number: str = "") -> None:
     number_sid = str(numbers[0].get("sid") or "")
     if not number_sid:
         return
-    requests.post(
-        f"{_TWILIO_API}/Accounts/{sid}/IncomingPhoneNumbers/{number_sid}.json",
-        auth=(sid, token),
-        data={"SmsUrl": webhook_url, "SmsMethod": "POST"},
-        timeout=25,
-    )
+    try:
+        requests.post(
+            f"{_TWILIO_API}/Accounts/{sid}/IncomingPhoneNumbers/{number_sid}.json",
+            auth=(sid, token),
+            data={"SmsUrl": webhook_url, "SmsMethod": "POST"},
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Twilio SMS webhook update failed err=%s", exc)
 
 
 def _patient_for_sms(patient_id: int, *, user=None) -> Tuple[Optional[Patient], Dict[str, Any]]:
@@ -1421,6 +1555,11 @@ def start_sms_conversation_for_patient(
     patient, err = _patient_for_sms(patient_id, user=user)
     if err:
         return err
+    # Under 18: text the parent/guardian from the minor line, never the child.
+    if _is_minor(patient.dob):
+        return start_minor_sms_conversation_for_patient(
+            patient_id, user=user, webhook_url=webhook_url
+        )
 
     dial_number = _combine_phone(patient.country_code, patient.phone_number)
     if not dial_number:
@@ -1582,7 +1721,7 @@ def start_sms_conversation(
     if sms_err:
         return {"ok": False, "error": sms_err, "status_code": 502}
 
-    _close_open_sms_for_number(phone)
+    _close_open_sms_for_number(phone, from_number)
     actor_user = actor or getattr(patient, "user", None) if patient else actor
     conversation = SmsConversation.objects.create(
         chat_id=chat_id,
@@ -1678,7 +1817,7 @@ def start_minor_sms_conversation(
         return {"ok": False, "error": sms_err, "status_code": 502}
 
     chat_id = f"minor-{uuid.uuid4().hex}"
-    _close_open_sms_for_number(phone)
+    _close_open_sms_for_number(phone, from_number)
     actor_user = actor or getattr(patient, "user", None) if patient else actor
     conversation = SmsConversation.objects.create(
         chat_id=chat_id,
@@ -1722,18 +1861,101 @@ def start_minor_sms_conversation(
     }
 
 
-def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") -> str:
+def _fallback_reply(conversation: SmsConversation, text: str) -> str:
+    """Reply when no model answered."""
+    minor = (conversation.flow or "") == "minor"
+    if (conversation.step or "identity") == "identity":
+        # Never connect or offer a transfer before we know who we're texting.
+        if minor:
+            who = _minor_who(_minor_variables(conversation))
+            return f"Sorry, I didn't catch that. Are you {who}? Reply YES or NO."
+        name = conversation.patient_name or ""
+        return _fill(_sms_greeting(), name, name, conversation.service_name or "")
+    if _wants_schedule(text) or _wants_live_agent(text):
+        return "I'll connect you with a team member now — you'll receive a call shortly."
+    return _FALLBACK_CONNECT_OFFER
+
+
+def _same_line(conversation: SmsConversation, line: str) -> bool:
+    """True when the conversation was sent from our Twilio number `line`."""
+    return bool(line) and normalize_phone(conversation.from_number or "") == line
+
+
+def _latest_for_line(
+    conversations, line: str, *, same_line_only: bool = False
+) -> Optional[SmsConversation]:
+    """Newest conversation on the Twilio number they texted; newest overall otherwise."""
+    rows = list(conversations.order_by("-created_at")[:20])
+    for row in rows:
+        if _same_line(row, line):
+            return row
+    if same_line_only:
+        return None
+    return rows[0] if rows else None
+
+
+def _claim_inbound_sid(conversation: SmsConversation, message_sid: str) -> bool:
+    """Atomically record this Twilio MessageSid. False when it was already handled."""
+    if not message_sid:
+        return True
+    claimed = (
+        SmsConversation.objects.filter(pk=conversation.pk)
+        .exclude(last_inbound_sid=message_sid)
+        .update(last_inbound_sid=message_sid)
+    )
+    if not claimed:
+        return False
+    conversation.last_inbound_sid = message_sid
+    return True
+
+
+def _reply_after_close(
+    conversation: SmsConversation, phone: str, text: str, message_sid: str
+) -> str:
+    """Patient texted after the conversation ended: send the office number once."""
+    if not _claim_inbound_sid(conversation, message_sid):
+        return ""
+    speaker = "Guardian" if (conversation.flow or "") == "minor" else "Patient"
+    reply = closed_reply(_sms_from_number() or "the office")
+    already_told = reply in (conversation.transcript or "")
+    _remember(conversation, speaker, text)
+    # STOP is handled by Twilio opt-out; never text back after it.
+    if _word(text) in {"stop", "end", "cancel", "unsubscribe"} or already_told:
+        conversation.save(update_fields=["transcript", "updated_at"])
+        return ""
+    _remember(conversation, "Agent", reply)
+    conversation.save(update_fields=["transcript", "updated_at"])
+    _sid, sms_err = send_twilio_sms(phone, reply, conversation.from_number)
+    if sms_err:
+        logger.warning("Twilio closed reply failed chat=%s err=%s", conversation.chat_id, sms_err)
+    return reply
+
+
+def reply_to_inbound_sms(
+    *, from_number: str, body: str, message_sid: str = "", to_number: str = ""
+) -> str:
     phone = normalize_phone(from_number)
     text = (body or "").strip()
     if not phone or not text:
         return ""
+    line = normalize_phone(to_number)
 
-    conversation = (
-        SmsConversation.objects.filter(to_number=phone, status__in=_OPEN_SMS_STATUSES)
-        .order_by("-created_at")
-        .first()
-    )
+    all_rows = SmsConversation.objects.filter(to_number=phone)
+    open_rows = all_rows.filter(status__in=_OPEN_SMS_STATUSES)
+    # Prefer the conversation on the Twilio number they texted (adult vs minor line).
+    conversation = _latest_for_line(open_rows, line, same_line_only=True)
     if conversation is None:
+        latest_on_line = _latest_for_line(all_rows, line, same_line_only=True)
+        if latest_on_line is None:
+            conversation = _latest_for_line(open_rows, line)
+    just_started = False
+    if conversation is None:
+        # A finished conversation (live agent / completed) must not restart the
+        # adult flow — reply with the office number instead.
+        closed = latest_on_line or _latest_for_line(all_rows, line)
+        if closed is not None:
+            return _reply_after_close(closed, phone, text, message_sid)
+        just_started = True
         started = start_sms_conversation(
             phone_number=phone,
             patient_name="",
@@ -1747,7 +1969,8 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
         if conversation is None:
             return ""
 
-    if message_sid and conversation.last_inbound_sid == message_sid:
+    # Claim the MessageSid before any work so a duplicate delivery is skipped.
+    if not _claim_inbound_sid(conversation, message_sid):
         return ""
 
     # First (or any) patient reply while still "sent" → "replied".
@@ -1769,9 +1992,6 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
             variables["provider_name"] = conversation.provider_name
         scripted = _scripted_reply(conversation, text, variables)
     if scripted is not None:
-        if message_sid:
-            conversation.last_inbound_sid = message_sid
-            conversation.save(update_fields=["last_inbound_sid"])
         if scripted:
             _sid, sms_err = send_twilio_sms(phone, scripted, conversation.from_number)
             if sms_err:
@@ -1815,21 +2035,17 @@ def reply_to_inbound_sms(*, from_number: str, body: str, message_sid: str = "") 
         else:
             logger.warning("Retell chat completion failed chat=%s err=%s", conversation.chat_id, err)
 
-    if not reply:
-        if _wants_schedule(text) or _wants_live_agent(text):
-            reply = (
-                "I'll connect you with a team member now — you'll receive a call shortly."
-            )
-        else:
-            reply = (
-                "Thanks for your message — I can help with that. "
-                "Would you like me to connect you with a team member? Reply YES or NO."
-            )
+    from apps.ai_sms.agent_dial import _is_transfer_reply
+
+    if reply and (conversation.step or "identity") == "identity" and _is_transfer_reply(reply):
+        # Not verified yet — re-ask who we're texting instead of dialing an agent.
+        reply = _fallback_reply(conversation, text)
+
+    if not reply and not just_started:
+        # (A chat this message just started already got the greeting.)
+        reply = _fallback_reply(conversation, text)
 
     _apply_conversational_side_effects(conversation, text, reply)
-    if message_sid:
-        conversation.last_inbound_sid = message_sid
-        conversation.save(update_fields=["last_inbound_sid"])
     if not reply:
         return ""
     _sid, sms_err = send_twilio_sms(phone, reply, conversation.from_number)

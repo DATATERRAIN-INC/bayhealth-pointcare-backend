@@ -1,5 +1,10 @@
+import base64
+import hashlib
+import json
 import re
+import time
 
+from django.core.cache import cache
 from rest_framework import authentication, exceptions
 
 from apps.users.cognito import CognitoError, get_user
@@ -13,6 +18,51 @@ _AUTH_FAIL_CODES = {
     "UserNotFoundException",
     "ExpiredTokenException",
 }
+
+
+# Remember a token Cognito already accepted, so every API call does not pay a
+# ~0.3-1s round trip to AWS. Never longer than the token's own expiry.
+_VERIFIED_TOKEN_SECONDS = 60
+
+
+def _verified_token_key(token):
+    return "cognito:verified:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _token_seconds_left(token):
+    """Seconds until the JWT `exp` claim (no signature check — only bounds the cache)."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = int(json.loads(base64.urlsafe_b64decode(payload)).get("exp") or 0)
+    except Exception:
+        return 0
+    return exp - int(time.time())
+
+
+def forget_verified_token(token):
+    """Drop a token from the cache (logout)."""
+    if token:
+        cache.delete(_verified_token_key(token))
+
+
+def _cognito_user_for(token):
+    key = _verified_token_key(token)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    cognito_user = get_user(access_token=token)
+    ttl = min(_VERIFIED_TOKEN_SECONDS, _token_seconds_left(token))
+    if ttl > 0:
+        cache.set(
+            key,
+            {
+                "Username": cognito_user.get("Username"),
+                "UserAttributes": cognito_user.get("UserAttributes") or [],
+            },
+            ttl,
+        )
+    return cognito_user
 
 
 def _auth_failed_message(exc=None):
@@ -49,7 +99,7 @@ class CognitoBearerAuthentication(authentication.BaseAuthentication):
             raise exceptions.AuthenticationFailed("Invalid or expired access token.")
 
         try:
-            cognito_user = get_user(access_token=token)
+            cognito_user = _cognito_user_for(token)
         except CognitoError as exc:
             raise exceptions.AuthenticationFailed(_auth_failed_message(exc)) from exc
 

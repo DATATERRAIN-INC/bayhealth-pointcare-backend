@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -12,6 +12,7 @@ from apps.ai_caller.models import (
     Patient,
     ScheduledOutreach,
 )
+from apps.ai_caller.transcript_merge import is_log_url
 from common.s3 import build_s3_url
 
 
@@ -122,19 +123,18 @@ class PatientSerializer(serializers.ModelSerializer):
             return value
         latest = (
             Call.objects.filter(patient=obj)
-            .order_by("-started_at", "-id")
+            .order_by(F("started_at").desc(nulls_last=True), "-id")
             .values_list("id", flat=True)
             .first()
         )
         return latest
 
     def get_retell_call_id(self, obj):
-        value = getattr(obj, "_latest_retell_call_id", None)
-        if value is not None:
-            return value or None
+        if hasattr(obj, "_latest_retell_call_id"):
+            return obj._latest_retell_call_id or None
         latest = (
             Call.objects.filter(patient=obj)
-            .order_by("-started_at", "-id")
+            .order_by(F("started_at").desc(nulls_last=True), "-id")
             .values_list("retell_call_id", flat=True)
             .first()
         )
@@ -150,7 +150,7 @@ class PatientSerializer(serializers.ModelSerializer):
             )
         latest = (
             Call.objects.filter(patient=obj)
-            .order_by("-started_at", "-id")
+            .order_by(F("started_at").desc(nulls_last=True), "-id")
             .only("recording_url", "live_agent_recording_url")
             .first()
         )
@@ -162,7 +162,7 @@ class PatientSerializer(serializers.ModelSerializer):
         if not _recording_enabled_for(self):
             return None
         patient_url, _ = self._latest_call_recording_fields(obj)
-        return patient_url or None
+        return None if is_log_url(patient_url) else (patient_url or None)
 
     def get_live_agent_recording_url(self, obj):
         if not _recording_enabled_for(self):
@@ -177,7 +177,7 @@ class PatientSerializer(serializers.ModelSerializer):
         if started_at is None and not hasattr(obj, "_latest_call_id"):
             latest = (
                 Call.objects.filter(patient=obj)
-                .order_by("-started_at", "-id")
+                .order_by(F("started_at").desc(nulls_last=True), "-id")
                 .only("started_at", "ended_at", "status")
                 .first()
             )
@@ -201,7 +201,7 @@ class PatientSerializer(serializers.ModelSerializer):
         if calls is None:
             calls = (
                 Call.objects.filter(patient=obj)
-                .order_by("-started_at", "-id")
+                .order_by(F("started_at").desc(nulls_last=True), "-id")
                 .only("id", "started_at", "flow", "status", "retell_call_id")
             )
         attempts = []
@@ -234,28 +234,37 @@ class PatientSerializer(serializers.ModelSerializer):
         else:
             active_status = (
                 Call.objects.filter(patient=obj, status__in=Call.ACTIVE_STATUSES)
-                .order_by("-started_at", "-id")
+                .order_by(F("started_at").desc(nulls_last=True), "-id")
                 .values_list("status", flat=True)
                 .first()
             )
         if active_status:
             return active_status
-        if Call.objects.filter(patient=obj, status=Call.Status.WAITING).exists():
+        if hasattr(obj, "_has_waiting_call"):
+            has_waiting = obj._has_waiting_call
+        else:
+            has_waiting = Call.objects.filter(
+                patient=obj, status=Call.Status.WAITING
+            ).exists()
+        if has_waiting:
             return Call.Status.WAITING
 
-        latest_real = (
-            Call.objects.filter(patient=obj)
-            .exclude(
-                status__in=[
-                    Call.Status.QUEUED,
-                    Call.Status.SCHEDULED,
-                    Call.Status.PAUSED,
-                ]
+        if hasattr(obj, "_latest_real_status"):
+            latest_real = obj._latest_real_status
+        else:
+            latest_real = (
+                Call.objects.filter(patient=obj)
+                .exclude(
+                    status__in=[
+                        Call.Status.QUEUED,
+                        Call.Status.SCHEDULED,
+                        Call.Status.PAUSED,
+                    ]
+                )
+                .order_by("-ended_at", "-started_at", "-id")
+                .values_list("status", flat=True)
+                .first()
             )
-            .order_by("-ended_at", "-started_at", "-id")
-            .values_list("status", flat=True)
-            .first()
-        )
         if latest_real:
             return latest_real
 
@@ -350,6 +359,7 @@ class CallSerializer(serializers.ModelSerializer):
     scheduled_at = serializers.SerializerMethodField()
     schedule_kind = serializers.SerializerMethodField()
     schedule_raw_time = serializers.SerializerMethodField()
+    session_outcome = serializers.SerializerMethodField()
     timezone = serializers.SerializerMethodField()
     started_at = serializers.SerializerMethodField()
     ended_at = serializers.SerializerMethodField()
@@ -378,6 +388,11 @@ class CallSerializer(serializers.ModelSerializer):
             "agent_id",
             "transfer_number",
             "decline_reason",
+            "disconnection_reason",
+            "retell_call_status",
+            "user_sentiment",
+            "call_successful",
+            "session_outcome",
             "timezone",
             "started_at",
             "ended_at",
@@ -393,6 +408,12 @@ class CallSerializer(serializers.ModelSerializer):
             "updated_at",
         )
         read_only_fields = fields
+
+    def get_session_outcome(self, obj):
+        """Retell's label: Successful / Unsuccessful, None until analysed."""
+        if obj.call_successful is None:
+            return None
+        return "Successful" if obj.call_successful else "Unsuccessful"
 
     def _caller_timezone_name(self):
         cached = getattr(self, "_cached_timezone_name", None)
@@ -471,7 +492,8 @@ class CallSerializer(serializers.ModelSerializer):
     def get_recording_url(self, obj):
         if not _recording_enabled_for(self):
             return None
-        return (obj.recording_url or "").strip() or None
+        url = (obj.recording_url or "").strip()
+        return None if is_log_url(url) else (url or None)
 
     def get_live_agent_recording_url(self, obj):
         if not _recording_enabled_for(self):

@@ -187,6 +187,31 @@ class Call(models.Model):
     agent_id = models.CharField(max_length=120, blank=True, default="")
     transfer_number = models.CharField(max_length=32, blank=True, default="")
     decline_reason = models.TextField(blank=True, default="")
+    # Retell call details, as shown in Retell's Call History.
+    disconnection_reason = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Retell End Reason, e.g. user_hangup, voicemail_reached, dial_no_answer.",
+    )
+    retell_call_status = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="Retell Session Status: registered, ongoing, ended, not_connected, error.",
+    )
+    user_sentiment = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        help_text="Retell post-call User Sentiment: Positive, Neutral, Negative, Unknown.",
+    )
+    call_successful = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text="Retell Session Outcome: True = Successful, False = Unsuccessful, "
+        "empty until Retell finishes post-call analysis.",
+    )
     transcript = models.JSONField(default=list, blank=True)
     retell_transcript = models.JSONField(default=list, blank=True)
     live_agent_transcript = models.JSONField(default=list, blank=True)
