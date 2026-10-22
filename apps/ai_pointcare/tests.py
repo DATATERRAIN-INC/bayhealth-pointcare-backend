@@ -121,3 +121,67 @@ class ContactVerificationRemovedTests(TestCase):
         self.assertIn("NOT an answer to the language question", lang["state_prompt"])
         self.assertIn("NEVER call transition_to_purpose in the same turn", lang["state_prompt"])
         self.assertEqual(lang["edges"][0]["parameters"]["required"], ["preferred_language"])
+
+    def test_step_names_never_spoken(self):
+        from apps.ai_pointcare.flow_definition import build_llm_payload, build_states, build_tools
+
+        payload = build_llm_payload(function_url="https://example.test/fn/", patient_name="Sam")
+        self.assertIn("NEVER say a function or step name", payload["general_prompt"])
+        for state in build_states("https://example.test/fn/"):
+            self.assertIn("silent function calls", state["state_prompt"])
+        # Anything spoken while a tool runs is fixed text, never written by the model.
+        for tool in build_tools("https://example.test/fn/").values():
+            if tool.get("speak_during_execution"):
+                self.assertEqual(tool.get("execution_message_type"), "static_text", tool["name"])
+
+
+class RenewalVideoResendTests(TestCase):
+    """Patient says the text never came: one real resend, then no more texts."""
+
+    def test_one_resend_then_stop(self):
+        from apps.ai_pointcare.flow_definition import build_llm_payload
+
+        session = RenewalCallSession.objects.create(
+            retell_call_id="call_video", patient_name="Jane Doe", phone_number="+14085551234"
+        )
+        call = {"call_id": "call_video"}
+        sent = {"ok": True, "sid": "SM1", "from_number": "+1800", "video_url": "u", "body": "b"}
+        with patch("apps.ai_pointcare.flow_service.send_renewal_video_sms", return_value=sent) as sms:
+            first = handle_retell_function("send_renewal_video_sms", {}, call)
+            second = handle_retell_function("send_renewal_video_sms", {}, call)
+            third = handle_retell_function("send_renewal_video_sms", {}, call)
+        self.assertEqual(sms.call_count, 2)
+        self.assertTrue(first["video_sent"])
+        self.assertIn("silently call transition_to_household_income", first["message"])
+        self.assertTrue(second["video_sent"])
+        self.assertIn("continue the question you were on", second["message"])
+        self.assertFalse(third["video_sent"])
+        session.refresh_from_db()
+        self.assertEqual(session.state_payload["renewal_video_sms_count"], 2)
+        # The tool exists in every step, so a resend later in the call is possible.
+        payload = build_llm_payload(function_url="https://example.test/fn/", patient_name="Jane")
+        self.assertIn("send_renewal_video_sms", [t["name"] for t in payload["general_tools"]])
+        for state in payload["states"]:
+            self.assertNotIn("send_renewal_video_sms", [t["name"] for t in state.get("tools") or []])
+
+    def test_help_step_asks_before_transfer(self):
+        from apps.ai_pointcare.flow_definition import NODE_ASSISTANCE, build_states
+
+        step = next(s for s in build_states("https://example.test/fn/") if s["name"] == NODE_ASSISTANCE)
+        self.assertIn('Do NOT say "I\'ll connect you"', step["state_prompt"])
+        self.assertIn("NOT an answer", step["state_prompt"])
+
+    def test_no_command_style_text_for_the_ai_to_copy(self):
+        """The AI copied 'transition_to_X with a=b' from its instructions into speech."""
+        import re
+
+        from apps.ai_pointcare.flow_definition import build_llm_payload
+
+        payload = build_llm_payload(function_url="https://example.test/fn/", patient_name="Jane")
+        texts = [payload["general_prompt"]]
+        for state in payload["states"]:
+            texts.append(state["state_prompt"])
+            texts.extend(edge["description"] for edge in state.get("edges") or [])
+        for text in texts:
+            self.assertIsNone(re.search(r"\b[a-z_]+=", text), text[:120])
+            self.assertIsNone(re.search(r"transition_to_\w+ with ", text), text[:120])
