@@ -96,3 +96,28 @@ class RetellFunctionTests(TestCase):
         result = handle_retell_function("not_a_tool", {}, {})
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "Unknown call_id.")
+
+
+class ContactVerificationRemovedTests(TestCase):
+    """The renewal call goes purpose -> renewal status; no address/phone/email check."""
+
+    def test_flow_skips_contact_information(self):
+        from apps.ai_pointcare.flow_definition import NODE_PURPOSE, NODE_RENEWAL, build_states
+
+        states = build_states("https://example.test/fn/")
+        names = {s["name"] for s in states}
+        self.assertNotIn("contact_information", names)
+        for state in states:
+            for edge in state.get("edges") or []:
+                self.assertIn(edge["destination_state_name"], names)
+        purpose = next(s for s in states if s["name"] == NODE_PURPOSE)
+        self.assertIn(NODE_RENEWAL, [e["destination_state_name"] for e in purpose["edges"]])
+        self.assertNotIn("transition_to_contact_information", purpose["state_prompt"])
+
+    def test_language_step_waits_for_patient_answer(self):
+        from apps.ai_pointcare.flow_definition import NODE_LANGUAGE, build_states
+
+        lang = next(s for s in build_states("https://example.test/fn/") if s["name"] == NODE_LANGUAGE)
+        self.assertIn("NOT an answer to the language question", lang["state_prompt"])
+        self.assertIn("NEVER call transition_to_purpose in the same turn", lang["state_prompt"])
+        self.assertEqual(lang["edges"][0]["parameters"]["required"], ["preferred_language"])
