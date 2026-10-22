@@ -553,8 +553,8 @@ def due_scheduled_outreaches(settings_obj, *, limit: int):
         status=Call.Status.COMPLETED,
     ).values_list("patient_id", flat=True)
     in_progress_patient_ids = Call.objects.filter(
+        Call.line_busy_q(),
         user=settings_obj.user,
-        status__in=Call.ACTIVE_STATUSES,
     ).values_list("patient_id", flat=True)
 
     qs = (

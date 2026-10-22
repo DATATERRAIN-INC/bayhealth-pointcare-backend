@@ -468,6 +468,7 @@ def _persist_agent_dial_recording(
 ) -> None:
     """Download Dial dual-channel audio, STT each leg, store URLs + split transcript."""
     from apps.ai_caller.transcript_merge import (
+        clean_human_items,
         interleave_speaker_segments,
         transcribe_recording_detailed,
     )
@@ -521,6 +522,7 @@ def _persist_agent_dial_recording(
         patient_text=str(patient_detailed.get("text") or ""),
         provider_text=str(agent_detailed.get("text") or ""),
     )
+    items = clean_human_items(items)
     for row in items:
         if isinstance(row, dict) and not row.get("name"):
             sp = str(row.get("speaker") or "")

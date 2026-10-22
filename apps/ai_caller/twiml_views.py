@@ -9,6 +9,9 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from apps.ai_caller.twilio_bridge import (
+    failover_to_next_live_agent,
+    handle_long_wait_choice,
+    long_wait_offer_twiml,
     _sync_call_twilio_ids,
     answer_twiml,
     ask_callback_twiml,
@@ -213,8 +216,8 @@ def warm_transfer_queue_tone_audio(request):
 @csrf_exempt
 @require_POST
 def warm_transfer_wait(request):
-    """Ringback for the patient while waiting for the live agent to join."""
-    return _xml(conference_wait_twiml())
+    """Ringback (and the repeating hold message) while the patient waits."""
+    return _xml(conference_wait_twiml(_session(request)))
 
 
 @csrf_exempt
@@ -287,6 +290,32 @@ def warm_transfer_callback_gather(request):
         "</Say>"
         "<Hangup/>"
         "</Response>"
+    )
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_long_wait_offer(request):
+    """Patient on hold too long: offer a callback (press 1) or keep holding (press 2)."""
+    session = _session(request)
+    if not session:
+        return _xml('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>')
+    return _xml(long_wait_offer_twiml(session))
+
+
+@csrf_exempt
+@require_POST
+def warm_transfer_long_wait_choice(request):
+    session = _session(request)
+    if not session:
+        return _xml('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>')
+    return _xml(
+        handle_long_wait_choice(
+            session,
+            speech=(request.POST.get("SpeechResult") or "").strip(),
+            digits=(request.POST.get("Digits") or "").strip(),
+            choice=(request.GET.get("choice") or "").strip(),
+        )
     )
 
 
@@ -366,6 +395,17 @@ def warm_transfer_status(request):
         maybe_failover_on_agent_status(
             session, call_status=call_status, call_sid=call_sid
         )
+        # Agent answered but hung up before joining (e.g. during the briefing):
+        # try the next agent instead of leaving the patient on ringback.
+        if (
+            call_status.strip().lower() == "completed"
+            and call_sid
+            and call_sid == dial_sid
+            and not session.get("spoke_now")
+            and not session.get("agent_released")
+            and not session.get("conference_ended")
+        ):
+            failover_to_next_live_agent(session, reason="agent_left_before_join")
         # Patient host hangup ends the conference; extend full duration
         # and let the next waiting patient through.
         if call_status.strip().lower() == "completed":

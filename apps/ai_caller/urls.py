@@ -126,6 +126,16 @@ urlpatterns = [
         name="twilio-warm-transfer-ask-callback",
     ),
     path(
+        "twilio/warm-transfer/long-wait-offer/",
+        twiml_views.warm_transfer_long_wait_offer,
+        name="twilio-warm-transfer-long-wait-offer",
+    ),
+    path(
+        "twilio/warm-transfer/long-wait-choice/",
+        twiml_views.warm_transfer_long_wait_choice,
+        name="twilio-warm-transfer-long-wait-choice",
+    ),
+    path(
         "twilio/warm-transfer/callback-gather/",
         twiml_views.warm_transfer_callback_gather,
         name="twilio-warm-transfer-callback-gather",

@@ -19,6 +19,14 @@ def sync_in_progress_calls():
     return {"ok": True, "synced": synced}
 
 
+@shared_task(name="ai_caller.offer_callback_after_long_wait")
+def offer_callback_after_long_wait(session_id, wait_token):
+    """Patient still on hold after the max wait → offer a callback."""
+    from apps.ai_caller.twilio_bridge import offer_callback_to_long_waiter
+
+    return {"offered": offer_callback_to_long_waiter(session_id, wait_token)}
+
+
 @shared_task(name="ai_caller.sync_in_progress_calls_for_user")
 def sync_in_progress_calls_for_user(user_id, limit=10):
     """Non-blocking per-user sync triggered from list/summary (debounced)."""
