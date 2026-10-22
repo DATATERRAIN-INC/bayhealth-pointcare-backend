@@ -170,7 +170,15 @@ class CallViewSet(viewsets.ModelViewSet):
             call = self.get_queryset().first()
             if not call:
                 return error_response("Call not found.", 404)
-            return Response({"transcript": transcript_for_api(call.transcript or [])})
+            # Recording links too, so the Patients-page transcript dialog can play audio.
+            recordings = CallSerializer(call, context=self.get_serializer_context()).data
+            return Response(
+                {
+                    "transcript": transcript_for_api(call.transcript or []),
+                    "recording_url": recordings.get("recording_url"),
+                    "live_agent_recording_url": recordings.get("live_agent_recording_url"),
+                }
+            )
         return super().list(request, *args, **kwargs)
 
     @staticmethod

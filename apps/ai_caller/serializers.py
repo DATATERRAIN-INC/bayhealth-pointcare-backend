@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -123,7 +123,7 @@ class PatientSerializer(serializers.ModelSerializer):
             return value
         latest = (
             Call.objects.filter(patient=obj)
-            .order_by("-started_at", "-id")
+            .order_by(F("started_at").desc(nulls_last=True), "-id")
             .values_list("id", flat=True)
             .first()
         )
@@ -134,7 +134,7 @@ class PatientSerializer(serializers.ModelSerializer):
             return obj._latest_retell_call_id or None
         latest = (
             Call.objects.filter(patient=obj)
-            .order_by("-started_at", "-id")
+            .order_by(F("started_at").desc(nulls_last=True), "-id")
             .values_list("retell_call_id", flat=True)
             .first()
         )
@@ -150,7 +150,7 @@ class PatientSerializer(serializers.ModelSerializer):
             )
         latest = (
             Call.objects.filter(patient=obj)
-            .order_by("-started_at", "-id")
+            .order_by(F("started_at").desc(nulls_last=True), "-id")
             .only("recording_url", "live_agent_recording_url")
             .first()
         )
@@ -177,7 +177,7 @@ class PatientSerializer(serializers.ModelSerializer):
         if started_at is None and not hasattr(obj, "_latest_call_id"):
             latest = (
                 Call.objects.filter(patient=obj)
-                .order_by("-started_at", "-id")
+                .order_by(F("started_at").desc(nulls_last=True), "-id")
                 .only("started_at", "ended_at", "status")
                 .first()
             )
@@ -201,7 +201,7 @@ class PatientSerializer(serializers.ModelSerializer):
         if calls is None:
             calls = (
                 Call.objects.filter(patient=obj)
-                .order_by("-started_at", "-id")
+                .order_by(F("started_at").desc(nulls_last=True), "-id")
                 .only("id", "started_at", "flow", "status", "retell_call_id")
             )
         attempts = []
@@ -234,7 +234,7 @@ class PatientSerializer(serializers.ModelSerializer):
         else:
             active_status = (
                 Call.objects.filter(patient=obj, status__in=Call.ACTIVE_STATUSES)
-                .order_by("-started_at", "-id")
+                .order_by(F("started_at").desc(nulls_last=True), "-id")
                 .values_list("status", flat=True)
                 .first()
             )

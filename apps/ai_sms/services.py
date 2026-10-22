@@ -27,7 +27,7 @@ from apps.ai_caller.retell import (
     _retell_request,
     normalize_phone,
 )
-from apps.ai_caller.services import _combine_phone, _resolve_live_agent_numbers
+from apps.ai_caller.services import _combine_phone, _is_minor, _resolve_live_agent_numbers
 from apps.ai_sms.models import SmsConversation
 from apps.ai_sms.prompt import (
     assist_ask,
@@ -268,12 +268,20 @@ def _yn(text: str) -> str:
     lowered = (text or "").strip().lower()
     tokens = [re.sub(r"[^a-z]", "", t) for t in lowered.split() if t]
     first = tokens[0] if tokens else ""
-    yes_words = {"y", "yes", "yeah", "yep", "sure", "ok", "okay", "alreadydidit"}
+    yes_words = {
+        "y", "yes", "yeah", "yep", "sure", "ok", "okay", "alreadydidit",
+        "yup", "yea", "ya", "yah", "yess", "correct",
+    }
+    # Only when they are the whole reply ("absolutely not" must stay a no).
+    yes_whole = {
+        "absolutely", "ofcourse", "thatsme", "itsme", "thisisme", "speaking",
+        "thatsright", "right", "yesplease", "definitely",
+    }
     no_words = {
         "n", "no", "nope", "nah", "notyet", "maybe", "maybelater", "later",
         "notnow", "notrightnow", "idontknow", "idonotknow",
     }
-    if word in yes_words or first in yes_words:
+    if word in yes_words or first in yes_words or word in yes_whole:
         return "yes"
     if word in no_words or first in no_words:
         return "no"
@@ -291,6 +299,7 @@ _NEGATION_WORDS = frozenset(
     {
         "no", "not", "dont", "don't", "never", "stop", "already", "didnt", "didn't",
         "wont", "won't", "doesnt", "doesn't", "cant", "can't", "cannot", "without",
+        "havent", "haven't", "hasnt", "hasn't",
     }
 )
 _NEGATION_WINDOW = 4
@@ -312,9 +321,10 @@ def _requests_phrase(text: str, phrases: Tuple[str, ...]) -> bool:
     return False
 
 
+# A bare "appointment" is not a request ("I have an appointment next week").
 _SCHEDULE_PHRASES = (
     "schedule",
-    "appointment",
+    "get an appointment",
     "booking",
     "book an",
     "book a",
@@ -342,7 +352,9 @@ _LIVE_AGENT_PHRASES = (
 
 
 def _wants_schedule(text: str) -> bool:
-    return _requests_phrase(text, _SCHEDULE_PHRASES)
+    # "It's scheduled for Nov 15" describes an existing appointment, not a request.
+    cleaned = re.sub(r"\b(re)?scheduled\b", " ", (text or "").lower())
+    return _requests_phrase(cleaned, _SCHEDULE_PHRASES)
 
 
 def _wants_live_agent(text: str) -> bool:
@@ -1543,6 +1555,11 @@ def start_sms_conversation_for_patient(
     patient, err = _patient_for_sms(patient_id, user=user)
     if err:
         return err
+    # Under 18: text the parent/guardian from the minor line, never the child.
+    if _is_minor(patient.dob):
+        return start_minor_sms_conversation_for_patient(
+            patient_id, user=user, webhook_url=webhook_url
+        )
 
     dial_number = _combine_phone(patient.country_code, patient.phone_number)
     if not dial_number:
@@ -2017,6 +2034,12 @@ def reply_to_inbound_sms(
             )
         else:
             logger.warning("Retell chat completion failed chat=%s err=%s", conversation.chat_id, err)
+
+    from apps.ai_sms.agent_dial import _is_transfer_reply
+
+    if reply and (conversation.step or "identity") == "identity" and _is_transfer_reply(reply):
+        # Not verified yet — re-ask who we're texting instead of dialing an agent.
+        reply = _fallback_reply(conversation, text)
 
     if not reply and not just_started:
         # (A chat this message just started already got the greeting.)

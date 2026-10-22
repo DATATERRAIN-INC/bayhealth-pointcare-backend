@@ -247,6 +247,22 @@ def _party_numbers(*values: str) -> list:
     return found
 
 
+# A transfer happens during the call that created its session. Older unclaimed
+# sessions (calls that never transferred) must not grab a new inbound transfer.
+_INBOUND_SESSION_MAX_AGE_SECONDS = 60 * 60
+
+
+def _session_started_at(session: Dict[str, Any]) -> float:
+    """Epoch seconds when the session was created (updated_at for older rows)."""
+    created = session.get("created_at")
+    if isinstance(created, (int, float)):
+        return float(created)
+    try:
+        return datetime.fromisoformat(str(session.get("updated_at") or "")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def resolve_inbound_session(
     *,
     call_sid: str = "",
@@ -277,9 +293,14 @@ def resolve_inbound_session(
             for session in sessions:
                 if str(session.get("call_sid") or "") == call_sid:
                     return session
+        # Only sessions from the last hour, so a new transfer never binds to an
+        # earlier call's leftover session (e.g. a rehearsal call to the same phone).
+        cutoff = time.time() - _INBOUND_SESSION_MAX_AGE_SECONDS
+        sessions = [s for s in sessions if _session_started_at(s) >= cutoff]
         parties = _party_numbers(from_number, to_number, caller, called)
         for party in parties:
-            for session in sessions:
+            # Same phone on two recent sessions: the newest call is the one transferring.
+            for session in sorted(sessions, key=_session_started_at, reverse=True):
                 if session.get("conference_ended") or session.get("agent_released"):
                     continue
                 bound = str(session.get("call_sid") or "")
@@ -1166,6 +1187,14 @@ def start_coordinator_leg(session: Dict[str, Any]) -> None:
     destination = str(session.get("transfer_number") or "").strip()
     from_number = _from_number()
     if client is None or not destination or not from_number:
+        logger.error(
+            "Cannot dial live agent session=%s client=%s destination=%s from=%s",
+            session_id,
+            client is not None,
+            bool(destination),
+            bool(from_number),
+        )
+        failover_to_next_live_agent(session, reason="dial_not_configured")
         return
     session["b_dialed"] = True
     save_session(session)
@@ -1228,7 +1257,11 @@ def failover_to_next_live_agent(session: Dict[str, Any], *, reason: str = "") ->
         if str(n).strip()
     ]
     if len(numbers) < 2:
-        return False
+        # No other agent to try (e.g. the only agent's dial could not be placed):
+        # ask the patient for a callback time instead of leaving them on hold.
+        session["status"] = "agent_unreachable"
+        save_session(session)
+        return offer_agent_unreachable_callback(session)
 
     try:
         idx = int(session.get("transfer_number_index") or 0)
@@ -2588,6 +2621,7 @@ def prepare_retell_bridge(
 
     session_data: Dict[str, Any] = {
         "session_id": session_id,
+        "created_at": time.time(),
         "name": name,
         "service_name": service_name,
         "phone_number": normalize_phone(phone_number),

@@ -9,6 +9,13 @@ from apps.ai_caller.models import Call, Patient
 
 S = Call.Status
 
+def _clear_caches():
+    from django.core.cache import caches
+
+    for alias in ("default", "warm_transfer", "warm_transfer_file"):
+        caches[alias].clear()
+
+
 LOCAL_CACHES = {
     "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
     "warm_transfer": {
@@ -88,6 +95,7 @@ class MapRetellStatusTests(TestCase):
 @override_settings(CACHES=LOCAL_CACHES)
 class UpdateCallFromRetellTests(TestCase):
     def setUp(self):
+        _clear_caches()
         patient = Patient.objects.create(
             first_name="Ana", address="1 Main St", phone_number="+14155550123"
         )
@@ -438,3 +446,149 @@ class ReleaseAgentSlotTests(TestCase):
             twilio_bridge.release_agent_slot(session)
         set_status.assert_called_once()
         self.assertEqual(set_status.call_args.args[1], "completed")
+
+
+@override_settings(CACHES=LOCAL_CACHES)
+class DemoReviewTransferTests(TestCase):
+    """B3, B5: transfer session matching and the one-agent failure path."""
+
+    def setUp(self):
+        _clear_caches()
+
+    def _session(self, sid, *, phone="+14155550123", age_seconds=0, **extra):
+        import time as _time
+
+        return twilio_bridge.save_session(
+            {
+                "session_id": sid,
+                "retell_call_id": f"call_{sid}",
+                "phone_number": phone,
+                "created_at": _time.time() - age_seconds,
+                **extra,
+            }
+        )
+
+    def test_new_transfer_binds_to_newest_call_for_same_phone(self):
+        self._session("old", age_seconds=20 * 60)  # rehearsal call 20 min ago
+        self._session("new")
+        chosen = twilio_bridge.resolve_inbound_session(call_sid="CA1", from_number="+14155550123")
+        self.assertEqual(chosen["session_id"], "new")
+
+    def test_sessions_older_than_an_hour_are_ignored(self):
+        self._session("yesterday", age_seconds=24 * 3600)
+        self.assertEqual(twilio_bridge.resolve_inbound_session(call_sid="CA2"), {})
+
+    def test_single_agent_dial_failure_offers_callback(self):
+        session = self._session("solo", transfer_numbers=["+14155550001"], transfer_number="+14155550001")
+        with patch.object(twilio_bridge, "offer_agent_unreachable_callback", return_value=True) as offer:
+            self.assertTrue(twilio_bridge.failover_to_next_live_agent(session, reason="dial_create_failed"))
+        offer.assert_called_once()
+
+    def test_unconfigured_dial_does_not_leave_patient_ringing(self):
+        session = self._session("noclient", transfer_numbers=["+14155550001"], transfer_number="+14155550001")
+        with patch.object(twilio_bridge, "_twilio_client", return_value=None), patch.object(
+            twilio_bridge, "offer_agent_unreachable_callback", return_value=True
+        ) as offer:
+            twilio_bridge.start_coordinator_leg(session)
+        offer.assert_called_once()
+
+
+@override_settings(CACHES=LOCAL_CACHES)
+class DemoReviewCallSyncTests(TestCase):
+    """B4, B8: callback calls keep syncing; the callback check runs once."""
+
+    def setUp(self):
+        _clear_caches()
+        patient = Patient.objects.create(first_name="Ana", address="x", phone_number="+14155550123")
+        self.call = Call.objects.create(
+            patient=patient, retell_call_id="call_cb", flow=Call.Flow.OUTBOUND, status=S.ONGOING
+        )
+        for p in (
+            patch("apps.ai_caller.signals.publish_call_change"),
+            patch.object(services, "cancel_scheduled_for_patient"),
+            patch.object(twilio_bridge, "transfer_call_should_stay_open", return_value=False),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_callback_requested_mid_call_keeps_syncing_until_ended(self):
+        from django.utils import timezone
+
+        Call.objects.filter(pk=self.call.pk).update(
+            status=S.CALLBACK, retell_call_status="ongoing", transcript=[{"text": "hi"}],
+            started_at=timezone.now(),
+        )
+        ended = _retell("call_ended", reason="user_hangup", transcript=SPOKEN)["call"]
+        ended["call_id"] = "call_cb"
+        ended["recording_url"] = "https://cdn.example/cb/recording.wav"
+        with patch.object(services, "get_retell_call", return_value={"ok": True, "data": ended}) as get_call:
+            services.sync_in_progress_calls_from_retell()
+        get_call.assert_called_once()
+        self.call.refresh_from_db()
+        self.assertEqual(self.call.status, S.CALLBACK)
+        self.assertEqual(self.call.retell_call_status, "ended")
+        self.assertEqual(self.call.recording_url, "https://cdn.example/cb/recording.wav")
+        self.assertEqual(len(self.call.retell_transcript), 2)
+
+    def test_callback_check_runs_once_per_completed_call(self):
+        payload = _retell("call_ended", reason="user_hangup", transcript=SPOKEN)
+        payload["call"]["call_id"] = "call_cb"
+        with patch.object(services, "maybe_schedule_callback_from_transcript") as check:
+            services.update_call_from_retell_payload(payload)
+            services.update_call_from_retell_payload({**payload, "event": "call_analyzed"})
+            services.update_call_from_retell_payload(payload)
+        check.assert_called_once()
+
+
+@override_settings(CACHES=LOCAL_CACHES)
+class DemoReviewPatientApiTests(TestCase):
+    """B6, B7: patients list shows the real latest call; transcript returns recordings."""
+
+    def setUp(self):
+        from django.utils import timezone
+        from rest_framework.test import APIClient
+
+        from apps.ai_caller.models import CallerSettings
+        from apps.users.models import User
+
+        self.user = User.objects.create(cognito_id="sub-api", email="api@example.com")
+        CallerSettings.load(self.user)
+        self.patient = Patient.objects.create(
+            user=self.user, first_name="Ana", address="x", phone_number="4155550123", country_code="+1"
+        )
+        p = patch("apps.ai_caller.signals.publish_call_change")
+        p.start()
+        self.addCleanup(p.stop)
+        now = timezone.now()
+        self.done = Call.objects.create(
+            user=self.user, patient=self.patient, flow="outbound", status=S.NOT_ATTENDED,
+            retell_call_id="call_real", started_at=now, ended_at=now,
+            recording_url="https://cdn.example/real/recording.wav",
+        )
+        # Pending reminder row: no started_at (created after the real call).
+        Call.objects.create(
+            user=self.user, patient=self.patient, flow="outbound", status=S.SCHEDULED, started_at=None
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def _results(self, url):
+        body = self.client.get(url).json()
+        return body.get("results") or body.get("data", {}).get("results") or []
+
+    def test_patients_list_shows_real_latest_call_not_queue_row(self):
+        rows = self._results("/api/ai-call/patients/")
+        self.assertEqual(rows[0]["retell_call_id"], "call_real")
+        self.assertEqual(rows[0]["call_status"], S.NOT_ATTENDED)
+
+    def test_outcome_filter_includes_patient_with_pending_reminder(self):
+        rows = self._results("/api/ai-call/patients/?call_status=not_attended")
+        self.assertEqual([r["id"] for r in rows], [self.patient.id])
+
+    def test_transcript_response_includes_recordings(self):
+        with patch("apps.ai_caller.views.CallViewSet._enqueue_retell_sync"), patch(
+            "apps.ai_caller.serializers._recording_enabled_for", return_value=True
+        ):
+            body = self.client.get("/api/ai-call/calls/?retell_call_id=call_real").json()
+        self.assertEqual(body["recording_url"], "https://cdn.example/real/recording.wav")
+        self.assertIn("transcript", body)

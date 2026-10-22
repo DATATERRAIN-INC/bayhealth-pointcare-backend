@@ -342,3 +342,139 @@ class ConversationLifecycleTests(TestCase):
             sid, err = services.send_twilio_sms(PATIENT, "hello")
         self.assertEqual(sid, "")
         self.assertTrue(err)
+
+
+class DemoReviewSmsTests(TestCase):
+    """B1, B9: intent and yes/no reading."""
+
+    def test_describing_an_existing_appointment_is_not_a_request(self):
+        for text in (
+            "I have an appointment next week",
+            "Yes I had my appointment last month",
+            "No, I haven't scheduled it yet",
+            "It's scheduled for Nov 15th",
+            "My appointment is on 11/20",
+            "He had his appointment last month",
+        ):
+            self.assertFalse(services._wants_schedule(text), text)
+
+    def test_real_scheduling_requests_still_work(self):
+        for text in (
+            "I need to make an appointment",
+            "Can you schedule me?",
+            "I want to reschedule",
+            "Can I get an appointment",
+            "book an appointment please",
+        ):
+            self.assertTrue(services._wants_schedule(text), text)
+
+    def test_more_ways_to_say_yes(self):
+        for text in ("Yup", "Correct", "That's me", "Yea", "Of course", "Absolutely", "Right"):
+            self.assertEqual(services._yn(text), "yes", text)
+        self.assertNotEqual(services._yn("Absolutely not"), "yes")
+        self.assertEqual(services._yn("Right now I'm busy"), "")
+
+
+@override_settings(**TWILIO)
+class DemoReviewInboundTests(TestCase):
+    """B1, B11 through the real inbound handler."""
+
+    def setUp(self):
+        self.sent = []
+        patches = [
+            patch.object(services, "send_twilio_sms", side_effect=lambda to, body, frm="": (self.sent.append(body) or ("SM1", ""))),
+            patch.object(services, "_openai_conversational_reply", return_value=""),
+            patch.object(services, "_retell_request", return_value=(500, None, "down")),
+            patch.object(agent_dial, "dial_live_agent", return_value=True),
+        ]
+        self.mocks = [p.start() for p in patches]
+        for p in patches:
+            self.addCleanup(p.stop)
+
+    def _inbound(self, text):
+        return services.reply_to_inbound_sms(
+            from_number=PATIENT, body=text, to_number=ADULT_LINE
+        )
+
+    def test_appointment_date_in_a_sentence_ends_without_transfer(self):
+        convo = _conversation(step="appointment")
+        self._inbound("It's scheduled for Nov 15th")
+        convo.refresh_from_db()
+        self.assertEqual(convo.step, "ended")
+        agent_dial.dial_live_agent.assert_not_called()
+
+    def test_model_cannot_promise_a_call_before_identity(self):
+        convo = _conversation(step="identity")
+        self.mocks[1].return_value = (
+            "Of course. I'll connect you with a team member now — you'll receive a call shortly."
+        )
+        reply = self._inbound("Can I talk to someone?")
+        self.assertIn("Am I texting with", reply)
+        agent_dial.dial_live_agent.assert_not_called()
+        convo.refresh_from_db()
+        self.assertEqual(convo.step, "identity")
+
+
+@override_settings(**TWILIO)
+class DemoReviewStartTests(TestCase):
+    """B2, B10: who gets texted, and no second SMS while one is open."""
+
+    def setUp(self):
+        from datetime import date
+
+        from apps.ai_caller.models import CallerSettings, Patient
+        from apps.users.models import User
+
+        self.user = User.objects.create(cognito_id="sub-demo", email="demo@example.com")
+        settings_obj = CallerSettings.load(self.user)
+        settings_obj.text_sms_enabled = True
+        settings_obj.sms_trigger_after_calls = 1
+        settings_obj.save()
+        self.patient = Patient.objects.create(
+            user=self.user, first_name="Liam", address="x", phone_number="4155550123",
+            country_code="+1", dob=date(2016, 5, 1),
+        )
+
+    def test_send_sms_for_a_minor_starts_the_guardian_flow(self):
+        with patch.object(services, "start_minor_sms_conversation_for_patient", return_value={"ok": True}) as minor, \
+                patch.object(services, "start_sms_conversation") as adult:
+            services.start_sms_conversation_for_patient(self.patient.id, user=self.user)
+        minor.assert_called_once()
+        adult.assert_not_called()
+
+    def test_no_auto_sms_while_one_is_already_open(self):
+        from apps.ai_caller.models import Call
+        from apps.ai_caller.services import maybe_trigger_sms_after_missed_call
+
+        SmsConversation.objects.create(
+            chat_id="open-1", patient=self.patient, to_number=PATIENT,
+            from_number=ADULT_LINE, status=SmsConversation.Status.REPLIED,
+        )
+        call = Call.objects.create(
+            user=self.user, patient=self.patient, flow="outbound",
+            status=Call.Status.NOT_ATTENDED, retell_call_id="call_missed",
+        )
+        with patch("apps.ai_sms.services.start_minor_sms_conversation_for_patient") as minor, \
+                patch("apps.ai_sms.services.start_sms_conversation_for_patient") as adult, \
+                patch("apps.ai_caller.signals.publish_call_change"):
+            self.assertIsNone(maybe_trigger_sms_after_missed_call(call))
+        minor.assert_not_called()
+        adult.assert_not_called()
+
+    def test_auto_sms_starts_when_none_is_open(self):
+        # Control for the test above: same setup, but the earlier SMS is finished.
+        from apps.ai_caller.models import Call
+        from apps.ai_caller.services import maybe_trigger_sms_after_missed_call
+
+        SmsConversation.objects.create(
+            chat_id="done-1", patient=self.patient, to_number=PATIENT,
+            from_number=ADULT_LINE, status=SmsConversation.Status.COMPLETED,
+        )
+        call = Call.objects.create(
+            user=self.user, patient=self.patient, flow="outbound",
+            status=Call.Status.NOT_ATTENDED, retell_call_id="call_missed_2",
+        )
+        with patch("apps.ai_sms.services.start_minor_sms_conversation_for_patient", return_value={"ok": True}) as minor, \
+                patch("apps.ai_caller.signals.publish_call_change"):
+            maybe_trigger_sms_after_missed_call(call)
+        minor.assert_called_once()

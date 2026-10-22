@@ -80,13 +80,6 @@ def _filter_patients_by_call_status(queryset, call_status):
     has_paused = _patient_has_call_status(Call.Status.PAUSED)
     has_scheduled = _patient_has_call_status(Call.Status.SCHEDULED)
     has_queued = _patient_has_call_status(Call.Status.QUEUED)
-    has_open_dial = _patient_has_call_status(
-        *Call.ACTIVE_STATUSES,
-        Call.Status.WAITING,
-        Call.Status.PAUSED,
-        Call.Status.SCHEDULED,
-        Call.Status.QUEUED,
-    )
 
     match = Q()
     for status in statuses:
@@ -109,11 +102,13 @@ def _filter_patients_by_call_status(queryset, call_status):
                 & ~has_scheduled
             )
         else:
-            # completed / not_attended / voicemail_reached / callback —
-            # latest status, no open dial row
+            # completed / not_attended / voicemail_reached / callback — same
+            # rule as the status chip: no live call, latest real outcome. A
+            # pending reminder/callback row does not hide the outcome.
             match |= (
-                Q(_latest_call_status=status)
-                & ~has_open_dial
+                Q(_latest_real_status=status)
+                & ~has_active
+                & ~has_waiting
             )
     return queryset.filter(match)
 
@@ -151,8 +146,10 @@ def get_patient_queryset(
     if upload_id.isdigit():
         queryset = queryset.filter(upload_id=int(upload_id))
 
+    # Queue/reminder rows have no started_at; Postgres puts NULLs first in DESC,
+    # so they must go last or they hide the patient's real latest call.
     latest_call = Call.objects.filter(patient_id=OuterRef("pk")).order_by(
-        "-started_at", "-id"
+        F("started_at").desc(nulls_last=True), "-id"
     )
     active_call = Call.objects.filter(
         patient_id=OuterRef("pk"), status__in=Call.ACTIVE_STATUSES
@@ -188,7 +185,9 @@ def get_patient_queryset(
     ).prefetch_related(
         Prefetch(
             "calls",
-            queryset=Call.objects.order_by("-started_at", "-id").only(
+            queryset=Call.objects.order_by(
+                F("started_at").desc(nulls_last=True), "-id"
+            ).only(
                 "id", "started_at", "flow", "status", "retell_call_id", "patient_id"
             ),
             to_attr="_try_calls",
@@ -1416,7 +1415,9 @@ def maybe_trigger_sms_after_missed_call(call):
         start_sms_conversation_for_patient,
     )
 
-    if SmsConversation.objects.filter(patient=patient, status="ongoing").exists():
+    if SmsConversation.objects.filter(
+        patient=patient, status__in=["sent", "replied", "ongoing"]
+    ).exists():
         dialer_logger.info(
             "SMS_AUTO_SKIP patient_id=%s reason=ongoing_sms streak=%s",
             patient.id,
@@ -1482,6 +1483,22 @@ _FINAL_CALL_STATUSES = frozenset(
         Call.Status.CANCEL,
     }
 )
+
+
+def _first_callback_check(call) -> bool:
+    """True once per call: the OpenAI callback check runs on the first completed update only."""
+    try:
+        from apps.ai_caller.twilio_bridge import _session_cache
+
+        return bool(
+            _session_cache().add(
+                f"ai_caller:callback_check:{call.retell_call_id or call.pk}",
+                1,
+                timeout=7 * 24 * 3600,
+            )
+        )
+    except Exception:
+        return True
 
 
 def _cancel_callbacks_from_call(call, *, reason=""):
@@ -1734,7 +1751,7 @@ def update_call_from_retell_payload(payload):
     # transcript — only once a patient actually finished a conversation. A
     # voicemail greeting ("I'll call you back") is not a callback request, and
     # live calls are checked when they end.
-    if call.status == Call.Status.COMPLETED:
+    if call.status == Call.Status.COMPLETED and _first_callback_check(call):
         maybe_schedule_callback_from_transcript(call)
         call.refresh_from_db(fields=["status"])
 
@@ -1812,6 +1829,13 @@ def sync_in_progress_calls_from_retell(*, user=None, limit=25):
                 & Q(started_at__gte=recent_cutoff)
             )
             | (awaiting_analysis & ~Q(status=Call.Status.CANCEL))
+            # Callback requested mid-call: the row is no longer "active" but the
+            # call is still running — keep syncing until Retell says it ended.
+            | (
+                Q(status=Call.Status.CALLBACK)
+                & ~Q(retell_call_status__in=["ended", "not_connected", "error"])
+                & Q(started_at__gte=recent_cutoff)
+            )
         )
         .annotate(
             _sync_priority=Case(
