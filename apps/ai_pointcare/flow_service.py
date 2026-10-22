@@ -10,6 +10,9 @@ from apps.ai_pointcare.renewal_video import send_renewal_video_sms
 
 logger = logging.getLogger(__name__)
 
+# First renewal-video text plus one resend when the patient says it did not arrive.
+_MAX_RENEWAL_VIDEO_SMS = 2
+
 
 def _as_bool(value) -> Optional[bool]:
     if value is None or value == "":
@@ -238,6 +241,22 @@ def handle_retell_function(name: str, args: Dict[str, Any], call: Dict[str, Any]
         }
 
     if fname == "send_renewal_video_sms":
+        payload = dict(session.state_payload or {})
+        sent_before = int(
+            payload.get("renewal_video_sms_count")
+            or (1 if payload.get("renewal_video_sms") else 0)
+        )
+        if sent_before >= _MAX_RENEWAL_VIDEO_SMS:
+            # First text + one resend already went out: no more texts on this call.
+            return {
+                "ok": True,
+                "saved": False,
+                "video_sent": False,
+                "message": (
+                    "The video was already texted twice. Say it can take a few minutes to "
+                    "arrive, then continue the question you were on. Do not send it again."
+                ),
+            }
         phone = (
             getattr(session, "phone_number", None)
             or str((call or {}).get("to_number") or "")
@@ -262,7 +281,7 @@ def handle_retell_function(name: str, args: Dict[str, Any], call: Dict[str, Any]
                 "error": result.get("error") or "Failed to send video SMS.",
             }
 
-        payload = dict(session.state_payload or {})
+        payload["renewal_video_sms_count"] = sent_before + 1
         payload["renewal_video_sms"] = {
             "sid": result.get("sid") or "",
             "from_number": result.get("from_number") or "",
@@ -270,6 +289,17 @@ def handle_retell_function(name: str, args: Dict[str, Any], call: Dict[str, Any]
             "body": result.get("body") or "",
         }
         session.state_payload = payload
+        if sent_before:
+            session.save(update_fields=["state_payload", "updated_at"])
+            return {
+                "ok": True,
+                "saved": True,
+                "video_sent": True,
+                "message": (
+                    "Video SMS sent again. Say briefly that you just resent it, then continue "
+                    "the question you were on. Do not change steps because of the resend."
+                ),
+            }
         session.assistance_type = "renewal_video"
         session.current_node = "household_income"
         session.save(
@@ -285,9 +315,10 @@ def handle_retell_function(name: str, args: Dict[str, Any], call: Dict[str, Any]
             "saved": True,
             "video_sent": True,
             "message": (
-                "Video SMS sent successfully. Confirm briefly that you texted the video, "
-                "then immediately transition_to_household_income and continue the remaining "
-                "questions. Do NOT offer Pointcare or transfer again unless asked. "
+                "Video SMS sent successfully. Say one short natural sentence that you texted "
+                "the video, then silently call transition_to_household_income and continue the "
+                "remaining questions. Never read this message or any function name aloud. "
+                "Do NOT offer Pointcare or transfer again unless asked. "
                 "Do NOT say goodbye. Do NOT call end_call."
             ),
         }

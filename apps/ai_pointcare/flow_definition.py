@@ -80,10 +80,14 @@ BRANCHING FLOW (follow edges exactly — do not invent skips):
   - live enrollment agent → agent_transfer
 09 benefits → 10 appointment
 10 appointment:
-  - IF flow_path is renewal_no AND benefits=yes AND appointment scheduled → 14 transfer
-  - NORMAL: otherwise (including appointment help = No) → immediately transition_to_offer_renewal_assistance. Never invent a goodbye.
+  - IF flow_path is renewal_no AND benefits is yes AND appointment scheduled → 14 transfer
+  - NORMAL: otherwise (including appointment help is No) → immediately transition_to_offer_renewal_assistance. Never invent a goodbye.
 
 GLOBAL RULES:
+- SPEAK ONLY NATURAL SENTENCES TO THE PATIENT. transition_to_* steps and tools are SILENT
+  function calls. NEVER say a function or step name, a field name, or a field value out loud
+  (for example: transition_to_…, flow_path, renewal_status, assistance_type, renewal_no,
+  appointment_details). Never describe what you are passing to a function.
 - Stay in the current state. Ask ONLY what that state allows.
 - When a state lists REQUIRED spoken lines, say those lines FIRST, word-for-word when quoted.
 - After identity is confirmed, ALWAYS ask the language question before any Medi-Cal intro.
@@ -93,12 +97,15 @@ GLOBAL RULES:
 - FORBIDDEN until Assistance/Closing/Transfer/Pointcare end: inventing goodbye / end_call early.
 - Never continue talking over the patient.
 - NEVER make the patient repeat a yes/no already given.
-- Do NOT call save_progress or schedule_appointment — both disabled (cause silent waits). Use transition_to_* with parameters only.
+- Do NOT call save_progress or schedule_appointment — both disabled (cause silent waits). Pass answers only as fields of the silent transition_to_* call.
 - Never leave silence after an answer — transition in the same turn.
   Exception: after asking a question (e.g. the language question), always wait for the patient's reply first.
 - Understand natural language. No "Unsure" path.
 - Never disclose Medi-Cal details before identity is verified.
 - Never ask the patient to confirm or update their address, phone number, or email.
+- Never say you sent or will resend a text unless you call send_renewal_video_sms in that same turn.
+- Never transfer unless the patient clearly asked for a live agent / phone help, or the
+  Appointment early-transfer rule matches. "What?", "sorry?", "hello?" or unclear words are NOT a yes.
 - Callback request → callback_end. DNC → record_dnc then end (only in allowed states).
 
 TRANSFER RULES:
@@ -203,9 +210,13 @@ def build_tools(function_url: str) -> Dict[str, Any]:
             "name": "request_callback",
             "url": function_url,
             "method": "POST",
-            "description": "Create a callback / follow-up request when the patient is busy or transfer fails.",
+            "description": (
+                "ONLY when the patient clearly asks to be called back later, or the transfer fails. "
+                "Never use it to move between steps or to save answers."
+            ),
             "speak_during_execution": True,
             "speak_after_execution": True,
+            "execution_message_type": "static_text",
             "execution_message_description": "One moment while I note that callback.",
             "parameters": _json_props(
                 {
@@ -257,14 +268,17 @@ def build_tools(function_url: str) -> Dict[str, Any]:
             "method": "POST",
             "description": (
                 "Text the Medi-Cal renewal follow-up video link to the patient's phone. "
-                "Use ONLY after they choose the video option in renewal_followup_offer "
-                "(not Pointcare, not live agent). "
-                "After success: briefly confirm the video was texted, then immediately "
+                "Use ONLY (a) after they choose the video option in renewal_followup_offer "
+                "(not Pointcare, not live agent), or (b) ONCE to resend when the patient says "
+                "they did not get the text. On a resend, stay in the current step and continue "
+                "the question you were on. "
+                "After success: briefly confirm the video was texted, then silently call "
                 "transition_to_household_income and continue the remaining questions. "
                 "Do NOT say goodbye. Do NOT call end_call."
             ),
             "speak_during_execution": True,
             "speak_after_execution": True,
+            "execution_message_type": "static_text",
             "execution_message_description": "One moment while I text you that video link.",
             "parameters": _json_props({}),
             "timeout_ms": 8000,
@@ -289,7 +303,21 @@ def build_tools(function_url: str) -> Dict[str, Any]:
     }
 
 
+_SILENT_STEPS_REMINDER = (
+    "\nREMINDER: transitions and tools are silent function calls. Never read a function name, "
+    "field name, or field value aloud, and never describe what you pass to a function — "
+    "say only natural sentences to the patient."
+)
+
+
 def build_states(function_url: str) -> List[Dict[str, Any]]:
+    states = _build_state_list(function_url)
+    for state in states:
+        state["state_prompt"] = state["state_prompt"] + _SILENT_STEPS_REMINDER
+    return states
+
+
+def _build_state_list(function_url: str) -> List[Dict[str, Any]]:
     tools = build_tools(function_url)
     transfer = tools["transfer_to_bach_agent"]
     end = tools["end_call"]
@@ -301,7 +329,7 @@ def build_states(function_url: str) -> List[Dict[str, Any]]:
 ## Node 01 Opening & Identity
 The begin message already asked: "Hello, may I speak with {{{{patient_name}}}}?"
 After they confirm (yeah / yes / speaking / that's me / hello):
-IMMEDIATELY call transition_to_language_preference with patient_verified=true.
+IMMEDIATELY and silently call transition_to_language_preference (set patient_verified to true).
 Do NOT speak the Lauren / Medi-Cal intro here.
 Do NOT ask about renewal, address, phone, or email here.
 FORBIDDEN here: language question is the NEXT state — do not skip it.
@@ -337,9 +365,9 @@ English, Spanish, Hindi, Chinese (Mandarin), and Vietnamese.
 Example: "I can continue in English, Spanish, Hindi, Chinese, or Vietnamese. Which would you prefer?"
 Then WAIT for their choice.
 Only AFTER the patient replies to the language question:
-- English / fine / okay / yes → transition_to_purpose with preferred_language="English".
+- English / fine / okay / yes → silently call transition_to_purpose (set preferred_language to "English").
 - Another language named (e.g. Spanish) → briefly acknowledge, continue in that language when you can,
-  then transition_to_purpose with preferred_language set to what they asked for.
+  then silently call transition_to_purpose (set preferred_language to what they asked for).
 FORBIDDEN: Medi-Cal intro, renewal, contact questions, goodbye. Do not invent languages outside the list.
 """.strip(),
             "edges": [
@@ -386,12 +414,12 @@ If busy: transition_to_callback_end.
 Ask ONCE, say: "Have you already completed your Medi-Cal renewal this year or received and completed the form?"
 
 On first answer, map status and BRANCH (never end the call here):
-- YES / already completed / submitted → renewal_status=COMPLETED or SUBMITTED_PENDING
+- YES / already completed / submitted → set renewal_status to COMPLETED or SUBMITTED_PENDING
   → immediately transition_to_changes_check
   Set flow_path hint toward completed path.
-- NO / not yet / not received → renewal_status=NOT_COMPLETED or NOT_RECEIVED
+- NO / not yet / not received → set renewal_status to NOT_COMPLETED or NOT_RECEIVED
   → immediately transition_to_renewal_followup_offer
-  Set flow_path="{FLOW_PATH_NO}"
+  Set flow_path to "{FLOW_PATH_NO}"
 
 FORBIDDEN: goodbye, ending after Yes/No, skipping straight to household after No.
 """.strip(),
@@ -419,7 +447,7 @@ FORBIDDEN: goodbye, ending after Yes/No, skipping straight to household after No
                     NODE_RENEWAL_OFFER,
                     (
                         f"Renewal NO / not completed → offer video, Pointcare, or live agent. "
-                        f"Set flow_path={FLOW_PATH_NO}."
+                        f"Set flow_path to {FLOW_PATH_NO}."
                     ),
                     _json_props(
                         {
@@ -448,12 +476,12 @@ On first clear answer:
 - VIDEO / text me / send the video / SMS / link →
   1) Immediately call send_renewal_video_sms
   2) After it succeeds, say briefly: "I've just texted you the video. Let's keep going with a few quick questions."
-  3) Immediately transition_to_household_income with flow_path="{FLOW_PATH_NO}" and assistance_type="renewal_video"
+  3) Immediately silently call transition_to_household_income (set flow_path to "{FLOW_PATH_NO}" and assistance_type to "renewal_video")
   Do NOT say goodbye. Do NOT call end_call.
 - POINTCARE / registration / guide me / website / set up account →
-  immediately transition_to_pointcare_registration with flow_path="{FLOW_PATH_NO}" and assistance_type="pointcare"
+  immediately silently call transition_to_pointcare_registration (set flow_path to "{FLOW_PATH_NO}" and assistance_type to "pointcare")
 - LIVE AGENT / enrollment agent / transfer / talk to a person / connect me →
-  immediately transition_to_agent_transfer with flow_path="{FLOW_PATH_NO}" and assistance_type="live_agent"
+  immediately silently call transition_to_agent_transfer (set flow_path to "{FLOW_PATH_NO}" and assistance_type to "live_agent")
 
 FORBIDDEN: two-option wording ("continue with questions"); ending after video; inventing goodbye here.
 """.strip(),
@@ -462,7 +490,7 @@ FORBIDDEN: two-option wording ("continue with questions"); ending after video; i
                     NODE_HOUSEHOLD_INCOME,
                     (
                         f"Video SMS sent — continue remaining questions. "
-                        f"Set flow_path={FLOW_PATH_NO}."
+                        f"Set flow_path to {FLOW_PATH_NO}."
                     ),
                     _json_props(
                         {
@@ -482,7 +510,7 @@ FORBIDDEN: two-option wording ("continue with questions"); ending after video; i
                     NODE_POINTCARE,
                     (
                         f"Patient chose Pointcare registration guidance on this call. "
-                        f"Set flow_path={FLOW_PATH_NO}."
+                        f"Set flow_path to {FLOW_PATH_NO}."
                     ),
                     _json_props(
                         {
@@ -502,7 +530,7 @@ FORBIDDEN: two-option wording ("continue with questions"); ending after video; i
                     NODE_TRANSFER,
                     (
                         f"Patient chose a live enrollment agent. Transfer next. "
-                        f"Set flow_path={FLOW_PATH_NO}."
+                        f"Set flow_path to {FLOW_PATH_NO}."
                     ),
                     _json_props(
                         {
@@ -519,7 +547,6 @@ FORBIDDEN: two-option wording ("continue with questions"); ending after video; i
                     ),
                 ),
             ],
-            "tools": [tools["send_renewal_video_sms"]],
         },
         {
             "name": NODE_POINTCARE,
@@ -544,14 +571,14 @@ STEPS (in order):
 9) Confirm profile looks right.
 
 When account setup is complete:
-- If they still need household/income help for Medi-Cal, transition_to_household_income with flow_path="{FLOW_PATH_NO}".
-- If they are done / all set, transition_to_closing with final_outcome="POINTCARE_GUIDED".
+- If they still need household/income help for Medi-Cal, silently call transition_to_household_income (set flow_path to "{FLOW_PATH_NO}").
+- If they are done / all set, silently call transition_to_closing (set final_outcome to "POINTCARE_GUIDED").
 - If they ask for a live person, transition_to_agent_transfer.
 """.strip(),
             "edges": [
                 _edge(
                     NODE_HOUSEHOLD_INCOME,
-                    f"Pointcare setup done; continue Medi-Cal questions. flow_path={FLOW_PATH_NO}.",
+                    f"Pointcare setup done; continue Medi-Cal questions. flow_path: {FLOW_PATH_NO}.",
                     _json_props(
                         {
                             "flow_path": {
@@ -605,16 +632,16 @@ Ask ONCE whether anything changed that could affect Medi-Cal:
 address, household members, and/or employment/income.
 
 - No changes → immediately transition_to_additional_benefits
-  Set flow_path="{FLOW_PATH_YES_NO_CHANGES}"
+  Set flow_path to "{FLOW_PATH_YES_NO_CHANGES}"
 - Any changes reported → immediately transition_to_household_income
-  Set flow_path="{FLOW_PATH_YES_WITH_CHANGES}"
+  Set flow_path to "{FLOW_PATH_YES_WITH_CHANGES}"
 
 FORBIDDEN: docs, work exemption, goodbye, end call.
 """.strip(),
             "edges": [
                 _edge(
                     NODE_BENEFITS,
-                    f"No address/household/income changes. Skip to benefits. flow_path={FLOW_PATH_YES_NO_CHANGES}.",
+                    f"No address/household/income changes. Skip to benefits. flow_path: {FLOW_PATH_YES_NO_CHANGES}.",
                     _json_props(
                         {
                             "flow_path": {
@@ -629,7 +656,7 @@ FORBIDDEN: docs, work exemption, goodbye, end call.
                 ),
                 _edge(
                     NODE_HOUSEHOLD_INCOME,
-                    f"Changes reported. Collect household/income details. flow_path={FLOW_PATH_YES_WITH_CHANGES}.",
+                    f"Changes reported. Collect household/income details. flow_path: {FLOW_PATH_YES_WITH_CHANGES}.",
                     _json_props(
                         {
                             "flow_path": {
@@ -660,7 +687,7 @@ FORBIDDEN: goodbye, end call, inventing other skips.
             "edges": [
                 _edge(
                     NODE_WORK_EXEMPTION,
-                    f"Renewal NO path only (flow_path={FLOW_PATH_NO}). Continue to work exemption.",
+                    f"Renewal NO path only (flow_path: {FLOW_PATH_NO}). Continue to work exemption.",
                     _json_props(
                         {
                             "household_changed": {"type": "boolean"},
@@ -676,7 +703,7 @@ FORBIDDEN: goodbye, end call, inventing other skips.
                 ),
                 _edge(
                     NODE_BENEFITS,
-                    f"Renewal YES + changes path (flow_path={FLOW_PATH_YES_WITH_CHANGES}). Skip to benefits.",
+                    f"Renewal YES + changes path (flow_path: {FLOW_PATH_YES_WITH_CHANGES}). Skip to benefits.",
                     _json_props(
                         {
                             "household_changed": {"type": "boolean"},
@@ -746,7 +773,7 @@ FORBIDDEN: goodbye, end call, transfer.
 ## Node 09 Additional Benefits
 Ask once about interest in food assistance or other community care programs.
 On first Yes or No: immediately transition_to_healthcare_appointment.
-Pass additional_benefits_interest=true/false.
+Set additional_benefits_interest to true or false on the silent transition.
 FORBIDDEN: goodbye, end call, transfer here.
 """.strip(),
             "edges": [
@@ -793,7 +820,7 @@ FORBIDDEN:
                 _edge(
                     NODE_TRANSFER,
                     (
-                        f"EARLY TRANSFER: flow_path={FLOW_PATH_NO} AND benefits interest=yes "
+                        f"EARLY TRANSFER: flow_path: {FLOW_PATH_NO} AND benefits interest is yes "
                         "AND appointment preferred time captured. Skip assistance. "
                         "Do not ask again — transfer immediately."
                     ),
@@ -829,19 +856,27 @@ FORBIDDEN:
             "name": NODE_ASSISTANCE,
             "state_prompt": """
 ## Node 11 Final help preference
-Ask ONCE and WAIT (short wording only):
-"Would you like phone help from our Enrollment Team now, or are you all set for now?"
+When you ENTER this state, your FIRST words must be this question. Ask ONCE and WAIT:
+- If they asked for help scheduling an appointment earlier:
+  "Our Enrollment Team can help set up that appointment. Would you like me to connect you now, or are you all set for now?"
+- Otherwise:
+  "Would you like phone help from our Enrollment Team now, or are you all set for now?"
+Do NOT say "I'll connect you" or "I'm connecting you" before they answer.
 
-On first clear answer — call a transition tool in the SAME turn:
-- phone help / Enrollment Team / connect me / transfer → immediately transition_to_agent_transfer
-- no / don't need help / all set / decline → immediately transition_to_final_outcome
+Only after the patient answers THIS question — call a transition tool in the SAME turn:
+- clear yes / phone help / Enrollment Team / connect me / transfer → transition_to_agent_transfer
+- no / don't need help / all set / decline → transition_to_final_outcome
+- "What?", "sorry?", "hello?", or unclear / garbled words → NOT an answer. Repeat the question once, briefly, and WAIT.
 
-FORBIDDEN: thank-and-end yourself; "have a great day" here; silence; asking them to repeat.
+FORBIDDEN: thank-and-end yourself; "have a great day" here; silence; transferring without a clear yes.
 """.strip(),
             "edges": [
                 _edge(
                     NODE_TRANSFER,
-                    "Phone help / Enrollment Team chosen — transfer next.",
+                    (
+                        "Only after the patient clearly says yes to phone help / Enrollment Team "
+                        "in reply to the question asked in this state."
+                    ),
                     _json_props(
                         {
                             "assistance_type": {
@@ -869,7 +904,7 @@ FORBIDDEN: thank-and-end yourself; "have a great day" here; silence; asking them
             "name": NODE_OUTCOME,
             "state_prompt": f"""
 ## Node 12 Final Outcome (no-transfer path only)
-No extra questions. Immediately transition_to_closing with final_outcome
+No extra questions. Immediately and silently call transition_to_closing and set final_outcome
 (prefer PATIENT_DECLINED or RENEWAL_COMPLETED from: {', '.join(FINAL_OUTCOMES)}).
 Do not speak a long goodbye here — Closing handles that.
 """.strip(),
@@ -948,5 +983,6 @@ def build_llm_payload(
         "general_tools": [
             tools["request_callback"],
             tools["record_dnc"],
+            tools["send_renewal_video_sms"],
         ],
     }
