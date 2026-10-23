@@ -45,8 +45,8 @@ class FreshOnboardingStartTests(unittest.IsolatedAsyncioTestCase):
             await _logout_for_fresh_signin(
                 page, "https://my.pointcare.com/onboarding?code=x"
             )
-        self.assertGreaterEqual(clear.await_count, 2)
-        self.assertGreaterEqual(page.goto.await_count, 2)
+        self.assertEqual(clear.await_count, 2)
+        self.assertEqual(page.goto.await_count, 1)
         self.assertIn("/onboarding", page.url)
 
     async def test_saved_dashboard_triggers_ui_logout_then_welcome(self) -> None:
@@ -164,8 +164,15 @@ class FreshOnboardingStartTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_open(url):
             opens.append(url or "")
-            page.url = url or "about:blank"
+            if url:
+                page.url = url
             return page
+
+        async def fake_goto(url, **_kwargs):
+            page.url = url
+            return None
+
+        page.goto = AsyncMock(side_effect=fake_goto)
 
         async def welcome_side_effect(_page, *, call_id=""):
             page.url = "https://my.pointcare.com/auth"
@@ -182,6 +189,10 @@ class FreshOnboardingStartTests(unittest.IsolatedAsyncioTestCase):
                 "pc_liveagent.live_form._logout_for_fresh_signin",
                 new=AsyncMock(),
             ) as fresh,
+            patch(
+                "pc_liveagent.live_form._clear_pointcare_session",
+                new=AsyncMock(),
+            ),
             patch(
                 "pc_liveagent.live_form._already_signed_in",
                 new=AsyncMock(return_value=False),
@@ -206,8 +217,10 @@ class FreshOnboardingStartTests(unittest.IsolatedAsyncioTestCase):
             session = await lf.start_live_form(
                 call_id, "https://my.pointcare.com/onboarding?code=x"
             )
-        self.assertEqual(opens[0], "about:blank")
-        fresh.assert_awaited_once()
+        self.assertEqual(opens[0], "")
+        fresh.assert_not_awaited()
+        page.goto.assert_awaited_once()
+        self.assertIn("/onboarding", page.goto.await_args.args[0])
         self.assertTrue(session.welcome_done)
         async with lf._sessions_lock:
             lf._sessions.pop(call_id, None)

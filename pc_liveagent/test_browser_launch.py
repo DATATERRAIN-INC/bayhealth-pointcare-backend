@@ -376,6 +376,10 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(),
             ),
             patch(
+                "pc_liveagent.live_form._clear_pointcare_session",
+                new=AsyncMock(),
+            ),
+            patch(
                 "pc_liveagent.live_form._already_signed_in",
                 new=AsyncMock(return_value=False),
             ),
@@ -436,6 +440,10 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "pc_liveagent.live_form._logout_for_fresh_signin",
+                new=AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.live_form._clear_pointcare_session",
                 new=AsyncMock(),
             ),
             patch(

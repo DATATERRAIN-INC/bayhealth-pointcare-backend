@@ -631,17 +631,21 @@ async def start_live_form(call_id: str, url: str = "") -> LiveFormSession:
                         call_id,
                         _safe_url_for_log(target),
                     )
-                    # Full call: open a blank tab, leave the Chrome profile's
-                    # Google login in place, then load welcome page 1 and the
-                    # sign-in options. Application test / after-signin keep the
-                    # saved account path.
+                    # Full call: one navigation to the onboarding page, then the
+                    # four welcome clicks. Do not reload that page before sign-in.
+                    # Application test / after-signin keep the saved account path.
                     if (
                         not config.APPLICATION_TEST_MODE
                         and not config.APPLICATION_AFTER_SIGNIN
                     ):
-                        page = await open_page("about:blank")
+                        page = await open_page(None)
                         session.page = page
-                        await _logout_for_fresh_signin(page, target)
+                        await _clear_pointcare_session(page)
+                        await page.goto(
+                            target,
+                            wait_until="domcontentloaded",
+                            timeout=45000,
+                        )
                     else:
                         page = await open_page(target)
                         session.page = page
@@ -1889,12 +1893,11 @@ async def _ui_logout_saved_session(page: Page) -> None:
 
 
 async def _logout_for_fresh_signin(page: Page, onboarding_url: str) -> None:
-    """Land on welcome page 1 for the full call: intro clicks → sign-in → Stage D.
+    """Land on welcome page 1 once, then the caller clicks through to sign-in.
 
     Must not leave the tab on the saved household dashboard (Next steps /
-    Continue Quick Apply). Cookie clear alone is often not enough while a
-    profile session is still active — UI Logout is used as a fallback, then
-    onboarding is opened again.
+    Continue Quick Apply). The onboarding URL is opened once. It is opened
+    again only when that first page is still the saved household.
     """
     target = (onboarding_url or "").strip()
     if not target:
@@ -1915,9 +1918,8 @@ async def _logout_for_fresh_signin(page: Page, onboarding_url: str) -> None:
     except Exception:
         logger.exception("Could not open onboarding for fresh start")
         raise
-    # Clear storage on the Pointcare origin, then reload welcome.
+    # Drop site storage now that the tab is on Pointcare. Do not navigate again.
     await _clear_pointcare_session(page)
-    await _open_welcome()
 
     for attempt in range(4):
         if await _confirm_welcome_page_one(page):
@@ -1927,7 +1929,7 @@ async def _logout_for_fresh_signin(page: Page, onboarding_url: str) -> None:
                 _safe_url_for_log(page.url),
             )
             return
-        if await _on_saved_household_surface(page):
+        if await _on_saved_household_surface(page) or await _already_signed_in(page):
             logger.warning(
                 "Saved household still open attempt=%s url=%s — UI logout then clear",
                 attempt + 1,
@@ -1937,13 +1939,22 @@ async def _logout_for_fresh_signin(page: Page, onboarding_url: str) -> None:
                 await asyncio.wait_for(_ui_logout_saved_session(page), timeout=12)
             except Exception:
                 logger.warning("UI logout timed out; clearing cookies anyway")
-        else:
+            await _clear_pointcare_session(page)
+            await _open_welcome()
+            continue
+        await page.wait_for_timeout(800)
+        if await _confirm_welcome_page_one(page):
             logger.info(
-                "Not on welcome landing attempt=%s url=%s; reopening onboarding",
+                "Welcome landing ready attempt=%s url=%s",
                 attempt + 1,
                 _safe_url_for_log(page.url),
             )
-        await _clear_pointcare_session(page)
+            return
+        logger.info(
+            "Not on welcome landing attempt=%s url=%s; reopening onboarding",
+            attempt + 1,
+            _safe_url_for_log(page.url),
+        )
         await _open_welcome()
 
     if await _on_saved_household_surface(page) or await _already_signed_in(page):

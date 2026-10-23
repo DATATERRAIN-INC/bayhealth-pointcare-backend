@@ -46,6 +46,9 @@ class FakePage:
     async def wait_for_timeout(self, _ms: int) -> None:
         return None
 
+    async def goto(self, url: str, **_kwargs) -> None:
+        self.url = url
+
 
 class ApplicationTestModeFlagTests(unittest.TestCase):
     def test_disabled_by_default_and_blocked_in_production(self) -> None:
@@ -454,7 +457,11 @@ class StartupPathTests(unittest.IsolatedAsyncioTestCase):
 
         page = FakePage("Get Started", url="https://my.pointcare.com/auth")
         logout = AsyncMock()
-        welcome = AsyncMock(return_value=["Get Started"])
+
+        async def welcome(page, *, call_id=""):
+            page.url = "https://my.pointcare.com/auth"
+            return ["Get Started"]
+
         prepare = AsyncMock(side_effect=AssertionError("test mode must stay off"))
 
         with (
@@ -462,15 +469,19 @@ class StartupPathTests(unittest.IsolatedAsyncioTestCase):
             patch("pc_liveagent.config.APPLICATION_AFTER_SIGNIN", False),
             patch("pc_liveagent.live_form.open_page", new=AsyncMock(return_value=page)),
             patch("pc_liveagent.live_form._logout_for_fresh_signin", logout),
+            patch("pc_liveagent.live_form._clear_pointcare_session", new=AsyncMock()),
             patch("pc_liveagent.live_form._page_wait", new=AsyncMock()),
             patch("pc_liveagent.live_form._already_signed_in", new=AsyncMock(return_value=False)),
             patch("pc_liveagent.app_stage.prepare_application_test", prepare),
-            patch("pc_liveagent.live_form.advance_welcome_screens", welcome),
+            patch(
+                "pc_liveagent.live_form.advance_welcome_screens",
+                new=AsyncMock(side_effect=welcome),
+            ) as welcome_mock,
             patch("pc_liveagent.live_form.settle_on_signin_page", new=AsyncMock()),
         ):
             session = await start_live_form("test-off", "https://my.pointcare.com/onboarding")
-        logout.assert_awaited()
-        welcome.assert_awaited()
+        logout.assert_not_awaited()
+        welcome_mock.assert_awaited()
         prepare.assert_not_awaited()
         self.assertNotIn("application_test", [item.get("field_id") for item in session.history])
 
