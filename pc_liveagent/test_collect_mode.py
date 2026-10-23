@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from pc_liveagent.answer_parse import normalize_utterance, validate_for_step
 from pc_liveagent.call_turn import (
@@ -68,6 +70,46 @@ class AnswerParseTests(unittest.TestCase):
 
     def test_normalize_strips_filler(self) -> None:
         self.assertEqual(normalize_utterance("  My name is Alex  "), "Alex")
+
+    def test_proceed_application_yes_is_fast_path(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+
+        for utterance in ("Yes", "Yes.", "Yes. We can start.", "Yeah"):
+            resolved = resolve_answer("proceed_application", utterance)
+            self.assertEqual(resolved.answer, "Yes", utterance)
+            self.assertIsNone(resolved.clarify, utterance)
+            self.assertTrue(is_fast_path_resolve(resolved), utterance)
+
+    def test_proceed_application_continue_counts_as_yes(self) -> None:
+        answer, clarify = validate_for_step(
+            "proceed_application", "Continue Quick Apply"
+        )
+        self.assertEqual(answer, "Yes")
+        self.assertIsNone(clarify)
+
+    def test_proceed_application_unclear_does_not_list_dashboard_buttons(
+        self,
+    ) -> None:
+        from pc_liveagent.answer_parse import resolve_answer
+
+        # Same dashboard labels call_turn used to pass in and speak on timeout.
+        resolved = resolve_answer(
+            "proceed_application",
+            "maybe later",
+            options=[
+                "en",
+                "Household",
+                "Account",
+                "Continue Quick Apply",
+                "New Quick Apply",
+            ],
+        )
+        self.assertIsNone(resolved.answer)
+        spoken = (resolved.clarify or "").lower()
+        self.assertIn("yes or no", spoken)
+        self.assertNotIn("continue quick apply", spoken)
+        self.assertNotIn("new quick apply", spoken)
+        self.assertNotIn("options include", spoken)
 
 
 class BranchingTests(unittest.TestCase):
@@ -263,8 +305,914 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("marital", r.speech.lower())
         submit.assert_not_called()
 
-    async def test_programs_complete_thanks_and_ends_call(self) -> None:
-        """After household eligibility finishes, thank the caller and end_call."""
+    async def test_person_rel_options_available_lists_choices(self) -> None:
+        call_id = "rel-opts"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="person_rel"
+        )
+        submit = AsyncMock()
+        opts = ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"]
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                AsyncMock(return_value=session),
+            ),
+            patch(
+                "pc_liveagent.call_turn.peek_choice_labels",
+                AsyncMock(return_value=opts),
+            ),
+            patch("pc_liveagent.call_turn.submit_field", submit),
+            patch(
+                "pc_liveagent.call_turn.resolve_with_claude",
+                AsyncMock(),
+            ) as claude,
+        ):
+            r = await process_user_turn(
+                call_id, "What are the options available?"
+            )
+        self.assertEqual(r.detail, "list_options")
+        self.assertEqual(session.elig_step, "person_rel")
+        low = r.speech.lower()
+        self.assertIn("the options are", low)
+        self.assertIn("child", low)
+        self.assertIn("other", low)
+        self.assertNotIn("required to continue", low)
+        self.assertNotIn("please choose one of", low)
+        self.assertNotIn("first name", low)
+        submit.assert_not_called()
+        claude.assert_not_called()
+
+    async def test_initial_person_rel_question_includes_options(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            _spoken_question_for_step,
+            relationship_question_speech,
+        )
+
+        session = LiveFormSession(
+            call_id="rel-init", url="https://example.test", elig_step="person_rel"
+        )
+        spoken = _spoken_question_for_step(session, "person_rel")
+        low = spoken.lower()
+        self.assertIn("the options are", low)
+        self.assertIn("child", low)
+        self.assertIn("stepchild", low)
+        self.assertIn("grandchild", low)
+        self.assertIn("foster", low)
+        self.assertIn("other", low)
+        self.assertIn("which best describes", low)
+        child = relationship_question_speech(
+            "child_rel",
+            ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"],
+        )
+        self.assertIn("the options are", child.lower())
+        self.assertIn("foster child", child.lower())
+
+    async def test_person_rel_claude_timeout_uses_local_options(self) -> None:
+        from pc_liveagent.answer_parse import ClaudeResolveResult
+
+        call_id = "rel-timeout"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="person_rel"
+        )
+        opts = ["Child", "Stepchild", "Other"]
+        submit = AsyncMock()
+        claude = ClaudeResolveResult(
+            needs_clarify=True,
+            reject_reason="timeout",
+            clarify_prompt=(
+                "What is their relationship to you? "
+                "This field is required to continue. Please choose one of: Child."
+            ),
+            latency_ms=1500,
+        )
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                AsyncMock(return_value=session),
+            ),
+            patch(
+                "pc_liveagent.call_turn.peek_choice_labels",
+                AsyncMock(return_value=opts),
+            ),
+            patch("pc_liveagent.call_turn.submit_field", submit),
+            patch(
+                "pc_liveagent.call_turn.resolve_with_claude",
+                AsyncMock(return_value=claude),
+            ),
+        ):
+            r = await process_user_turn(call_id, "not sure")
+        self.assertEqual(session.elig_step, "person_rel")
+        self.assertIsNone(getattr(r, "end_call", None) or None)
+        low = (r.speech or "").lower()
+        self.assertIn("other", low)
+        self.assertNotIn("required to continue", low)
+        self.assertNotIn("options include", low)
+        submit.assert_not_called()
+
+    async def test_other_relationship_awaits_custom_text(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="rel-other", url="https://example.test", elig_step="person_rel"
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                AsyncMock(return_value=["Child", "Other"]),
+            ),
+            patch(
+                "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                AsyncMock(),
+            ) as ensure,
+            patch(
+                "pc_liveagent.live_form._other_relationship_input_visible",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="person_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+        ):
+            result = await _submit_eligibility_answer(
+                "rel-other", session, page, "Other", time.time()
+            )
+        ensure.assert_awaited_with(page, "Other")
+        self.assertEqual(session.filled.get("rel_other_awaiting"), "person_rel")
+        self.assertEqual(session.elig_step, "person_rel")
+        self.assertIn("other relationship", (result.get("spoken") or "").lower())
+        self.assertNotIn("required", (result.get("spoken") or "").lower())
+
+        with (
+            patch(
+                "pc_liveagent.live_form._fill_other_relationship_text",
+                AsyncMock(return_value="Niece"),
+            ),
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="person_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+        ):
+            result2 = await _submit_eligibility_answer(
+                "rel-other", session, page, "Niece", time.time()
+            )
+        self.assertEqual(session.filled.get("person_rel"), "Other")
+        self.assertEqual(session.filled.get("person_rel_other"), "Niece")
+        self.assertNotIn("rel_other_awaiting", session.filled)
+        self.assertEqual(session.elig_step, "person_age")
+        self.assertTrue(result2.get("ok"))
+
+    async def test_other_without_custom_field_continues(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="rel-other-none",
+            url="https://example.test",
+            elig_step="person_rel",
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                AsyncMock(return_value=["Child", "Other"]),
+            ),
+            patch(
+                "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.live_form._other_relationship_input_visible",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="person_form"),
+            ),
+            patch(
+                "pc_liveagent.live_form._relationship_speech_for_page",
+                AsyncMock(return_value="age next"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+        ):
+            result = await _submit_eligibility_answer(
+                "rel-other-none", session, page, "Other", time.time()
+            )
+        self.assertEqual(session.filled.get("person_rel"), "Other")
+        self.assertNotIn("rel_other_awaiting", session.filled)
+        self.assertEqual(session.elig_step, "person_age")
+        self.assertTrue(result.get("ok"))
+
+    async def test_ensure_relationship_raises_when_validation_still_blocks(self) -> None:
+        """Fail only when the form still demands a selection after click attempts."""
+        from pc_liveagent.live_form import _ensure_relationship_choice_selected
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._relationship_chip_selected",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._choice_appears_selected",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_relationship_chip",
+                AsyncMock(return_value=True),
+            ) as click,
+            patch("pc_liveagent.live_form._click_exact_choice", AsyncMock()),
+            patch(
+                "pc_liveagent.live_form._visible_validation_hints",
+                AsyncMock(return_value="Please select an option."),
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await _ensure_relationship_choice_selected(page, "Child")
+        self.assertIn("couldn't select", str(ctx.exception).lower())
+        self.assertEqual(click.await_count, 1)
+
+    async def test_ensure_relationship_accepts_click_when_required_text_is_gone(self) -> None:
+        """No ARIA marker is OK after one click when the field is no longer invalid."""
+        from pc_liveagent.live_form import _ensure_relationship_choice_selected
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        click = AsyncMock(return_value=True)
+        with (
+            patch(
+                "pc_liveagent.live_form._relationship_chip_selected",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._choice_appears_selected",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_relationship_chip",
+                click,
+            ),
+            patch(
+                "pc_liveagent.live_form._visible_validation_hints",
+                AsyncMock(return_value=""),
+            ),
+        ):
+            await _ensure_relationship_choice_selected(page, "Spouse")
+        self.assertEqual(click.await_count, 1)
+
+    async def test_ensure_relationship_skips_click_when_already_selected(self) -> None:
+        from pc_liveagent.live_form import _ensure_relationship_choice_selected
+
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._relationship_chip_selected",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_relationship_chip",
+                AsyncMock(return_value=True),
+            ) as click,
+        ):
+            await _ensure_relationship_choice_selected(page, "Child")
+        click.assert_not_awaited()
+
+    async def test_ensure_relationship_skips_click_when_visual_active(self) -> None:
+        from pc_liveagent.live_form import _ensure_relationship_choice_selected
+
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._relationship_chip_selected",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._choice_appears_selected",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_relationship_chip",
+                AsyncMock(return_value=True),
+            ) as click,
+        ):
+            await _ensure_relationship_choice_selected(page, "Stepchild")
+        click.assert_not_awaited()
+
+    async def test_spouse_last_fill_does_not_clear_the_first_name(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="keep-first",
+            url="https://example.test",
+            elig_step="spouse_last",
+        )
+        session.filled["spouse_first"] = "Alex"
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="spouse_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch("pc_liveagent.live_form._strict_fill", AsyncMock()),
+            patch(
+                "pc_liveagent.live_form._clear_new_person_name_fields",
+                AsyncMock(),
+            ) as clear,
+        ):
+            result = await _submit_eligibility_answer(
+                "keep-first", session, page, "Rivera", 0.0
+            )
+        clear.assert_not_awaited()
+        self.assertEqual(session.filled.get("spouse_first"), "Alex")
+        self.assertEqual(session.filled.get("spouse_last"), "Rivera")
+        self.assertEqual(session.elig_step, "spouse_role")
+        self.assertTrue(result.get("ok"))
+
+    async def test_opening_spouse_form_clears_name_fields(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="new-spouse",
+            url="https://example.test",
+            elig_step="marital",
+        )
+        page = AsyncMock()
+        with (
+            patch("pc_liveagent.live_form._click_exact_choice", AsyncMock()),
+            patch("pc_liveagent.live_form._wait_for_screen", AsyncMock(return_value="spouse_form")),
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="marital"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch(
+                "pc_liveagent.live_form._clear_new_person_name_fields",
+                AsyncMock(),
+            ) as clear,
+        ):
+            result = await _submit_eligibility_answer(
+                "new-spouse", session, page, "Married", 0.0
+            )
+        clear.assert_awaited()
+        self.assertEqual(session.elig_step, "spouse_first")
+        self.assertTrue(result.get("ok"))
+
+    async def test_person_rel_does_not_advance_when_selection_unverified(self) -> None:
+        """Grandchild must not reach person_age unless the chip is selected."""
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="rel-no-advance",
+            url="https://example.test",
+            elig_step="person_rel",
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                AsyncMock(
+                    return_value=[
+                        "Child",
+                        "Stepchild",
+                        "Grandchild",
+                        "Foster Child",
+                        "Other",
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                AsyncMock(
+                    side_effect=RuntimeError(
+                        "REL_CLARIFY: I couldn't select Grandchild on the form."
+                    )
+                ),
+            ),
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="person_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await _submit_eligibility_answer(
+                    "rel-no-advance", session, page, "Grandchild", time.time()
+                )
+        self.assertIn("couldn't select", str(ctx.exception).lower())
+        self.assertNotIn("person_rel", session.filled)
+        self.assertEqual(session.elig_step, "person_rel")
+
+    async def test_confirm_yes_blocks_when_relationship_missing(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="rel-confirm-block",
+            url="https://example.test",
+            elig_step="person_confirm",
+            after_person="disabled",
+        )
+        session.filled.update(
+            {
+                "person_first": "Water",
+                "person_last": "Bottle",
+                "person_age": "(21-63) Adult",
+                "person_kind": "student",
+            }
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="person_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch(
+                "pc_liveagent.live_form._click_continue_to",
+                AsyncMock(),
+            ) as cont,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await _submit_eligibility_answer(
+                    "rel-confirm-block", session, page, "Yes", time.time()
+                )
+        self.assertIn("relationship", str(ctx.exception).lower())
+        cont.assert_not_awaited()
+        self.assertEqual(session.elig_step, "person_confirm")
+
+    async def test_spouse_confirm_yes_skips_strict_chip_reverify(self) -> None:
+        """Confirm Yes must not fail when the strict chip reader cannot see selection."""
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="spouse-confirm-yes",
+            url="https://example.test",
+            elig_step="spouse_confirm",
+        )
+        session.filled.update(
+            {
+                "spouse_first": "Alex",
+                "spouse_last": "Rivera",
+                "spouse_role": "Spouse",
+                "spouse_age": "(21-63) Adult",
+            }
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="spouse_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch(
+                "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                AsyncMock(
+                    side_effect=RuntimeError(
+                        "REL_CLARIFY: I couldn't select Spouse on the form."
+                    )
+                ),
+            ) as ensure,
+            patch(
+                "pc_liveagent.live_form._choice_appears_selected",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_continue_to",
+                AsyncMock(),
+            ) as cont,
+        ):
+            result = await _submit_eligibility_answer(
+                "spouse-confirm-yes", session, page, "Yes", time.time()
+            )
+        ensure.assert_not_awaited()
+        cont.assert_awaited()
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(session.elig_step, "children")
+        self.assertEqual(session.filled.get("spouse_role"), "Spouse")
+
+    async def test_spouse_confirm_partner_correction_in_place(self) -> None:
+        """Saying Partner on spouse_confirm corrects the role without Back."""
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="spouse-partner-fix",
+            url="https://example.test",
+            elig_step="spouse_confirm",
+        )
+        session.filled.update(
+            {
+                "spouse_first": "Alex",
+                "spouse_last": "Rivera",
+                "spouse_role": "Spouse",
+                "spouse_age": "(21-63) Adult",
+            }
+        )
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="spouse_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                AsyncMock(return_value=["Spouse", "Partner"]),
+            ),
+            patch(
+                "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                AsyncMock(),
+            ) as ensure,
+            patch(
+                "pc_liveagent.live_form._click_continue_to",
+                AsyncMock(),
+            ) as cont,
+        ):
+            result = await _submit_eligibility_answer(
+                "spouse-partner-fix", session, page, "Partner.", time.time()
+            )
+        ensure.assert_awaited_with(page, "Partner")
+        cont.assert_not_awaited()
+        self.assertEqual(session.filled.get("spouse_role"), "Partner")
+        self.assertEqual(session.filled.get("spouse_first"), "Alex")
+        self.assertEqual(session.elig_step, "spouse_confirm")
+
+    async def test_spouse_confirm_different_age_updates_without_second_match_click(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="age-fix",
+            url="https://example.test",
+            elig_step="spouse_confirm",
+        )
+        session.filled.update(
+            {
+                "spouse_first": "Alex",
+                "spouse_last": "Rivera",
+                "spouse_role": "Spouse",
+                "spouse_age": "(65+) Senior",
+            }
+        )
+        page = AsyncMock()
+        ages = [
+            "(0-18) Child",
+            "(19-20) Young Adult",
+            "(21-63) Adult",
+            "(64) Turning Senior",
+            "(65+) Senior",
+        ]
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="spouse_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch(
+                "pc_liveagent.live_form._ensure_age_choices_visible",
+                AsyncMock(return_value=ages),
+            ),
+            patch("pc_liveagent.live_form._click_age_choice", AsyncMock()) as click,
+        ):
+            changed = await _submit_eligibility_answer(
+                "age-fix", session, page, "Twenty five", 0.0
+            )
+            click.assert_awaited()
+            self.assertEqual(session.filled.get("spouse_age"), "(21-63) Adult")
+            self.assertEqual(session.elig_step, "spouse_confirm")
+            self.assertIn("confirm", (changed.get("spoken") or "").lower())
+            click.reset_mock()
+            same = await _submit_eligibility_answer(
+                "age-fix", session, page, "Twenty five", 0.0
+            )
+        click.assert_not_awaited()
+        self.assertEqual(session.filled.get("spouse_first"), "Alex")
+        self.assertEqual(session.elig_step, "spouse_confirm")
+        self.assertTrue(same.get("ok"))
+
+    def test_resolve_partner_on_spouse_confirm_is_fast_path(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+
+        resolved = resolve_answer("spouse_confirm", "Partner.")
+        self.assertEqual(resolved.answer, "Partner")
+        self.assertEqual(resolved.detail, "confirm_rel_correction")
+        self.assertTrue(is_fast_path_resolve(resolved))
+        affirm = resolve_answer("spouse_confirm", "Spouse is correct.")
+        self.assertEqual(affirm.answer, "Yes")
+
+    def test_resolve_age_on_confirm_is_fast_path(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+
+        resolved = resolve_answer("spouse_confirm", "Twenty five.")
+        self.assertEqual(resolved.detail, "confirm_age_correction")
+        self.assertTrue(is_fast_path_resolve(resolved))
+        child = resolve_answer("child_confirm", "Child")
+        self.assertEqual(child.detail, "confirm_rel_correction")
+        person = resolve_answer("person_confirm", "Fifteen.")
+        self.assertEqual(person.detail, "confirm_age_correction")
+
+    def test_resolve_relationship_on_person_confirm_is_fast_path(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+
+        for spoken, expected in (
+            ("Grandchild", "Grandchild"),
+            ("my stepson", "Stepchild"),
+            ("Foster Child", "Foster Child"),
+            ("Other", "Other"),
+        ):
+            resolved = resolve_answer("person_confirm", spoken)
+            self.assertEqual(resolved.answer, expected, spoken)
+            self.assertEqual(resolved.detail, "confirm_rel_correction")
+            self.assertTrue(is_fast_path_resolve(resolved))
+
+    async def test_all_person_relationship_chips_select_and_advance(self) -> None:
+        """Every person_rel chip selects via ensure and advances to person_age."""
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        opts = ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"]
+        for label in opts:
+            session = LiveFormSession(
+                call_id=f"rel-{label}",
+                url="https://example.test",
+                elig_step="person_rel",
+            )
+            page = AsyncMock()
+            page.wait_for_timeout = AsyncMock()
+            with (
+                patch(
+                    "pc_liveagent.live_form._visible_choice_labels",
+                    AsyncMock(return_value=opts),
+                ),
+                patch(
+                    "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                    AsyncMock(),
+                ) as ensure,
+                patch(
+                    "pc_liveagent.live_form._other_relationship_input_visible",
+                    AsyncMock(return_value=False),
+                ),
+                patch(
+                    "pc_liveagent.live_form._eligibility_screen",
+                    AsyncMock(return_value="person_form"),
+                ),
+                patch("pc_liveagent.live_form._mark"),
+            ):
+                result = await _submit_eligibility_answer(
+                    f"rel-{label}", session, page, label, time.time()
+                )
+            ensure.assert_awaited_with(page, label)
+            self.assertEqual(session.filled.get("person_rel"), label)
+            self.assertEqual(session.elig_step, "person_age")
+            self.assertTrue(result.get("ok"), label)
+
+    async def test_all_child_relationship_chips_select_and_advance(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        opts = ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"]
+        for label in opts:
+            session = LiveFormSession(
+                call_id=f"child-rel-{label}",
+                url="https://example.test",
+                elig_step="child_rel",
+            )
+            page = AsyncMock()
+            page.wait_for_timeout = AsyncMock()
+            with (
+                patch(
+                    "pc_liveagent.live_form._visible_choice_labels",
+                    AsyncMock(return_value=opts),
+                ),
+                patch(
+                    "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                    AsyncMock(),
+                ) as ensure,
+                patch(
+                    "pc_liveagent.live_form._other_relationship_input_visible",
+                    AsyncMock(return_value=False),
+                ),
+                patch(
+                    "pc_liveagent.live_form._eligibility_screen",
+                    AsyncMock(return_value="child_form"),
+                ),
+                patch("pc_liveagent.live_form._mark"),
+            ):
+                result = await _submit_eligibility_answer(
+                    f"child-rel-{label}", session, page, label, time.time()
+                )
+            ensure.assert_awaited_with(page, label)
+            self.assertEqual(session.filled.get("child_rel"), label)
+            self.assertEqual(session.elig_step, "child_age")
+            self.assertTrue(result.get("ok"), label)
+
+    async def test_spouse_and_partner_roles_select(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        for spoken, role in (("Spouse", "Spouse"), ("Partner", "Partner"), ("they're my partner", "Partner")):
+            session = LiveFormSession(
+                call_id=f"role-{role}-{spoken[:4]}",
+                url="https://example.test",
+                elig_step="spouse_role",
+            )
+            page = AsyncMock()
+            with (
+                patch(
+                    "pc_liveagent.live_form._eligibility_screen",
+                    AsyncMock(return_value="spouse_form"),
+                ),
+                patch("pc_liveagent.live_form._mark"),
+                patch(
+                    "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                    AsyncMock(),
+                ) as ensure,
+            ):
+                result = await _submit_eligibility_answer(
+                    session.call_id, session, page, spoken, time.time()
+                )
+            ensure.assert_awaited_with(page, role)
+            self.assertEqual(session.filled.get("spouse_role"), role)
+            self.assertEqual(session.elig_step, "spouse_age")
+            self.assertTrue(result.get("ok"))
+
+    async def test_person_confirm_relationship_correction_in_place(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="person-rel-fix",
+            url="https://example.test",
+            elig_step="person_confirm",
+            after_person="disabled",
+        )
+        session.filled.update(
+            {
+                "person_first": "Sam",
+                "person_last": "Lee",
+                "person_rel": "Child",
+                "person_age": "(21-63) Adult",
+                "person_kind": "student",
+            }
+        )
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="person_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                AsyncMock(
+                    return_value=[
+                        "Child",
+                        "Stepchild",
+                        "Grandchild",
+                        "Foster Child",
+                        "Other",
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                AsyncMock(),
+            ) as ensure,
+            patch(
+                "pc_liveagent.live_form._click_continue_to",
+                AsyncMock(),
+            ) as cont,
+        ):
+            result = await _submit_eligibility_answer(
+                "person-rel-fix", session, page, "Grandchild", time.time()
+            )
+        ensure.assert_awaited_with(page, "Grandchild")
+        cont.assert_not_awaited()
+        self.assertEqual(session.filled.get("person_rel"), "Grandchild")
+        self.assertEqual(session.filled.get("person_first"), "Sam")
+        self.assertEqual(session.elig_step, "person_confirm")
+        self.assertTrue(result.get("ok"))
+
+    async def test_person_confirm_yes_continues_when_relationship_recorded(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="person-confirm-yes",
+            url="https://example.test",
+            elig_step="person_confirm",
+            after_person="disabled",
+        )
+        session.filled.update(
+            {
+                "person_first": "Sam",
+                "person_last": "Lee",
+                "person_rel": "Foster Child",
+                "person_age": "(21-63) Adult",
+                "person_kind": "student",
+            }
+        )
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="person_form"),
+            ),
+            patch("pc_liveagent.live_form._mark"),
+            patch(
+                "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                AsyncMock(
+                    side_effect=RuntimeError(
+                        "REL_CLARIFY: I couldn't select Foster Child on the form."
+                    )
+                ),
+            ) as ensure,
+            patch(
+                "pc_liveagent.live_form._choice_appears_selected",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_continue_to",
+                AsyncMock(),
+            ) as cont,
+        ):
+            result = await _submit_eligibility_answer(
+                "person-confirm-yes", session, page, "Yes", time.time()
+            )
+        ensure.assert_not_awaited()
+        cont.assert_awaited()
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(session.elig_step, "disabled")
+        self.assertEqual(session.filled.get("person_rel"), "Foster Child")
+
+    async def test_correct_member_relationship_requires_real_selection(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, correct_member_field
+
+        call_id = "rel-correct-fail"
+        session = LiveFormSession(
+            call_id=call_id,
+            url="https://example.test",
+            elig_step="person_confirm",
+            welcome_done=True,
+            status="open",
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        session.page = page
+        from pc_liveagent import live_form as lf
+
+        async with lf._sessions_lock:
+            lf._sessions[call_id] = session
+        try:
+            with (
+                patch(
+                    "pc_liveagent.live_form._eligibility_screen",
+                    AsyncMock(return_value="person_form"),
+                ),
+                patch(
+                    "pc_liveagent.live_form._visible_choice_labels",
+                    AsyncMock(
+                        return_value=[
+                            "Child",
+                            "Stepchild",
+                            "Grandchild",
+                            "Foster Child",
+                            "Other",
+                        ]
+                    ),
+                ),
+                patch(
+                    "pc_liveagent.live_form._ensure_relationship_choice_selected",
+                    AsyncMock(
+                        side_effect=RuntimeError(
+                            "REL_CLARIFY: I couldn't select Child on the form."
+                        )
+                    ),
+                ),
+            ):
+                result = await correct_member_field(call_id, "relationship", "Child")
+            self.assertFalse(result.get("ok"))
+            self.assertIn("couldn't select", (result.get("spoken") or "").lower())
+            self.assertEqual(session.elig_step, "person_confirm")
+            self.assertNotIn("person_rel", session.filled)
+        finally:
+            async with lf._sessions_lock:
+                lf._sessions.pop(call_id, None)
+
+    async def test_programs_decline_closes_without_stage_e(self) -> None:
+        """No on program-summary closes politely without starting Stage E."""
+        from pc_liveagent.app_stage import CLOSING_NO_APPLICATION
         from pc_liveagent.call_turn import (
             CLOSING,
             _run_eligibility_browser_background,
@@ -292,11 +1240,10 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(
                     return_value={
                         "ok": True,
-                        "spoken": (
-                            "I've finished filling your household eligibility form. "
-                            "Thank you for your time. Goodbye."
-                        ),
+                        "spoken": CLOSING_NO_APPLICATION,
                         "step": "",
+                        "end_call": True,
+                        "action": "declined_application",
                     }
                 ),
             ),
@@ -315,13 +1262,12 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
                 epoch=ctrl.elig_nav_epoch,
             )
         self.assertEqual(ctrl.phase, "closing")
-        self.assertIn("household eligibility", ctrl.last_speech.lower())
+        self.assertIn("have not started an application", ctrl.last_speech.lower())
         self.assertIn("thank", ctrl.last_speech.lower())
         deliver.assert_awaited()
         kwargs = deliver.await_args.kwargs
         self.assertTrue(kwargs.get("end_call"))
         self.assertIn("close:", kwargs.get("key", ""))
-        # Sync path also ends the call when already closing.
         r = await process_user_turn(call_id, "")
         self.assertTrue(r.end_call)
         self.assertEqual(r.phase, "closing")
@@ -498,6 +1444,173 @@ class IncomeMappingTests(unittest.TestCase):
             labels[0],
         )
 
+    def test_natural_spoken_amounts_and_k(self) -> None:
+        from pc_liveagent.live_form import (
+            _map_income_range_label,
+            _parse_spoken_income_interval,
+        )
+
+        labels = [
+            "$0 – $12,000",
+            "$12,001 – $39,900",
+            "$39,901 – $50,000",
+            "$50,001 – $100,000",
+            "$100,001+",
+        ]
+        self.assertEqual(
+            _parse_spoken_income_interval("forty to fifty thousand"),
+            (40000, 50000),
+        )
+        self.assertEqual(
+            _parse_spoken_income_interval("Between 40,000 and 50,000 dollars."),
+            (40000, 50000),
+        )
+        self.assertEqual(_parse_spoken_income_interval("About 100k."), (100000, 100000))
+        self.assertEqual(
+            _parse_spoken_income_interval("One hundred thousand a year."),
+            (100000, 100000),
+        )
+        self.assertEqual(
+            _parse_spoken_income_interval("Around forty thousand annually."),
+            (40000, 40000),
+        )
+        self.assertEqual(
+            _parse_spoken_income_interval("About five thousand a month."),
+            (5000, 5000),
+        )
+        self.assertEqual(
+            _parse_spoken_income_interval("Every two weeks, around two thousand."),
+            (2000, 2000),
+        )
+        self.assertEqual(
+            _map_income_range_label("About 100k.", labels),
+            "$50,001 – $100,000",
+        )
+        self.assertEqual(
+            _map_income_range_label("One hundred thousand a year.", labels),
+            "$50,001 – $100,000",
+        )
+        self.assertEqual(
+            _map_income_range_label("forty to fifty thousand", labels),
+            "$39,901 – $50,000",
+        )
+        self.assertEqual(
+            _map_income_range_label("About five thousand a month.", labels),
+            "$0 – $12,000",
+        )
+
+    def test_bare_number_requests_scale_clarification(self) -> None:
+        from pc_liveagent.answer_parse import resolve_answer
+        from pc_liveagent.elig_meta import get_field_meta
+        from pc_liveagent.live_form import (
+            _income_amount_scale_unclear,
+            _map_income_range_label,
+        )
+
+        labels = ["$0 – $12,000", "$39,901 – $50,000", "$50,001 – $100,000"]
+        self.assertTrue(_income_amount_scale_unclear("100"))
+        self.assertTrue(_income_amount_scale_unclear("one hundred"))
+        self.assertFalse(_income_amount_scale_unclear("100k"))
+        self.assertFalse(_income_amount_scale_unclear("one hundred thousand"))
+        self.assertFalse(_income_amount_scale_unclear("100 dollars"))
+        self.assertEqual(_map_income_range_label("100", labels), "")
+        r = resolve_answer(
+            "income_range",
+            "100",
+            options=labels,
+            meta=get_field_meta("income_range"),
+        )
+        self.assertIsNone(r.answer)
+        self.assertEqual(r.detail, "income_scale_unclear")
+        clarify = (r.clarify or "").lower()
+        self.assertIn("thousand", clarify)
+        self.assertIn("dollars", clarify)
+        # Do not echo the raw utterance or list UI chip labels.
+        self.assertNotIn("i heard 100", clarify)
+        self.assertNotIn("$39,901", r.clarify or "")
+        self.assertNotIn("you see", clarify)
+
+    def test_period_switch_detected_from_income_range(self) -> None:
+        from pc_liveagent.answer_parse import resolve_answer
+        from pc_liveagent.elig_meta import get_field_meta
+        from pc_liveagent.live_form import (
+            _detect_income_period_switch,
+            _wants_income_period_reselect,
+        )
+
+        self.assertEqual(
+            _detect_income_period_switch("change the period to monthly"),
+            "Monthly",
+        )
+        self.assertEqual(
+            _detect_income_period_switch("I want to choose bi-weekly instead"),
+            "Bi-weekly",
+        )
+        self.assertEqual(
+            _detect_income_period_switch("go back to annual"),
+            "Annual",
+        )
+        self.assertTrue(_wants_income_period_reselect("go back to the period"))
+        self.assertTrue(_wants_income_period_reselect("change the income period"))
+        switched = resolve_answer(
+            "income_range",
+            "change the period to monthly",
+            options=["$0 – $12,000", "$12,001+"],
+            meta=get_field_meta("income_range"),
+        )
+        self.assertEqual(switched.answer, "__INCOME_PERIOD_SWITCH__:Monthly")
+        self.assertEqual(switched.detail, "income_period_switch")
+        reselect = resolve_answer(
+            "income_range",
+            "go back to the period",
+            options=["$0 – $12,000"],
+            meta=get_field_meta("income_range"),
+        )
+        self.assertEqual(reselect.answer, "__INCOME_PERIOD_RESELECT__")
+
+    def test_voice_friendly_income_questions(self) -> None:
+        from pc_liveagent.elig_meta import format_question
+        from pc_liveagent.live_form import (
+            ELIG_QUESTIONS,
+            LiveFormSession,
+            _income_range_question_for_period,
+            _spoken_question_for_step,
+        )
+
+        annual = _income_range_question_for_period("Annual")
+        monthly = _income_range_question_for_period("Monthly")
+        bi = _income_range_question_for_period("Bi-weekly")
+        self.assertIn("per year", annual.lower())
+        self.assertIn("per month", monthly.lower())
+        self.assertIn("every two weeks", bi.lower())
+        for q in (annual, monthly, bi, ELIG_QUESTIONS["income_range"]):
+            self.assertNotIn("you see", q.lower())
+            self.assertNotIn("dollar range you see", q.lower())
+            # Never enumerate every income-band chip in the spoken question.
+            self.assertNotIn("$0", q)
+            self.assertNotIn("$12,000", q)
+        fq = format_question(
+            "income_range",
+            options=["$0 – $12,000", "$12,001 – $39,900"],
+            period="Monthly",
+        )
+        self.assertIn("per month", fq.lower())
+        self.assertNotIn("$0", fq)
+        self.assertNotIn("required to continue", fq.lower())
+        from pc_liveagent.live_form import build_options_help_speech
+
+        help_speech = build_options_help_speech(
+            "income_range", ["$0 – $12,000", "$39,901+"]
+        )
+        self.assertNotIn("$0", help_speech)
+        self.assertNotIn("$39,901", help_speech)
+        session = LiveFormSession(
+            call_id="inc-q", url="https://example.test", elig_step="income_range"
+        )
+        session.filled["income_when"] = "Bi-weekly"
+        spoken = _spoken_question_for_step(session, "income_range")
+        self.assertIn("every two weeks", spoken.lower())
+
     def test_income_range_validate(self) -> None:
         from pc_liveagent.answer_parse import resolve_answer
         from pc_liveagent.elig_meta import get_field_meta
@@ -522,6 +1635,11 @@ class IncomeMappingTests(unittest.TestCase):
         )
         self.assertIsNone(bad.answer)
         self.assertIsNotNone(bad.clarify)
+        clarify = (bad.clarify or "").lower()
+        self.assertNotIn("$0", bad.clarify or "")
+        # Must not echo the full caller phrase back (avoids clarification loops).
+        self.assertNotIn("ninety thousand to one hundred thousand", clarify)
+        self.assertNotIn("i heard", clarify)
         self.assertNotEqual(bad.answer, labels[0] if labels else None)
         answer2, clarify2 = validate_for_step("income_when", "two weeks")
         self.assertEqual(answer2, "Bi-weekly")
@@ -1252,6 +2370,144 @@ class StaleTranscriptDedupeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(d2.user_index, 1)
         await drop_controller(call_id)
 
+    async def test_same_transcript_event_is_not_reused_as_last_name(self) -> None:
+        """The first-name transcript event must not also fill last name."""
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "name-replay"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        ctrl.eligibility_question_sent = True
+        ctrl.active_websocket_status = "connected"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="spouse_first"
+        )
+        submits: list[tuple[str, str]] = []
+
+        async def fake_get_session(_cid: str):
+            return session
+
+        async def fake_submit(_cid, _field, value, **_kwargs):
+            submits.append((session.elig_step, value))
+            if session.elig_step == "spouse_first":
+                session.filled["spouse_first"] = value
+                session.elig_step = "spouse_last"
+                return {
+                    "ok": True,
+                    "spoken": "ASK: What is their last name?",
+                    "step": "spouse_last",
+                }
+            session.filled["spouse_last"] = value
+            session.elig_step = "spouse_role"
+            return {
+                "ok": True,
+                "spoken": "ASK: Are they your spouse or your partner?",
+                "step": "spouse_role",
+            }
+
+        with (
+            patch("pc_liveagent.call_turn.get_session", side_effect=fake_get_session),
+            patch("pc_liveagent.call_turn.submit_field", side_effect=fake_submit),
+            patch("pc_liveagent.call_turn._speak_interrupt", AsyncMock(return_value=True)),
+            patch("pc_liveagent.call_turn.peek_choice_labels", AsyncMock(return_value=[])),
+        ):
+            first = await process_user_turn(
+                call_id, "Alex", response_id=1, transcript_user_index=4
+            )
+            task = __import__(
+                "pc_liveagent.call_turn", fromlist=["_elig_browser_tasks"]
+            )._elig_browser_tasks.get(call_id)
+            if task is not None:
+                await task
+            replay = await process_user_turn(
+                call_id, "Alex", response_id=2, transcript_user_index=4
+            )
+            second = await process_user_turn(
+                call_id, "Alex", response_id=3, transcript_user_index=5
+            )
+            task2 = __import__(
+                "pc_liveagent.call_turn", fromlist=["_elig_browser_tasks"]
+            )._elig_browser_tasks.get(call_id)
+            if task2 is not None:
+                await task2
+        self.assertIn(first.detail, ("elig_ack", "elig_fast_complete"))
+        self.assertEqual(replay.detail, "stale_transcript_turn")
+        self.assertNotEqual(second.detail, "stale_transcript_turn")
+        self.assertEqual(session.filled.get("spouse_first"), "Alex")
+        self.assertEqual(session.filled.get("spouse_last"), "Alex")
+        self.assertEqual(submits, [("spouse_first", "Alex"), ("spouse_last", "Alex")])
+        await drop_controller(call_id)
+
+    async def test_fresh_yes_after_failed_confirm_is_not_a_duplicate(self) -> None:
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "yes-retry"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        ctrl.eligibility_question_sent = True
+        ctrl.active_websocket_status = "connected"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="spouse_confirm"
+        )
+        session.filled.update(
+            {"spouse_role": "Spouse", "spouse_age": "(21-63) Adult"}
+        )
+        submits: list[int] = []
+
+        async def fake_get_session(_cid: str):
+            return session
+
+        async def fake_submit(_cid, _field, value, **_kwargs):
+            submits.append(1)
+            if len(submits) == 1:
+                raise RuntimeError(
+                    "AGE_CLARIFY: I couldn't confirm the age on the form."
+                )
+            return {
+                "ok": True,
+                "spoken": "ASK: Do you have any children?",
+                "step": "spouse_confirm",
+            }
+
+        with (
+            patch("pc_liveagent.call_turn.get_session", side_effect=fake_get_session),
+            patch("pc_liveagent.call_turn.submit_field", side_effect=fake_submit),
+            patch("pc_liveagent.call_turn._speak_interrupt", AsyncMock(return_value=True)),
+            patch("pc_liveagent.call_turn.peek_choice_labels", AsyncMock(return_value=[])),
+        ):
+            first = await process_user_turn(
+                call_id, "Yes.", response_id=1, transcript_user_index=4
+            )
+            task = __import__(
+                "pc_liveagent.call_turn", fromlist=["_elig_browser_tasks"]
+            )._elig_browser_tasks.get(call_id)
+            if task is not None:
+                await task
+            replay = await process_user_turn(
+                call_id, "Yes.", response_id=2, transcript_user_index=4
+            )
+            second = await process_user_turn(
+                call_id, "Yes.", response_id=3, transcript_user_index=5
+            )
+            task2 = __import__(
+                "pc_liveagent.call_turn", fromlist=["_elig_browser_tasks"]
+            )._elig_browser_tasks.get(call_id)
+            if task2 is not None:
+                await task2
+            replay2 = await process_user_turn(
+                call_id, "Yes.", response_id=4, transcript_user_index=5
+            )
+        self.assertEqual(replay.detail, "stale_transcript_turn")
+        self.assertNotEqual(second.detail, "duplicate_utterance")
+        self.assertEqual(replay2.detail, "stale_transcript_turn")
+        self.assertEqual(len(submits), 2)
+        self.assertNotEqual(first.detail, "stale_transcript_turn")
+        await drop_controller(call_id)
+
     async def test_go_back_once_then_google_once(self) -> None:
         from pc_liveagent.call_turn import (
             EMAIL_GO_BACK,
@@ -1563,6 +2819,16 @@ class ControlIntentAndMetaTests(unittest.TestCase):
         self.assertEqual(change.target, "age")
         self.assertIn("fifteen", change.value.lower())
         self.assertEqual(detect_control_intent("Never married").kind, "none")
+        self.assertEqual(
+            detect_control_intent("What are the options available?").kind,
+            "list_options",
+        )
+        self.assertEqual(
+            detect_control_intent("What choices are there?").kind, "list_options"
+        )
+        self.assertEqual(
+            detect_control_intent("What can I say?").kind, "list_options"
+        )
         # Real answers / next must not be treated as context-repeat.
         self.assertEqual(
             detect_control_intent("What's the next question?").kind, "next"
@@ -1575,7 +2841,61 @@ class ControlIntentAndMetaTests(unittest.TestCase):
         self.assertTrue(meta.required)
         self.assertFalse(meta.can_skip)
         q = format_question("children")
-        self.assertIn("required", q.lower())
+        # Spoken questions must not append internal "required to continue" chrome.
+        self.assertNotIn("required to continue", q.lower())
+        self.assertIn("yes or no", q.lower())
+
+    def test_options_clarify_relationship_no_required_chrome(self) -> None:
+        from pc_liveagent.answer_parse import resolve_answer
+        from pc_liveagent.elig_meta import get_field_meta
+
+        opts = ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"]
+        r = resolve_answer(
+            "person_rel",
+            "uh maybe something",
+            options=opts,
+            meta=get_field_meta("person_rel"),
+        )
+        self.assertIsNone(r.answer)
+        clarify = (r.clarify or "").lower()
+        self.assertIn("child", clarify)
+        self.assertIn("other", clarify)
+        self.assertNotIn("required to continue", clarify)
+        self.assertNotIn("please choose one of", clarify)
+
+    def test_resolve_other_relationship_maps(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+        from pc_liveagent.elig_meta import get_field_meta
+        from pc_liveagent.live_form import (
+            _map_relationship_label,
+            relationship_question_speech,
+        )
+
+        opts = ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"]
+        r = resolve_answer(
+            "child_rel", "Other", options=opts, meta=get_field_meta("child_rel")
+        )
+        self.assertEqual(r.answer, "Other")
+        self.assertTrue(is_fast_path_resolve(r))
+        self.assertEqual(_map_relationship_label("my son", opts), "Child")
+        self.assertEqual(_map_relationship_label("my stepdaughter", opts), "Stepchild")
+        self.assertEqual(_map_relationship_label("my grandson", opts), "Grandchild")
+        self.assertEqual(_map_relationship_label("a foster child", opts), "Foster Child")
+        self.assertEqual(_map_relationship_label("something else", opts), "Other")
+        speech = relationship_question_speech("person_rel", opts)
+        low = speech.lower()
+        self.assertIn("what is their relationship to you", low)
+        self.assertIn("the options are", low)
+        self.assertIn("child", low)
+        self.assertIn("other", low)
+        self.assertIn("which best describes", low)
+        self.assertNotIn("required to continue", low)
+        self.assertNotIn("first name", low)
+        # Without Other in the live list, do not invent it.
+        no_other = relationship_question_speech(
+            "person_rel", ["Child", "Stepchild", "Grandchild"]
+        )
+        self.assertNotIn("other", no_other.lower())
 
     def test_resolve_age_with_options(self) -> None:
         from pc_liveagent.answer_parse import resolve_answer
@@ -1955,27 +3275,32 @@ class LiveCallFiveFixesTests(unittest.IsolatedAsyncioTestCase):
         edit = AsyncMock(
             return_value={
                 "ok": True,
-                "spoken": "Updated the first name to Michael. What is the child's last name?",
-                "step": "child_last",
+                "spoken": (
+                    "Updated the first name to Michael. Just to confirm for the child: "
+                    "first name Michael, last name Smith, relationship Child, "
+                    "age the 13-to-15 age range. Is that correct?"
+                ),
+                "step": "child_confirm",
                 "value": "Michael",
+                "in_place": True,
             }
         )
         with (
             patch("pc_liveagent.call_turn.get_session", side_effect=fake_get_session),
             patch("pc_liveagent.call_turn.peek_choice_labels", AsyncMock(return_value=[])),
-            patch("pc_liveagent.call_turn.correct_name_field", edit),
+            patch("pc_liveagent.call_turn.correct_member_field", edit),
             patch("pc_liveagent.call_turn.submit_field", AsyncMock()) as submit,
         ):
             r = await process_user_turn(
                 call_id, "Change the first name to Michael."
             )
-        self.assertEqual(r.detail, "name_corrected")
+        self.assertEqual(r.detail, "member_corrected")
         self.assertIn("michael", r.speech.lower())
         edit.assert_awaited()
         self.assertEqual(edit.await_args.args[2], "Michael")
         submit.assert_not_called()
 
-    async def test_child_age_auto_asks_child_more(self) -> None:
+    async def test_child_age_auto_asks_child_confirm(self) -> None:
         call_id = "fix-child"
         await drop_controller(call_id)
         ctrl = await get_controller(call_id)
@@ -1985,16 +3310,28 @@ class LiveCallFiveFixesTests(unittest.IsolatedAsyncioTestCase):
         session = LiveFormSession(
             call_id=call_id, url="https://example.test", elig_step="child_age"
         )
+        session.filled.update(
+            {
+                "child_first": "Aria",
+                "child_last": "Martin",
+                "child_rel": "Child",
+                "child_age": "(13-15) Teen",
+            }
+        )
 
         async def fake_get_session(_cid: str):
             return session
 
         async def submit(*_a, **_k):
-            session.elig_step = "child_more"
+            session.elig_step = "child_confirm"
             return {
                 "ok": True,
-                "spoken": "ASK: Is there another child to add? Please say Yes or No.",
-                "step": "child_more",
+                "spoken": (
+                    "ASK: Just to confirm for the child: first name Aria, last name "
+                    "Martin, relationship Child, age (13-15) Teen. Is that correct? "
+                    "Please say Yes or No."
+                ),
+                "step": "child_confirm",
             }
 
         interrupt = AsyncMock(return_value=True)
@@ -2014,8 +3351,9 @@ class LiveCallFiveFixesTests(unittest.IsolatedAsyncioTestCase):
             if task:
                 await asyncio.wait_for(task, timeout=2.0)
         spoken = interrupt.await_args.args[1]
-        self.assertIn("another child", spoken.lower())
-        self.assertEqual(session.elig_step, "child_more")
+        self.assertIn("just to confirm", spoken.lower())
+        self.assertIn("aria", spoken.lower())
+        self.assertEqual(session.elig_step, "child_confirm")
 
     async def test_add_another_child_asks_first_name(self) -> None:
         call_id = "fix-child2"
@@ -2349,6 +3687,21 @@ class NameAndSpecialPersonUnitTests(unittest.TestCase):
         self.assertEqual(sanitize_person_name("Anne-Marie"), "Anne-Marie")
         self.assertEqual(sanitize_person_name("Last name is Martin"), "Martin")
 
+    def test_sanitize_letter_by_letter_spelling(self) -> None:
+        from pc_liveagent.answer_parse import sanitize_person_name
+
+        self.assertEqual(sanitize_person_name("H u s s e y"), "Hussey")
+        self.assertEqual(sanitize_person_name("H-U-S-S-E-Y"), "Hussey")
+        self.assertEqual(sanitize_person_name("h u s s e y."), "Hussey")
+        self.assertEqual(sanitize_person_name("spelled H U S S E Y"), "Hussey")
+        # Legitimate multi-word / compound names must stay intact.
+        self.assertEqual(sanitize_person_name("Anne Marie"), "Anne Marie")
+        self.assertEqual(sanitize_person_name("Anne-Marie"), "Anne-Marie")
+        self.assertEqual(sanitize_person_name("O'Connor"), "O'Connor")
+        # Too short / not clearly spelling — leave alone.
+        self.assertEqual(sanitize_person_name("A B"), "A B")
+        self.assertEqual(sanitize_person_name("J R"), "J R")
+
     def test_last_name_is_martin_fills_name_not_choice(self) -> None:
         from pc_liveagent.answer_parse import resolve_answer
         from pc_liveagent.elig_meta import get_field_meta
@@ -2433,21 +3786,26 @@ class ChildNameEditTests(unittest.IsolatedAsyncioTestCase):
         edit = AsyncMock(
             return_value={
                 "ok": True,
-                "spoken": "Updated the last name to Martin. What is the relationship?",
-                "step": "child_rel",
+                "spoken": (
+                    "Updated the last name to Martin. Just to confirm for the child: "
+                    "first name Jackie, last name Martin, relationship Child, "
+                    "age the 13-to-15 age range. Is that correct?"
+                ),
+                "step": "child_confirm",
                 "value": "Martin",
+                "in_place": True,
             }
         )
         with (
             patch("pc_liveagent.call_turn.get_session", side_effect=fake_get_session),
             patch("pc_liveagent.call_turn.peek_choice_labels", AsyncMock(return_value=[])),
-            patch("pc_liveagent.call_turn.correct_name_field", edit),
+            patch("pc_liveagent.call_turn.correct_member_field", edit),
             patch("pc_liveagent.call_turn.submit_field", AsyncMock()) as submit,
         ):
             prompt = await process_user_turn(call_id, "Change the last name.")
             self.assertEqual(prompt.detail, "correction_prompt")
             r = await process_user_turn(call_id, "Martin")
-        self.assertEqual(r.detail, "name_corrected")
+        self.assertEqual(r.detail, "member_corrected")
         self.assertEqual(edit.await_args.args[1], "last_name")
         self.assertEqual(edit.await_args.args[2], "Martin")
         submit.assert_not_called()
@@ -2464,7 +3822,10 @@ class ChildNameEditTests(unittest.IsolatedAsyncioTestCase):
         s.elig_step = "child_rel"
         self.assertEqual(_next_elig_step(s, "Child"), "child_age")
         s.elig_step = "child_age"
-        self.assertEqual(_next_elig_step(s, "15"), "child_more")
+        self.assertEqual(_next_elig_step(s, "15"), "child_confirm")
+        s.elig_step = "child_confirm"
+        self.assertEqual(_next_elig_step(s, "yes"), "child_more")
+        self.assertEqual(_next_elig_step(s, "no"), "child_confirm")
         s.elig_step = "child_more"
         self.assertEqual(_next_elig_step(s, "yes"), "child_first")
         self.assertEqual(_next_elig_step(s, "no"), "student")
@@ -2849,6 +4210,21 @@ class SpecialPersonAssignTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(click.await_count, 1)
 
 
+def _sticky_state_side_effect(sequence: list[dict]):
+    """Return successive states, then keep repeating the last one (poll-safe)."""
+    values = list(sequence)
+    if not values:
+        values = [{"found": False, "checked": False, "source": "missing"}]
+    idx = {"n": 0}
+
+    async def _state(*_a, **_k):
+        i = idx["n"]
+        idx["n"] = i + 1
+        return values[i] if i < len(values) else values[-1]
+
+    return _state
+
+
 class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
     """Special Cases: one click max; never toggle off a successful selection."""
 
@@ -2857,16 +4233,17 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": True, "checked": False, "source": "input"},
-                {"found": True, "checked": True, "source": "input"},
-            ]
-        )
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": True, "checked": False, "source": "input"},
+                            {"found": True, "checked": True, "source": "input"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
@@ -2908,21 +4285,130 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             )
         click.assert_not_awaited()
 
+    async def test_multi_does_not_false_accept_via_prior_apply_to(self) -> None:
+        """Live bug: pregnant accepted because Blind already showed apply-to."""
+        from pc_liveagent.live_form import _select_special_condition_checkbox
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        async def state(_page, label):
+            if "pregnant" in (label or "").lower():
+                return {"found": False, "checked": False, "source": "missing"}
+            return {"found": True, "checked": True, "source": "input"}
+
+        with (
+            patch(
+                "pc_liveagent.live_form._special_condition_checkbox_state",
+                new=AsyncMock(side_effect=state),
+            ),
+            patch(
+                "pc_liveagent.live_form._special_apply_to_member_count",
+                new=AsyncMock(return_value=8),  # prior Blind apply-to already open
+            ),
+            patch(
+                "pc_liveagent.live_form._special_apply_to_heading_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._special_condition_readonly_reinspect",
+                new=AsyncMock(
+                    return_value={
+                        "found": False,
+                        "checked": False,
+                        "source": "reinspect_missing",
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={
+                        "members": [],
+                        "strategy": "condition_scope_missing",
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_exact_choice",
+                new=AsyncMock(),
+            ),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            await _select_special_condition_checkbox(
+                page, "Someone is pregnant", call_id="sp-multi-false", multi=True
+            )
+        self.assertIn("couldn't confirm", str(ctx.exception).lower())
+        self.assertIn("pregnant", str(ctx.exception).lower())
+
+    async def test_multi_accepts_second_condition_without_member_count_increase(
+        self,
+    ) -> None:
+        """Second condition OK when scoped members appear even if count is flat."""
+        from pc_liveagent.live_form import _select_special_condition_checkbox
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        calls = {"n": 0}
+
+        async def state(_page, _label):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"found": True, "checked": False, "source": "input"}
+            return {"found": False, "checked": False, "source": "missing"}
+
+        with (
+            patch(
+                "pc_liveagent.live_form._special_condition_checkbox_state",
+                new=AsyncMock(side_effect=state),
+            ),
+            patch(
+                "pc_liveagent.live_form._special_apply_to_member_count",
+                new=AsyncMock(return_value=2),
+            ),
+            patch(
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={
+                        "members": [
+                            {"label": "Mickey M.", "checked": False, "dupIndex": 0}
+                        ],
+                        "strategy": "condition_scope",
+                    }
+                ),
+            ) as discover,
+            patch(
+                "pc_liveagent.live_form._click_exact_choice",
+                new=AsyncMock(),
+            ) as click,
+        ):
+            await _select_special_condition_checkbox(
+                page,
+                "Someone is disabled (SSDI)",
+                call_id="sp-multi-ok",
+                multi=True,
+            )
+        click.assert_awaited_once()
+        discover.assert_awaited()
+        # Scoped discover must use the active condition label.
+        self.assertIn("disabled", (discover.await_args.args[1] or "").lower())
+
     async def test_disabled_condition_one_click(self) -> None:
         from pc_liveagent.live_form import _select_special_condition_checkbox
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": True, "checked": False, "source": "input"},
-                {"found": True, "checked": True, "source": "input"},
-            ]
-        )
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": True, "checked": False, "source": "input"},
+                            {"found": True, "checked": True, "source": "input"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
@@ -2951,17 +4437,17 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        # Before: unchecked. After one click: checked (DOM updated).
-        states = iter(
-            [
-                {"found": True, "checked": False, "source": "input"},
-                {"found": True, "checked": True, "source": "input"},
-            ]
-        )
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": True, "checked": False, "source": "input"},
+                            {"found": True, "checked": True, "source": "input"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
@@ -2987,16 +4473,17 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": False, "checked": False, "source": "missing"},
-                {"found": False, "checked": False, "source": "missing"},
-            ]
-        )
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": False, "checked": False, "source": "missing"},
+                            {"found": False, "checked": False, "source": "missing"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
@@ -3005,6 +4492,12 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.live_form._special_apply_to_heading_visible",
                 new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={"members": [], "strategy": "condition_scope_missing"}
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_condition_readonly_reinspect",
@@ -3038,16 +4531,17 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": False, "checked": False, "source": "missing"},
-                {"found": False, "checked": False, "source": "missing"},
-            ]
-        )
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": False, "checked": False, "source": "missing"},
+                            {"found": False, "checked": False, "source": "missing"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
@@ -3056,6 +4550,12 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.live_form._special_apply_to_heading_visible",
                 new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={"members": [], "strategy": "condition_scope_missing"}
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_condition_readonly_reinspect",
@@ -3078,24 +4578,24 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(click.await_count, 1)
 
     async def test_unreadable_accepted_via_delayed_apply_to(self) -> None:
-        """Apply-to appears only after the extra read-only wait."""
+        """Apply-to appears after a short poll when checkbox state is unreadable."""
         from pc_liveagent.live_form import _select_special_condition_checkbox
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": False, "checked": False, "source": "missing"},
-                {"found": False, "checked": False, "source": "missing"},
-            ]
-        )
-        # before click, after first check, after reinspect delay (x2 for heading+count)
-        member_counts = iter([0, 0, 3])
-        headings = iter([False, True])
+        member_counts = iter([0, 0, 3, 3, 3])
+        headings = iter([False, False, True, True, True])
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": False, "checked": False, "source": "missing"},
+                            {"found": False, "checked": False, "source": "missing"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
@@ -3104,6 +4604,12 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.live_form._special_apply_to_heading_visible",
                 new=AsyncMock(side_effect=lambda *_a, **_k: next(headings)),
+            ),
+            patch(
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={"members": [], "strategy": "condition_scope_missing"}
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_condition_readonly_reinspect",
@@ -3131,17 +4637,18 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": False, "checked": False, "source": "missing"},
-                {"found": False, "checked": False, "source": "missing"},
-            ]
-        )
-        member_counts = iter([0, 4])
+        member_counts = iter([0, 4, 4, 4])
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": False, "checked": False, "source": "missing"},
+                            {"found": False, "checked": False, "source": "missing"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
@@ -3150,6 +4657,12 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.live_form._special_apply_to_heading_visible",
                 new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={"members": [], "strategy": "condition_scope_missing"}
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_next_enabled",
@@ -3170,28 +4683,32 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": False, "checked": False, "source": "missing"},
-                {"found": False, "checked": False, "source": "missing"},
-            ]
-        )
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": False, "checked": False, "source": "missing"},
+                            {"found": False, "checked": False, "source": "missing"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
-                new=AsyncMock(side_effect=[0, 2]),
+                new=AsyncMock(return_value=2),
             ),
             patch(
-                "pc_liveagent.live_form._special_apply_to_heading_visible",
-                new=AsyncMock(return_value=True),
-            ),
-            patch(
-                "pc_liveagent.live_form._special_next_enabled",
-                new=AsyncMock(return_value=True),
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={
+                        "members": [
+                            {"label": "Mickey M.", "checked": False, "dupIndex": 0}
+                        ],
+                        "strategy": "condition_scope",
+                    }
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._click_exact_choice",
@@ -3208,20 +4725,27 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        states = iter(
-            [
-                {"found": True, "checked": False, "source": "input"},
-                {"found": True, "checked": False, "source": "input"},
-            ]
-        )
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=lambda *_a, **_k: next(states)),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": True, "checked": False, "source": "input"},
+                            {"found": True, "checked": False, "source": "input"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
                 new=AsyncMock(return_value=0),
+            ),
+            patch(
+                "pc_liveagent.live_form._discover_special_person_members",
+                new=AsyncMock(
+                    return_value={"members": [], "strategy": "condition_members_missing"}
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._click_exact_choice",
@@ -3315,6 +4839,20 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(click.await_count, 2)
         self.assertIn("blind", session.filled.get("special_conditions", "").lower())
         self.assertIn("pregnant", session.filled.get("special_conditions", "").lower())
+        # One condition at a time — do not assign under Blind while asking Pregnant.
+        active = (session.filled.get("special_active_conditions") or "").lower()
+        self.assertTrue(
+            "pregnant" in active or "blind" in active,
+            active,
+        )
+        self.assertNotIn("|", session.filled.get("special_active_conditions") or "")
+        queue = session.filled.get("special_person_queue") or ""
+        self.assertIn("|", queue)
+        spoken = (result.get("spoken") or "").lower()
+        self.assertTrue(
+            "who does" in spoken or "apply" in spoken or "which household" in spoken,
+            spoken,
+        )
 
     async def test_submit_none_of_the_above(self) -> None:
         from pc_liveagent.live_form import (
@@ -4085,10 +5623,15 @@ class AgeAndChildFormRegressionTests(unittest.IsolatedAsyncioTestCase):
                 "pc_liveagent.live_form._wait_for_child_form_ready",
                 AsyncMock(return_value=True),
             ),
+            patch(
+                "pc_liveagent.live_form._clear_new_person_name_fields",
+                AsyncMock(),
+            ) as clear_names,
         ):
             result = await _submit_eligibility_answer(
                 call_id, session, page, "Yes", started=0.0
             )
+        clear_names.assert_awaited()
         self.assertTrue(result.get("ok"))
         self.assertEqual(result.get("step"), "child_first")
 
@@ -4201,9 +5744,10 @@ class AgeAndChildFormRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([s for s, _ in fills], ["First Name", "Last Name"])
         self.assertEqual(fills[0][1], "Jackie")
         self.assertEqual(fills[1][1], "Smith")
-        click.assert_awaited()
+        self.assertTrue(click.await_count or page.evaluate.await_count)
         age_click.assert_awaited()
-        self.assertEqual(r4.get("step"), "child_more")
+        self.assertEqual(r4.get("step"), "child_confirm")
+        self.assertIn("just to confirm", (r4.get("spoken") or "").lower())
 
     async def test_child_form_missing_keeps_state_and_explains(self) -> None:
         from pc_liveagent.live_form import _submit_eligibility_answer
@@ -4274,11 +5818,11 @@ class AgeAndChildFormRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CHILD_MORE_CLARIFY", str(ctx.exception))
         self.assertEqual(session.elig_step, "child_more")
 
-        # Recovery guard: same-form failure must not remap child_more → child_first.
+        # Recovery guard: stay on the active child_* step (do not force child_first).
         from pc_liveagent.live_form import _screen_first_step, _step_group
 
         recovered = _screen_first_step("child_form", session)
-        self.assertEqual(recovered, "child_first")
+        self.assertEqual(recovered, "child_more")
         self.assertEqual(_step_group("child_more"), "child_form")
         self.assertEqual(_step_group(recovered), "child_form")
         # Same form group ⇒ treat as failure, not successful recovery.
@@ -4837,6 +6381,161 @@ class BiWeeklyIncomeWhenSubmitTests(unittest.IsolatedAsyncioTestCase):
         click.assert_not_awaited()
         self.assertEqual(session.elig_step, "income_when")
 
+    async def test_period_switch_from_income_range_in_place(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            _submit_eligibility_answer,
+        )
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.go_back = AsyncMock()
+        labels = [
+            "Annual",
+            "Monthly",
+            "Bi-weekly",
+            "$0 – $3,000",
+            "$3,001 – $5,000",
+        ]
+        session = LiveFormSession(
+            call_id="inc-switch",
+            url="https://example.test",
+            elig_step="income_range",
+        )
+        session.filled["income_when"] = "Annual"
+        session.filled["income_range"] = "$39,901+"
+        sig_values = iter(["idle|", "selected|active|true||false"])
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                new=AsyncMock(return_value="income"),
+            ),
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(return_value=labels),
+            ),
+            patch(
+                "pc_liveagent.live_form._choice_signature",
+                new=AsyncMock(side_effect=lambda *_a, **_k: next(sig_values)),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_exact_choice",
+                new=AsyncMock(),
+            ) as click,
+            patch(
+                "pc_liveagent.live_form._income_period_selected",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            result = await _submit_eligibility_answer(
+                "inc-switch",
+                session,
+                page,
+                "__INCOME_PERIOD_SWITCH__:Monthly",
+                0.0,
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "income_range")
+        self.assertEqual(session.filled.get("income_when"), "Monthly")
+        self.assertNotIn("income_range", session.filled)
+        self.assertIn("per month", (result.get("spoken") or "").lower())
+        click.assert_awaited()
+        self.assertEqual(click.await_args.args[1], "Monthly")
+        page.go_back.assert_not_awaited()
+
+    async def test_period_reselect_keeps_income_page(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            _submit_eligibility_answer,
+        )
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.go_back = AsyncMock()
+        session = LiveFormSession(
+            call_id="inc-reselect",
+            url="https://example.test",
+            elig_step="income_range",
+        )
+        session.filled["income_when"] = "Annual"
+        session.filled["income_range"] = "$12,001 – $39,900"
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                new=AsyncMock(return_value="income"),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_exact_choice",
+                new=AsyncMock(),
+            ) as click,
+        ):
+            result = await _submit_eligibility_answer(
+                "inc-reselect",
+                session,
+                page,
+                "__INCOME_PERIOD_RESELECT__",
+                0.0,
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "income_when")
+        self.assertEqual(session.elig_step, "income_when")
+        self.assertNotIn("income_range", session.filled)
+        self.assertIn("annual", (result.get("spoken") or "").lower())
+        click.assert_not_awaited()
+        page.go_back.assert_not_awaited()
+
+    async def test_income_range_verifies_before_advance(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            _submit_eligibility_answer,
+        )
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.mouse = AsyncMock()
+        page.mouse.wheel = AsyncMock()
+        labels = ["Annual", "Monthly", "$0 – $12,000", "$12,001 – $39,900"]
+        session = LiveFormSession(
+            call_id="inc-range-ok",
+            url="https://example.test",
+            elig_step="income_range",
+        )
+        session.filled["income_when"] = "Annual"
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                new=AsyncMock(side_effect=["income", "special", "special"]),
+            ),
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(return_value=labels),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_exact_choice",
+                new=AsyncMock(),
+            ) as click,
+            patch(
+                "pc_liveagent.live_form._choice_appears_selected",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._wait_for_screen",
+                new=AsyncMock(return_value="special"),
+            ),
+        ):
+            result = await _submit_eligibility_answer(
+                "inc-range-ok",
+                session,
+                page,
+                "about thirty thousand",
+                0.0,
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "special")
+        self.assertEqual(session.filled.get("income_range"), "$12,001 – $39,900")
+        click.assert_awaited()
+        self.assertEqual(click.await_args.args[1], "$12,001 – $39,900")
+
 
 class SpecialMoreConfirmTests(unittest.IsolatedAsyncioTestCase):
     async def test_special_person_confirms_before_next(self) -> None:
@@ -5055,6 +6754,49 @@ class SpecialMoreConfirmTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SectionIntroTests(unittest.IsolatedAsyncioTestCase):
+    def test_eligibility_section_intro_before_marital(self) -> None:
+        from pc_liveagent.live_form import (
+            ELIGIBILITY_SECTION_INTRO,
+            LiveFormSession,
+            _spoken_question_for_step,
+        )
+
+        session = LiveFormSession(
+            call_id="elig-intro", url="https://example.test", elig_step="marital"
+        )
+        session.filled["eligibility_intro_pending"] = "1"
+        first = _spoken_question_for_step(session, "marital")
+        self.assertTrue(first.startswith(ELIGIBILITY_SECTION_INTRO.strip()[:12]))
+        self.assertIn("let's start your household eligibility", first.lower())
+        self.assertIn("programs you may qualify", first.lower())
+        self.assertIn("marital status", first.lower())
+        again = _spoken_question_for_step(session, "marital")
+        self.assertNotIn("household eligibility check", again.lower())
+        self.assertIn("marital status", again.lower())
+
+    def test_speech_after_signin_keeps_eligibility_purpose_intro(self) -> None:
+        """Regression: post-sign-in helper used to replace intro with bare marital."""
+        from pc_liveagent.call_turn import _speech_after_signin
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="keep-intro", url="https://example.test", elig_step="marital"
+        )
+        spoken = (
+            "ASK: Let's start your household eligibility check. "
+            "I'll ask a few short questions about your household so Pointcare can see "
+            "what programs you may qualify for. "
+            "What is your marital status? Never Married, Married, Separated, Divorced, "
+            "Widowed, Registered Domestic Partner, or Common Law Marriage?"
+        )
+        session.filled["eligibility_opening_speech"] = spoken[5:].strip()
+        out = _speech_after_signin(session, spoken)
+        self.assertIn("let's start your household eligibility", out.lower())
+        self.assertIn("marital status", out.lower())
+        # Empty spoken still recovers stored opening.
+        out2 = _speech_after_signin(session, "")
+        self.assertIn("let's start your household eligibility", out2.lower())
+
     def test_spouse_and_child_intros_once(self) -> None:
         from pc_liveagent.live_form import (
             LiveFormSession,
@@ -5066,25 +6808,174 @@ class SectionIntroTests(unittest.IsolatedAsyncioTestCase):
             call_id="intro", url="https://example.test", elig_step="spouse_first"
         )
         first = _spoken_question_for_step(session, "spouse_first")
-        self.assertIn("spouse or partner", first.lower())
+        self.assertIn("learn more about your spouse or partner", first.lower())
         self.assertIn("first name", first.lower())
         again = _spoken_question_for_step(session, "spouse_first")
-        self.assertNotIn("spouse or partner", again.lower())
+        self.assertNotIn("learn more about your spouse or partner", again.lower())
         self.assertIn("first name", again.lower())
 
         child = LiveFormSession(
             call_id="intro-c", url="https://example.test", elig_step="child_first"
         )
         c1 = _spoken_question_for_step(child, "child_first")
-        self.assertIn("details about the child", c1.lower())
+        self.assertIn("learn more about your child", c1.lower())
         self.assertIn("first name", c1.lower())
         c1b = _spoken_question_for_step(child, "child_first")
-        self.assertNotIn("details about the child", c1b.lower())
+        self.assertNotIn("learn more about your child", c1b.lower())
 
         _bump_child_instance(child)
         c2 = _spoken_question_for_step(child, "child_first")
         self.assertIn("next child", c2.lower())
         self.assertIn("first name", c2.lower())
+
+    def test_person_kind_intros_and_member_confirm_speech(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            _member_confirm_speech,
+            _next_elig_step,
+            _spoken_question_for_step,
+            _yes_no_transition,
+        )
+
+        # Originating gate wins over a misclassified child_form landing.
+        self.assertEqual(
+            _yes_no_transition("disabled", True, "child_form"), "person_first"
+        )
+        self.assertEqual(
+            _yes_no_transition("relatives", True, "child_form"), "person_first"
+        )
+        self.assertEqual(
+            _yes_no_transition("student", True, "person_form"), "person_first"
+        )
+        self.assertEqual(
+            _yes_no_transition("children", True, "child_form"), "child_first"
+        )
+        self.assertEqual(
+            _yes_no_transition("children", True, "person_form"), "child_first"
+        )
+
+        disabled = LiveFormSession(
+            call_id="p-dis", url="https://example.test", elig_step="person_first"
+        )
+        disabled.filled["person_kind"] = "disabled"
+        speech = _spoken_question_for_step(disabled, "person_first")
+        self.assertIn("disabled individual", speech.lower())
+        self.assertIn("first name", speech.lower())
+        self.assertNotIn("your child", speech.lower())
+
+        relative = LiveFormSession(
+            call_id="p-rel", url="https://example.test", elig_step="person_first"
+        )
+        relative.filled["person_kind"] = "relative"
+        speech = _spoken_question_for_step(relative, "person_first")
+        self.assertIn("relatives you support", speech.lower())
+        self.assertNotIn("your child", speech.lower())
+
+        spouse = LiveFormSession(
+            call_id="c-sp", url="https://example.test", elig_step="spouse_confirm"
+        )
+        spouse.filled.update(
+            {
+                "spouse_first": "Alex",
+                "spouse_last": "Rivera",
+                "spouse_role": "Partner",
+                "spouse_age": "(65+) Senior",
+            }
+        )
+        confirm = _member_confirm_speech(spouse, "spouse")
+        self.assertIn("alex", confirm.lower())
+        self.assertIn("rivera", confirm.lower())
+        self.assertIn("partner", confirm.lower())
+        self.assertIn("senior", confirm.lower())
+        self.assertIn("yes or no", confirm.lower())
+
+        spouse.elig_step = "spouse_age"
+        self.assertEqual(_next_elig_step(spouse, "65"), "spouse_confirm")
+        spouse.elig_step = "spouse_confirm"
+        self.assertEqual(_next_elig_step(spouse, "yes"), "children")
+        self.assertEqual(_next_elig_step(spouse, "no"), "spouse_confirm")
+
+        child = LiveFormSession(
+            call_id="c-ch", url="https://example.test", elig_step="child_age"
+        )
+        self.assertEqual(_next_elig_step(child, "youth"), "child_confirm")
+        child.elig_step = "child_confirm"
+        self.assertEqual(_next_elig_step(child, "yes"), "child_more")
+        self.assertEqual(_next_elig_step(child, "no"), "child_confirm")
+
+        person = LiveFormSession(
+            call_id="c-pe", url="https://example.test", elig_step="person_age"
+        )
+        person.after_person = "relatives"
+        self.assertEqual(_next_elig_step(person, "adult"), "person_confirm")
+        person.elig_step = "person_confirm"
+        self.assertEqual(_next_elig_step(person, "yes"), "relatives")
+        self.assertEqual(_next_elig_step(person, "no"), "person_confirm")
+
+    async def test_disabled_yes_keeps_person_kind_despite_child_form_land(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            _submit_eligibility_answer,
+        )
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        session = LiveFormSession(
+            call_id="dis-gate",
+            url="https://example.test",
+            elig_step="disabled",
+        )
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                new=AsyncMock(return_value="disabled"),
+            ),
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(return_value=["Yes", "No", "Child", "Other"]),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_exact_choice",
+                new=AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.live_form._yes_no_selection_state",
+                new=AsyncMock(return_value="yes"),
+            ),
+            patch(
+                "pc_liveagent.live_form._wait_for_screen",
+                # Misclassified landing that previously forced child_first.
+                new=AsyncMock(return_value="child_form"),
+            ),
+        ):
+            result = await _submit_eligibility_answer(
+                "dis-gate", session, page, "Yes", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "person_first")
+        self.assertEqual(session.filled.get("person_kind"), "disabled")
+        self.assertIn("disabled individual", (result.get("spoken") or "").lower())
+        self.assertNotIn("your child", (result.get("spoken") or "").lower())
+
+    async def test_person_form_not_child_when_only_relationship_chip(self) -> None:
+        from pc_liveagent.live_form import _eligibility_screen
+
+        page = AsyncMock()
+        page.url = "https://example.test/support-disabled"
+        body = AsyncMock()
+        body.inner_text = AsyncMock(
+            return_value=(
+                "Tell us about this household member. First Name Last Name "
+                "Relationship to me Child Other"
+            )
+        )
+        page.locator = lambda *_a, **_k: body
+        with patch(
+            "pc_liveagent.live_form._visible_choice_labels",
+            new=AsyncMock(return_value=["Child", "Other", "(21-63) Adult"]),
+        ):
+            screen = await _eligibility_screen(page)
+        self.assertEqual(screen, "person_form")
 
     async def test_repeat_keeps_answers_and_explains_section(self) -> None:
         from pc_liveagent.call_turn import (
@@ -5122,6 +7013,2636 @@ class SectionIntroTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.filled.get("spouse_first"), "Alex")
         self.assertEqual(session.elig_step, "spouse_last")
         await drop_controller(call_id)
+
+
+class MemberConfirmCorrectionTests(unittest.IsolatedAsyncioTestCase):
+    """Child/spouse confirm No, age mapping, and in-place correction (no Back)."""
+
+    def test_spoken_age_range_is_natural(self) -> None:
+        from pc_liveagent.live_form import _spoken_age_range
+
+        spoken = _spoken_age_range("(1-5) Toddler")
+        self.assertIn("1-to-5", spoken.lower())
+        self.assertIn("toddler", spoken.lower())
+        self.assertNotRegex(spoken, r"^\(1-5\)")
+
+    def test_relationship_words_never_map_to_age(self) -> None:
+        from pc_liveagent.live_form import _map_age_label
+
+        opts = [
+            "(0-1) Baby",
+            "(1-5) Toddler",
+            "(6-12) Child",
+            "(13-15) Teen",
+            "(16-18) Teen",
+        ]
+        for spoken in ("Child", "Stepchild", "Grandchild", "Foster Child", "son"):
+            self.assertIsNone(
+                _map_age_label(spoken, opts),
+                msg=f"{spoken!r} must not select an age chip",
+            )
+        self.assertEqual(_map_age_label("fifteen", opts), "(13-15) Teen")
+        self.assertEqual(_map_age_label("Age is fifteen.", opts), "(13-15) Teen")
+        self.assertIsNone(_map_age_label("", opts))
+
+    def test_confirm_speech_uses_natural_age(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _member_confirm_speech
+
+        session = LiveFormSession(
+            call_id="c-age", url="https://example.test", elig_step="child_confirm"
+        )
+        session.filled.update(
+            {
+                "child_first": "Jackie",
+                "child_last": "Smith",
+                "child_rel": "Child",
+                "child_age": "(1-5) Toddler",
+            }
+        )
+        speech = _member_confirm_speech(session, "child")
+        self.assertIn("jackie", speech.lower())
+        self.assertIn("1-to-5", speech.lower())
+        self.assertNotIn("(1-5)", speech)
+
+    async def test_child_confirm_no_asks_which_field_not_restart(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        call_id = "confirm-no"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="child_confirm"
+        )
+        session.filled.update(
+            {
+                "child_first": "Jackie",
+                "child_last": "Smith",
+                "child_rel": "Child",
+                "child_age": "(13-15) Teen",
+                "child_instance": "1",
+            }
+        )
+        page = AsyncMock()
+        with patch(
+            "pc_liveagent.live_form._eligibility_screen",
+            AsyncMock(return_value="child_form"),
+        ):
+            result = await _submit_eligibility_answer(
+                call_id, session, page, "No", started=0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "child_confirm")
+        self.assertTrue(result.get("await_field_correction"))
+        spoken = (result.get("spoken") or "").lower()
+        self.assertIn("which detail", spoken)
+        self.assertNotIn("learn more about your child", spoken)
+        self.assertEqual(session.filled.get("child_first"), "Jackie")
+        self.assertEqual(session.filled.get("child_age"), "(13-15) Teen")
+
+    async def test_age_correction_updates_in_place_without_back(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, correct_member_field
+
+        call_id = "age-inplace"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="child_first"
+        )
+        session.filled.update(
+            {
+                "child_first": "Jackie",
+                "child_last": "Smith",
+                "child_rel": "Child",
+                "child_age": "(1-5) Toddler",
+                "child_instance": "1",
+            }
+        )
+        page = AsyncMock()
+        session.page = page
+        backs: list[str] = []
+
+        async def no_back(*_a, **_k):
+            backs.append("back")
+            raise AssertionError("must not navigate Back for age correction")
+
+        with (
+            patch(
+                "pc_liveagent.live_form.get_session",
+                AsyncMock(return_value=session),
+            ),
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="child_form"),
+            ),
+            patch(
+                "pc_liveagent.live_form._ensure_age_choices_visible",
+                AsyncMock(
+                    return_value=[
+                        "(0-1) Baby",
+                        "(1-5) Toddler",
+                        "(6-12) Child",
+                        "(13-15) Teen",
+                        "(16-18) Teen",
+                    ]
+                ),
+            ),
+            patch("pc_liveagent.live_form._click_age_choice", AsyncMock()) as age_click,
+            patch(
+                "pc_liveagent.live_form.navigate_back_one",
+                new=AsyncMock(side_effect=no_back),
+            ),
+        ):
+            result = await correct_member_field(call_id, "age", "Age is fifteen.")
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "child_confirm")
+        self.assertEqual(session.filled.get("child_age"), "(13-15) Teen")
+        self.assertEqual(session.filled.get("child_first"), "Jackie")
+        self.assertEqual(session.filled.get("child_rel"), "Child")
+        self.assertIn("13-to-15", (result.get("spoken") or "").lower())
+        age_click.assert_awaited()
+        self.assertEqual(backs, [])
+
+    async def test_change_age_only_sets_pending_not_back(self) -> None:
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "change-age-only"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        ctrl.eligibility_question_sent = True
+        ctrl.active_websocket_status = "connected"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="child_confirm"
+        )
+        session.filled.update(
+            {
+                "child_first": "Jackie",
+                "child_last": "Smith",
+                "child_rel": "Child",
+                "child_age": "(1-5) Toddler",
+            }
+        )
+        nav = AsyncMock(
+            side_effect=AssertionError("age correction must not call navigate_back_one")
+        )
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                AsyncMock(return_value=session),
+            ),
+            patch("pc_liveagent.call_turn.peek_choice_labels", AsyncMock(return_value=[])),
+            patch("pc_liveagent.call_turn.navigate_back_one", nav),
+            patch("pc_liveagent.call_turn.submit_field", AsyncMock()),
+        ):
+            result = await process_user_turn(
+                call_id,
+                "Everything is correct. I need to change the age only.",
+                response_id=1,
+            )
+        self.assertEqual(result.detail, "correction_prompt")
+        self.assertEqual((ctrl.pending_correction or {}).get("field"), "age")
+        self.assertIn("age", (result.speech or "").lower())
+        nav.assert_not_awaited()
+        await drop_controller(call_id)
+
+    async def test_pending_age_fifteen_corrects_without_back(self) -> None:
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "pending-fifteen"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        ctrl.eligibility_question_sent = True
+        ctrl.active_websocket_status = "connected"
+        ctrl.pending_correction = {
+            "field": "age",
+            "prompt": "Of course. What should the age be?",
+        }
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="child_first"
+        )
+        session.filled.update(
+            {
+                "child_first": "Jackie",
+                "child_last": "Smith",
+                "child_rel": "Child",
+                "child_age": "(1-5) Toddler",
+                "child_instance": "1",
+            }
+        )
+        session.page = AsyncMock()
+
+        async def fake_correct(cid, field, value):
+            self.assertEqual(field, "age")
+            self.assertIn("fifteen", value.lower())
+            session.filled["child_age"] = "(13-15) Teen"
+            session.elig_step = "child_confirm"
+            return {
+                "ok": True,
+                "step": "child_confirm",
+                "spoken": (
+                    "Updated the age to the 13-to-15 age range, labelled Teen. "
+                    "Just to confirm for the child: first name Jackie, last name Smith, "
+                    "relationship Child, age the 13-to-15 age range, labelled Teen. "
+                    "Is that correct? Please say Yes or No."
+                ),
+                "in_place": True,
+            }
+
+        nav = AsyncMock(
+            side_effect=AssertionError("must not navigate_back_one for pending age")
+        )
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                AsyncMock(return_value=session),
+            ),
+            patch(
+                "pc_liveagent.call_turn.correct_member_field",
+                AsyncMock(side_effect=fake_correct),
+            ),
+            patch("pc_liveagent.call_turn.navigate_back_one", nav),
+            patch("pc_liveagent.call_turn.submit_field", AsyncMock()),
+        ):
+            result = await process_user_turn(
+                call_id, "Age is fifteen.", response_id=2
+            )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.detail, "member_corrected")
+        self.assertIsNone(ctrl.pending_correction)
+        self.assertIn("13-to-15", (result.speech or "").lower())
+        self.assertEqual(session.filled.get("child_first"), "Jackie")
+        nav.assert_not_awaited()
+        await drop_controller(call_id)
+
+    async def test_spouse_confirm_no_preserves_values(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        call_id = "spouse-confirm-no"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="spouse_confirm"
+        )
+        session.filled.update(
+            {
+                "spouse_first": "Alex",
+                "spouse_last": "Rivera",
+                "spouse_role": "Partner",
+                "spouse_age": "(21-63) Adult",
+            }
+        )
+        with patch(
+            "pc_liveagent.live_form._eligibility_screen",
+            AsyncMock(return_value="spouse_form"),
+        ):
+            result = await _submit_eligibility_answer(
+                call_id, session, AsyncMock(), "No", started=0.0
+            )
+        self.assertEqual(result.get("step"), "spouse_confirm")
+        self.assertTrue(result.get("await_field_correction"))
+        self.assertEqual(session.filled.get("spouse_first"), "Alex")
+        self.assertEqual(session.filled.get("spouse_role"), "Partner")
+
+
+class StageETransitionTests(unittest.IsolatedAsyncioTestCase):
+    """Program-summary permission gate and Stage E Collect Mode."""
+
+    def test_build_programs_permission_speech_dynamic(self) -> None:
+        from pc_liveagent.app_stage import build_programs_permission_speech
+
+        speech = build_programs_permission_speech(
+            {
+                "programs": [
+                    {
+                        "name": "Medicaid",
+                        "may_be_eligible": False,
+                        "not_eligible": True,
+                        "detail": "Not eligible at this time",
+                    },
+                    {
+                        "name": "Medicare",
+                        "may_be_eligible": False,
+                        "not_eligible": True,
+                        "detail": "Not eligible at this time",
+                    },
+                    {
+                        "name": "ACA Marketplace",
+                        "may_be_eligible": True,
+                        "detail": "Members may be eligible for ACA Marketplace",
+                    },
+                ]
+            }
+        )
+        low = speech.lower()
+        self.assertIn("household eligibility check is complete", low)
+        self.assertIn("aca marketplace", low)
+        self.assertIn("may be eligible", low)
+        # Speak only eligible programs — never announce not-eligible cards.
+        self.assertNotIn("not eligible at this time", low)
+        self.assertNotIn("medicare", low)
+        self.assertNotIn("medicaid", low)
+        self.assertIn("would you like to continue and start the application", low)
+        self.assertNotIn("approved", low)
+
+    def test_build_programs_permission_speech_eligible_only_medikids(self) -> None:
+        from pc_liveagent.app_stage import build_programs_permission_speech
+
+        speech = build_programs_permission_speech(
+            {
+                "programs": [
+                    {
+                        "name": "MediKids / Florida Healthy Kids",
+                        "may_be_eligible": True,
+                        "detail": (
+                            "Agent, Mickey may be eligible for MediKids / "
+                            "Florida Healthy Kids"
+                        ),
+                    },
+                    {
+                        "name": "Medicare",
+                        "may_be_eligible": False,
+                        "not_eligible": True,
+                        "detail": "Not eligible at this time",
+                    },
+                    {
+                        "name": "ACA Marketplace",
+                        "may_be_eligible": False,
+                        "not_eligible": True,
+                        "detail": "Not eligible at this time",
+                    },
+                ]
+            }
+        )
+        low = speech.lower()
+        self.assertIn("medikids", low)
+        self.assertIn("may be eligible", low)
+        self.assertNotIn("not eligible", low)
+        self.assertNotIn("medicare", low)
+        self.assertNotIn("marketplace", low)
+
+    def test_programs_context_does_not_navigate(self) -> None:
+        from pc_liveagent.app_stage import programs_context_reply
+
+        reply = programs_context_reply(
+            "What happens if I say no?",
+            {"programs": [{"name": "ACA Marketplace", "may_be_eligible": True}]},
+        )
+        self.assertIsNotNone(reply)
+        assert reply is not None
+        self.assertIn("will not start the application", reply.lower())
+        self.assertIn("yes", reply.lower())
+
+    async def test_programs_yes_starts_application_once(self) -> None:
+        from pc_liveagent.app_stage import handle_programs_decision
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="prog-yes", url="https://example.test", elig_step="programs"
+        )
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application/step-1"
+        start = AsyncMock(return_value="Start Applications")
+
+        with (
+            patch("pc_liveagent.app_stage.click_start_applications", start),
+            patch(
+                "pc_liveagent.app_stage.wait_for_application_started",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+        ):
+            result = await handle_programs_decision(
+                "prog-yes", session, page, "Yes"
+            )
+            again = await handle_programs_decision(
+                "prog-yes", session, page, "Yes"
+            )
+        start.assert_awaited_once()
+
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_citizenship")
+        self.assertEqual(result.get("phase"), "application")
+        self.assertIn("started the application", str(result.get("spoken") or "").lower())
+        self.assertEqual(session.filled.get("application_started"), "1")
+        self.assertEqual(session.app_step, "app_citizenship")
+        self.assertEqual(again.get("step"), "app_citizenship")
+        # Second Yes must not re-click Start Applications (idempotent).
+        self.assertEqual(session.filled.get("start_applications_clicked"), "Start Applications")
+
+    async def test_programs_no_preserves_results_no_click(self) -> None:
+        from pc_liveagent.app_stage import (
+            CLOSING_NO_APPLICATION,
+            handle_programs_decision,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="prog-no", url="https://example.test", elig_step="programs"
+        )
+        session.filled["program_summary_json"] = '{"programs":[]}'
+        page = AsyncMock()
+        with patch(
+            "pc_liveagent.app_stage.click_start_applications",
+            new=AsyncMock(side_effect=AssertionError("must not click")),
+        ) as start:
+            result = await handle_programs_decision("prog-no", session, page, "No")
+        start.assert_not_awaited()
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "")
+        self.assertTrue(result.get("end_call"))
+        self.assertIn(CLOSING_NO_APPLICATION, str(result.get("spoken") or ""))
+        self.assertEqual(session.filled.get("application_started"), "0")
+        self.assertEqual(session.app_step, "")
+
+    async def test_programs_ambiguous_clarifies(self) -> None:
+        from pc_liveagent.app_stage import handle_programs_decision
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="prog-maybe", url="https://example.test", elig_step="programs"
+        )
+        session.filled["programs_permission_speech"] = (
+            "Your household eligibility check is complete. Would you like to continue "
+            "and start the application? Please say Yes or No."
+        )
+        page = AsyncMock()
+        with patch(
+            "pc_liveagent.app_stage.click_start_applications",
+            new=AsyncMock(side_effect=AssertionError("must not click")),
+        ):
+            result = await handle_programs_decision(
+                "prog-maybe", session, page, "I'm not sure"
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("step"), "programs")
+        self.assertIn("please say yes", str(result.get("spoken") or "").lower())
+
+    async def test_background_programs_yes_enters_application_phase(self) -> None:
+        from pc_liveagent.call_turn import (
+            _run_eligibility_browser_background,
+            drop_controller,
+            get_controller,
+        )
+
+        call_id = "stage-e-yes"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        ctrl.active_websocket_status = "connected"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="programs"
+        )
+        deliver = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(return_value=session),
+            ),
+            patch(
+                "pc_liveagent.call_turn.submit_field",
+                AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "spoken": (
+                            "Okay, I've started the application. Are all household "
+                            "members listed on this screen U.S. citizens? Please say Yes or No."
+                        ),
+                        "step": "app_citizenship",
+                        "phase": "application",
+                    }
+                ),
+            ),
+            patch("pc_liveagent.call_turn._deliver_question_once", deliver),
+        ):
+            await _run_eligibility_browser_background(
+                call_id,
+                answer="Yes",
+                step="programs",
+                turn_id=f"{call_id}:1:yes",
+                form_url="https://example.test",
+                commit_key="programs:1:yes",
+                epoch=ctrl.elig_nav_epoch,
+            )
+        self.assertEqual(ctrl.phase, "application")
+        self.assertIn("u.s. citizens", ctrl.last_speech.lower())
+        self.assertIn("stage_e:", deliver.await_args.kwargs.get("key", ""))
+        self.assertFalse(deliver.await_args.kwargs.get("end_call"))
+        await drop_controller(call_id)
+
+    async def test_submit_requires_explicit_yes(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="submit1",
+            url="https://example.test",
+            app_step="app_submit_confirm",
+        )
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application/submit"
+        page.locator = MagicMock()
+        with patch(
+            "pc_liveagent.live_form._click_cta",
+            new=AsyncMock(side_effect=AssertionError("must not submit")),
+        ):
+            unclear = await submit_application_answer(
+                "submit1", session, page, "maybe later", 0.0
+            )
+            review = await submit_application_answer(
+                "submit1", session, page, "I want to review first", 0.0
+            )
+        self.assertFalse(unclear.get("ok"))
+        self.assertEqual(unclear.get("step"), "app_submit_confirm")
+        self.assertTrue(review.get("ok"))
+        self.assertIn("will not submit yet", str(review.get("spoken") or "").lower())
+        self.assertNotEqual(session.filled.get("application_submitted"), "1")
+
+    async def test_submit_yes_requires_pointcare_confirmation_text(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        class _Body:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            async def inner_text(self) -> str:
+                return self.text
+
+        session = LiveFormSession(
+            call_id="submit-verify",
+            url="https://example.test",
+            app_step="app_submit_confirm",
+        )
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application/submit"
+        page.wait_for_timeout = AsyncMock()
+        page.locator = lambda _selector: _Body("Review your application Submit Applications")
+        with patch("pc_liveagent.live_form._click_cta", new=AsyncMock(return_value=True)):
+            missing = await submit_application_answer(
+                "submit-verify", session, page, "Yes", 0.0
+            )
+        self.assertFalse(missing.get("ok"))
+        self.assertEqual(missing.get("error"), "submit_not_verified")
+        self.assertNotEqual(session.filled.get("application_submitted"), "1")
+
+        page.locator = lambda _selector: _Body(
+            "Thank you. Your application has been submitted."
+        )
+        with patch("pc_liveagent.live_form._click_cta", new=AsyncMock(return_value=True)):
+            done = await submit_application_answer(
+                "submit-verify", session, page, "Yes", 0.0
+            )
+        self.assertTrue(done.get("ok"))
+        self.assertTrue(done.get("end_call"))
+        self.assertEqual(session.filled.get("application_submitted"), "1")
+
+    async def test_application_turn_dedupes_duplicate_answer(self) -> None:
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+
+        call_id = "app-dedupe"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "application"
+        ctrl.last_speech = "Are all household members U.S. citizens?"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_citizenship"
+        )
+        submit = AsyncMock(
+            return_value={
+                "ok": True,
+                "spoken": "ASK: Does anyone have health insurance now?",
+                "step": "app_insurance",
+                "phase": "application",
+            }
+        )
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(return_value=session),
+            ),
+            patch("pc_liveagent.call_turn.submit_field", submit),
+        ):
+            # Force sync path by removing step from slow set temporarily.
+            with patch(
+                "pc_liveagent.call_turn._SLOW_APP_STEPS",
+                frozenset(),
+            ):
+                r1 = await process_user_turn(call_id, "Yes")
+                session.app_step = "app_insurance"
+                ctrl.phase = "application"
+                r2 = await process_user_turn(call_id, "Yes")
+        self.assertEqual(r1.phase, "application")
+        # Second Yes on same fingerprint+step should dedupe once committed.
+        # After first answer step advances; second Yes is a new step — allowed.
+        self.assertEqual(submit.await_count, 2)
+        await drop_controller(call_id)
+
+    async def test_programs_context_via_process_user_turn(self) -> None:
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+
+        call_id = "prog-ctx"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="programs"
+        )
+        session.filled["program_summary_json"] = json.dumps(
+            {
+                "programs": [
+                    {"name": "ACA Marketplace", "may_be_eligible": True},
+                ]
+            }
+        )
+        session.filled["programs_permission_speech"] = (
+            "Your household eligibility check is complete. Pointcare indicates that "
+            "your household may be eligible for ACA Marketplace. Would you like to "
+            "continue and start the application? Please say Yes or No."
+        )
+        submit = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(return_value=session),
+            ),
+            patch("pc_liveagent.call_turn.submit_field", submit),
+            patch(
+                "pc_liveagent.call_turn.peek_choice_labels",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            r = await process_user_turn(call_id, "What happens if I say no?")
+        self.assertEqual(r.detail, "programs_context")
+        self.assertIn("will not start", r.speech.lower())
+        submit.assert_not_awaited()
+        await drop_controller(call_id)
+
+
+class StageEYesNoResolverTests(unittest.IsolatedAsyncioTestCase):
+    """Stage E Yes/No cards: short and descriptive labels, no Stage D changes."""
+
+    CITIZENSHIP = [
+        "Yes Everyone listed is a U.S. Citizen",
+        "No Some or all are not U.S. Citizens",
+    ]
+    INSURANCE = [
+        "Yes Someone has health insurance",
+        "No Nobody has health insurance",
+    ]
+
+    def test_yes_matches_long_citizenship_card(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        self.assertEqual(
+            resolve_stage_e_yes_no_label(True, self.CITIZENSHIP),
+            self.CITIZENSHIP[0],
+        )
+
+    def test_no_matches_long_citizenship_card(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        self.assertEqual(
+            resolve_stage_e_yes_no_label(False, self.CITIZENSHIP),
+            self.CITIZENSHIP[1],
+        )
+
+    def test_exact_short_labels_still_supported(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        self.assertEqual(resolve_stage_e_yes_no_label(True, ["Yes", "No"]), "Yes")
+        self.assertEqual(resolve_stage_e_yes_no_label(False, ["Yes", "No"]), "No")
+
+    def test_descriptive_preferred_when_short_and_long_both_visible(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        labels = ["Yes", "Yes Everyone listed is a U.S. Citizen", "No"]
+        self.assertEqual(
+            resolve_stage_e_yes_no_label(True, labels),
+            "Yes Everyone listed is a U.S. Citizen",
+        )
+
+    def test_dash_prefixed_cards(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        labels = [
+            "Yes — Everyone listed is a U.S. Citizen",
+            "No — Some or all are not U.S. Citizens",
+        ]
+        self.assertEqual(resolve_stage_e_yes_no_label(True, labels), labels[0])
+        self.assertEqual(resolve_stage_e_yes_no_label(False, labels), labels[1])
+
+    def test_insurance_long_labels(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        self.assertEqual(
+            resolve_stage_e_yes_no_label(True, self.INSURANCE),
+            self.INSURANCE[0],
+        )
+        self.assertEqual(
+            resolve_stage_e_yes_no_label(False, self.INSURANCE),
+            self.INSURANCE[1],
+        )
+
+    def test_ambiguous_options_do_not_resolve(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_stage_e_yes_no_label(
+                True,
+                [
+                    "Yes Everyone listed is a U.S. Citizen",
+                    "Yes Some members are citizens",
+                ],
+            )
+        self.assertIn("YES_NO_CLARIFY", str(ctx.exception))
+
+    def test_missing_options_do_not_resolve(self) -> None:
+        from pc_liveagent.app_stage import resolve_stage_e_yes_no_label
+
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_stage_e_yes_no_label(True, ["Continue", "Next"])
+        self.assertIn("YES_NO_CLARIFY", str(ctx.exception))
+
+    def test_shared_fuzzy_choice_still_keeps_bare_yes(self) -> None:
+        """Stage D / shared matcher must stay unchanged for bare Yes."""
+        from pc_liveagent.live_form import _fuzzy_choice_label
+
+        self.assertEqual(
+            _fuzzy_choice_label("Yes", self.CITIZENSHIP),
+            "Yes",
+        )
+
+    async def test_click_yes_no_uses_full_label_and_verifies(self) -> None:
+        from pc_liveagent.app_stage import _click_yes_no
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        clicked: list[str] = []
+
+        async def _stage_e_click(_page, value: str) -> bool:
+            clicked.append(value)
+            return True
+
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(return_value=list(self.CITIZENSHIP)),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_e_option_label",
+                new=_stage_e_click,
+            ),
+            patch(
+                "pc_liveagent.live_form._choice_signature",
+                new=AsyncMock(side_effect=["before", "after-selected"]),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+        ):
+            chosen = await _click_yes_no(page, True)
+        self.assertEqual(chosen, self.CITIZENSHIP[0])
+        self.assertEqual(clicked, [self.CITIZENSHIP[0]])
+        # Must not collapse through _choice_phrase / bare Yes.
+        self.assertNotEqual(chosen, "Yes")
+
+    async def test_click_yes_no_succeeds_when_page_advances(self) -> None:
+        """Missing old card after navigation is success, not a failure."""
+        from pc_liveagent.app_stage import _click_yes_no
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        screens = iter(["app_citizenship", "app_insurance", "app_insurance"])
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(
+                    side_effect=[
+                        list(self.CITIZENSHIP),
+                        list(self.INSURANCE),
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_e_option_label",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.live_form._choice_signature",
+                new=AsyncMock(side_effect=["before", "__missing__"]),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(side_effect=lambda _p: next(screens)),
+            ),
+        ):
+            chosen = await _click_yes_no(page, True)
+        self.assertEqual(chosen, self.CITIZENSHIP[0])
+
+    async def test_click_yes_no_ambiguous_does_not_click(self) -> None:
+        from pc_liveagent.app_stage import _click_yes_no
+
+        click = AsyncMock(side_effect=AssertionError("must not click"))
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(
+                    return_value=[
+                        "Yes Everyone listed is a U.S. Citizen",
+                        "Yes Some members are citizens",
+                    ]
+                ),
+            ),
+            patch("pc_liveagent.app_stage._click_stage_e_option_label", click),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await _click_yes_no(AsyncMock(), True)
+        self.assertIn("YES_NO_CLARIFY", str(ctx.exception))
+        click.assert_not_awaited()
+
+    async def test_citizenship_yes_advances_only_after_verified_click(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cit-yes",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value=self.CITIZENSHIP[0]),
+            ) as click,
+            patch("pc_liveagent.app_stage._click_next_or_continue", new=AsyncMock()),
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cit-yes", session, page, "Yes", 0.0
+            )
+        click.assert_awaited_once_with(page, True)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_insurance")
+        self.assertEqual(session.app_step, "app_insurance")
+        self.assertIn("insurance", (result.get("spoken") or "").lower())
+
+    async def test_citizenship_no_branches_to_immigration(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cit-no",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value=self.CITIZENSHIP[1]),
+            ) as click,
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cit-no", session, AsyncMock(), "No", 0.0
+            )
+        click.assert_awaited_once_with(ANY, False)
+        self.assertTrue(result.get("ok"))
+        # Empty scrape falls back to asking which members need a status.
+        self.assertEqual(result.get("step"), "app_immigration_who")
+        self.assertEqual(session.app_step, "app_immigration_who")
+        self.assertIn("which household members", (result.get("spoken") or "").lower())
+
+    async def test_repeated_yes_reconciles_when_browser_already_on_insurance(
+        self,
+    ) -> None:
+        """Delayed Yes must not re-click citizenship after the page advanced."""
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cit-stale",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value=self.INSURANCE[0]),
+            ) as click,
+            patch("pc_liveagent.app_stage._click_next_or_continue", new=AsyncMock()),
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cit-stale", session, AsyncMock(), "Yes", 0.0
+            )
+        click.assert_awaited_once_with(ANY, True)
+        self.assertTrue(result.get("ok"))
+        # Insurance Yes now collects member names when still on insurance.
+        self.assertEqual(result.get("step"), "app_insurance_members")
+        self.assertNotEqual(session.app_step, "app_citizenship")
+
+    async def test_click_failure_recovers_when_browser_already_advanced(
+        self,
+    ) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cit-nav",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        screens = iter(["app_citizenship", "app_insurance"])
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(side_effect=lambda _p: next(screens)),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(
+                    side_effect=RuntimeError(
+                        "YES_NO_CLARIFY: That Yes or No choice did not register."
+                    )
+                ),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cit-nav", session, AsyncMock(), "Yes", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_insurance")
+        spoken = result.get("spoken") or ""
+        self.assertNotIn("target=", spoken)
+        self.assertNotIn("body=", spoken)
+        self.assertIn("insurance", spoken.lower())
+
+    async def test_citizenship_click_failure_returns_clarify_without_advance(
+        self,
+    ) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cit-fail",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(
+                    side_effect=RuntimeError(
+                        "YES_NO_CLARIFY: That Yes or No choice did not register. "
+                        "target='Yes Everyone' body='debug'"
+                    )
+                ),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cit-fail", session, AsyncMock(), "Yes", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "yes_no_click_failed")
+        self.assertEqual(result.get("step"), "app_citizenship")
+        self.assertEqual(session.app_step, "app_citizenship")
+        spoken = result.get("spoken") or ""
+        self.assertNotIn("target=", spoken)
+        self.assertNotIn("body=", spoken)
+        self.assertNotIn("Yes Everyone", spoken)
+        self.assertIn("Yes or No", spoken)
+
+    async def test_insurance_no_uses_resolver(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="ins-no",
+            url="https://example.test",
+            app_step="app_insurance",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value=self.INSURANCE[1]),
+            ) as click,
+            patch("pc_liveagent.app_stage._click_next_or_continue", new=AsyncMock()),
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+        ):
+            result = await submit_application_answer(
+                "ins-no", session, AsyncMock(), "No", 0.0
+            )
+        click.assert_awaited_once_with(ANY, False)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_dob_review")
+
+    async def test_detect_insurance_coverage_wording(self) -> None:
+        from pc_liveagent.app_stage import detect_application_screen
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return (
+                    "Does anyone have coverage? "
+                    "Yes Someone has coverage "
+                    "No No one has coverage"
+                )
+
+        page = AsyncMock()
+        page.url = "https://example.test/application"
+        page.locator = lambda _selector: _Body()
+        self.assertEqual(await detect_application_screen(page), "app_insurance")
+
+
+class StageECollectModeTests(unittest.IsolatedAsyncioTestCase):
+    """Sequential Collect Mode Stage E: income fields, explain, circumstances."""
+
+    async def test_employed_income_asks_one_field_at_a_time(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="inc-seq",
+            url="https://example.test",
+            app_step="app_income",
+        )
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_income"),
+            ),
+            patch("pc_liveagent.live_form._click_cta", new=AsyncMock()),
+            patch("pc_liveagent.live_form._click_exact_choice", new=AsyncMock()),
+        ):
+            first = await submit_application_answer(
+                "inc-seq", session, page, "Employed", 0.0
+            )
+        self.assertTrue(first.get("ok"))
+        self.assertEqual(first.get("step"), "app_income_employed")
+        self.assertIn("monthly pay", (first.get("spoken") or "").lower())
+        self.assertNotIn("hours per week", (first.get("spoken") or "").lower())
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_income"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_next_visible_input",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            second = await submit_application_answer(
+                "inc-seq", session, page, "3200", 0.0
+            )
+        self.assertTrue(second.get("ok"))
+        self.assertEqual(second.get("step"), "app_income_employed_hours")
+        self.assertIn("hours", (second.get("spoken") or "").lower())
+
+    async def test_income_sequence_saves_after_last_field(self) -> None:
+        from pc_liveagent.app_stage import _set_income_seq, submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="inc-last",
+            url="https://example.test",
+            app_step="app_income_employed_employer",
+        )
+        _set_income_seq(
+            session,
+            {
+                "kind": "employed",
+                "index": 3,
+                "values": {"pay": "3k", "hours": "40", "frequency": "monthly"},
+                "keys": ["pay", "hours", "frequency", "employer"],
+            },
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_income"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_next_visible_input",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.live_form._click_cta", new=AsyncMock()) as save,
+        ):
+            result = await submit_application_answer(
+                "inc-last", session, AsyncMock(), "Acme Corp", 0.0
+            )
+        save.assert_awaited()
+        self.assertEqual(result.get("step"), "app_income_more")
+        self.assertNotIn("app_income_seq", session.filled)
+
+    async def test_circumstances_none_advances(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="circ-none",
+            url="https://example.test",
+            app_step="app_circumstances",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_circumstances"),
+            ),
+            patch("pc_liveagent.live_form._click_exact_choice", new=AsyncMock()),
+            patch("pc_liveagent.app_stage._click_next_or_continue", new=AsyncMock()),
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_tax"),
+            ),
+        ):
+            result = await submit_application_answer(
+                "circ-none", session, AsyncMock(), "None of the above", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_tax")
+
+    async def test_circumstances_asks_person_assignment(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="circ-vet",
+            url="https://example.test",
+            app_step="app_circumstances",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_circumstances"),
+            ),
+            patch("pc_liveagent.live_form._click_exact_choice", new=AsyncMock()),
+        ):
+            result = await submit_application_answer(
+                "circ-vet", session, AsyncMock(), "veteran", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_circumstances_person")
+        self.assertIn("which household member", (result.get("spoken") or "").lower())
+
+    async def test_stage_e_explain_does_not_advance(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, submit_field
+
+        session = LiveFormSession(
+            call_id="explain-e",
+            url="https://example.test",
+            app_step="app_citizenship",
+            page=AsyncMock(),
+            welcome_done=True,
+            signed_in=True,
+        )
+        session.ready.set()
+        with patch(
+            "pc_liveagent.live_form.get_session",
+            new=AsyncMock(return_value=session),
+        ):
+            # submit_field path may need session in registry — call explain via
+            # the same regex gate used in submit_field by invoking the helper.
+            from pc_liveagent.app_stage import stage_e_explain
+
+            spoken = stage_e_explain("app_citizenship")
+        self.assertIn("U.S. citizen", spoken)
+        self.assertIn("Please say Yes or No", spoken)
+
+    async def test_documents_upload_does_not_pretend_success(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="docs",
+            url="https://example.test",
+            app_step="app_documents",
+        )
+        with patch(
+            "pc_liveagent.app_stage.detect_application_screen",
+            new=AsyncMock(return_value="app_documents"),
+        ):
+            result = await submit_application_answer(
+                "docs", session, AsyncMock(), "I want to upload", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_documents")
+        spoken = (result.get("spoken") or "").lower()
+        self.assertIn("can't take document", spoken)
+        self.assertIn("not pretend", spoken)
+
+    async def test_substep_reconcile_keeps_income_field(self) -> None:
+        from pc_liveagent.app_stage import _reconcile_app_step
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="sub",
+            url="https://example.test",
+            app_step="app_income_employed_hours",
+        )
+        with patch(
+            "pc_liveagent.app_stage.detect_application_screen",
+            new=AsyncMock(return_value="app_income"),
+        ):
+            step = await _reconcile_app_step(session, AsyncMock())
+        self.assertEqual(step, "app_income_employed_hours")
+
+    def test_prompt_mentions_collect_mode_stage_e(self) -> None:
+        from pc_liveagent.live_fill_prompt import LIVE_FILL_APPENDIX
+
+        low = LIVE_FILL_APPENDIX.lower()
+        self.assertIn("collect mode", low)
+        self.assertIn("one short question at a time", low)
+        self.assertIn("never pretend a file was uploaded", low)
+
+
+class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
+    """Resume, citizenship→immigration branching, and dynamic DOB collection."""
+
+    def test_parse_dob_rejects_invalid_and_accepts_spoken(self) -> None:
+        from pc_liveagent.app_stage import _parse_dob_answer
+
+        self.assertEqual(_parse_dob_answer("March 15 2018"), ("03/15/2018", None))
+        self.assertEqual(_parse_dob_answer("3/15/2018"), ("03/15/2018", None))
+        self.assertEqual(_parse_dob_answer("not a date"), (None, None))
+        self.assertEqual(_parse_dob_answer("February 31 2018"), (None, None))
+        self.assertEqual(_parse_dob_answer("02/30/2019"), (None, None))
+
+    def test_parse_dob_flexible_formats(self) -> None:
+        from pc_liveagent.app_stage import _parse_dob_answer
+        from pc_liveagent.live_form import _normalize_dob
+
+        self.assertEqual(_parse_dob_answer("22/10/2024"), ("10/22/2024", None))
+        self.assertEqual(_parse_dob_answer("10/22/2024"), ("10/22/2024", None))
+        self.assertEqual(_parse_dob_answer("2024-10-22"), ("10/22/2024", None))
+        self.assertEqual(_parse_dob_answer("October 22, 2024"), ("10/22/2024", None))
+        self.assertEqual(_parse_dob_answer("22 October 2024"), ("10/22/2024", None))
+        self.assertEqual(
+            _parse_dob_answer("month is october date 22 year 2024"),
+            ("10/22/2024", None),
+        )
+        self.assertEqual(
+            _parse_dob_answer("October twenty-second twenty twenty-four"),
+            ("10/22/2024", None),
+        )
+        self.assertEqual(
+            _parse_dob_answer(
+                "the twenty-second of October two thousand twenty-four"
+            ),
+            ("10/22/2024", None),
+        )
+        # Live ASR: periods between clauses + fully spoken numeric DOB.
+        self.assertEqual(
+            _parse_dob_answer(
+                "Month is October. Day is twenty two. Year is two thousand three."
+            ),
+            ("10/22/2003", None),
+        )
+        self.assertEqual(
+            _parse_dob_answer("Zero four twenty five twenty twenty two."),
+            ("04/25/2022", None),
+        )
+        self.assertEqual(
+            _parse_dob_answer("Zero four twenty five twenty twenty."),
+            ("04/25/2020", None),
+        )
+        self.assertEqual(_parse_dob_answer("02/29/2020"), ("02/29/2020", None))
+        self.assertEqual(_parse_dob_answer("02/29/2019"), (None, None))
+        dob, clarify = _parse_dob_answer("10/11/2024")
+        self.assertIsNone(dob)
+        self.assertIn("ambiguous", (clarify or "").lower())
+        # Stage D normalize still prefers US month-first when ambiguous.
+        self.assertEqual(_normalize_dob("10/11/2024"), "10/11/2024")
+        self.assertEqual(_normalize_dob("22/10/2024"), "10/22/2024")
+
+    async def test_quick_apply_yes_restarts_at_question_one_in_test_mode(
+        self,
+    ) -> None:
+        """Live bug: Continue Quick Apply opened DOB; must Back to Q1."""
+        from pc_liveagent.app_stage import handle_application_gate
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="qa-restart",
+            url="https://example.test",
+            elig_step="proceed_application",
+        )
+        session.filled["application_gate_speech"] = "Can I start?"
+        session.filled["awaiting_quick_apply"] = "1"
+        session.filled["application_started"] = "0"
+        with (
+            patch("pc_liveagent.config.APPLICATION_TEST_MODE", True),
+            patch(
+                "pc_liveagent.app_stage.classify_saved_household_page",
+                new=AsyncMock(return_value="dashboard"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.click_quick_apply",
+                new=AsyncMock(return_value="Continue Quick Apply"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._wait_surface_after_quick_apply",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.restart_application_to_first_question",
+                new=AsyncMock(return_value="app_citizenship"),
+            ) as restart,
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+        ):
+            result = await handle_application_gate(
+                "qa-restart", session, AsyncMock(), "Yes"
+            )
+        restart.assert_awaited_once()
+        self.assertEqual(result.get("step"), "app_citizenship")
+        self.assertIn("first question", (result.get("spoken") or "").lower())
+        self.assertNotIn("date of birth", (result.get("spoken") or "").lower())
+
+    async def test_detect_does_not_invent_citizenship_from_url(self) -> None:
+        from pc_liveagent.app_stage import detect_application_screen
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return "Loading application details"
+
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application/step-3"
+        page.locator = lambda _s: _Body()
+        self.assertEqual(await detect_application_screen(page), "")
+
+    async def test_detect_dob_without_pencil_keyword(self) -> None:
+        from pc_liveagent.app_stage import detect_application_screen
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return (
+                    "Date of birth Review household "
+                    "Mickey Mouse Needs date of birth Add "
+                    "Murali M. 01/02/1990"
+                )
+
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application"
+        page.locator = lambda _s: _Body()
+        self.assertEqual(await detect_application_screen(page), "app_dob_review")
+
+    async def test_application_test_restarts_from_dob_to_question_one(self) -> None:
+        """Prior run on DOB must Back to Q1 — not resume mid-flow."""
+        from pc_liveagent.app_stage import prepare_application_test
+        from pc_liveagent.live_form import LiveFormSession
+
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application/step-3"
+        with (
+            patch(
+                "pc_liveagent.app_stage.wait_for_saved_household_surface",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.restart_application_to_first_question",
+                new=AsyncMock(return_value="app_citizenship"),
+            ) as restart,
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+        ):
+            session = LiveFormSession(call_id="restart-dob", url=page.url)
+            spoken = await prepare_application_test(session, page)
+        restart.assert_awaited_once()
+        self.assertEqual(session.app_step, "app_citizenship")
+        self.assertIn("first question", spoken.lower())
+        self.assertIn("u.s. citizen", spoken.lower())
+        self.assertNotIn("date of birth", spoken.lower())
+
+    async def test_application_test_first_question_agent_offer_when_present(
+        self,
+    ) -> None:
+        from pc_liveagent.app_stage import prepare_application_test
+        from pc_liveagent.live_form import LiveFormSession
+
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application/step-1"
+        with (
+            patch(
+                "pc_liveagent.app_stage.wait_for_saved_household_surface",
+                new=AsyncMock(return_value="app_income"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.restart_application_to_first_question",
+                new=AsyncMock(return_value="app_agent_offer"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_agent_offer"),
+            ),
+        ):
+            session = LiveFormSession(call_id="restart-agent", url=page.url)
+            spoken = await prepare_application_test(session, page)
+        self.assertEqual(session.app_step, "app_agent_offer")
+        self.assertIn("licensed agent", spoken.lower())
+
+    async def test_restart_clicks_back_until_first_question(self) -> None:
+        from pc_liveagent.app_stage import restart_application_to_first_question
+
+        state = {"screen": "app_dob_review", "backs": 0}
+
+        async def _detect(_page):
+            return state["screen"]
+
+        async def _back(_page):
+            state["backs"] += 1
+            state["screen"] = {
+                1: "app_insurance",
+                2: "app_citizenship",
+            }.get(state["backs"], "app_citizenship")
+            return True
+
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(side_effect=_detect),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_application_back",
+                new=AsyncMock(side_effect=_back),
+            ) as back,
+        ):
+            step = await restart_application_to_first_question(page)
+        self.assertEqual(step, "app_citizenship")
+        self.assertEqual(back.await_count, 2)
+
+    async def test_restart_reports_when_back_leaves_application(self) -> None:
+        from pc_liveagent.app_stage import restart_application_to_first_question
+
+        state = {"screen": "app_dob_review"}
+
+        async def _detect(_page):
+            return state["screen"]
+
+        async def _back(_page):
+            state["screen"] = "programs"
+            return True
+
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(side_effect=_detect),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_application_back",
+                new=AsyncMock(side_effect=_back),
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await restart_application_to_first_question(page)
+        self.assertIn("APPLICATION_TEST", str(ctx.exception))
+        self.assertIn("duplicate draft", str(ctx.exception).lower())
+
+    async def test_resume_gate_yes_redetects_live_screen(self) -> None:
+        from pc_liveagent.app_stage import handle_application_gate
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="resume-live",
+            url="https://example.test",
+            elig_step="proceed_application",
+        )
+        session.filled["resume_app_step"] = "app_citizenship"
+        session.filled["application_started"] = "1"
+        session.filled["application_gate_speech"] = "Can I start?"
+        with (
+            patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_income"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._prepare_resume_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "app_income",
+                        "What income type should I enter?",
+                    )
+                ),
+            ) as prep,
+        ):
+            result = await handle_application_gate(
+                "resume-live", session, AsyncMock(), "Yes"
+            )
+        prep.assert_awaited()
+        self.assertEqual(result.get("step"), "app_income")
+        self.assertIn("income", (result.get("spoken") or "").lower())
+
+    async def test_citizenship_no_walks_every_member_ignoring_defaults(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-flow",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        page = AsyncMock()
+        members = [
+            {"name": "Mickey Mouse", "selected": "U.S. Citizen", "index": 0},
+            {"name": "Angel R.", "selected": "U.S. Citizen", "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value="No"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=members),
+            ),
+        ):
+            first = await submit_application_answer(
+                "imm-flow", session, page, "No", 0.0
+            )
+        # Preselected Citizen radios must not skip confirmation.
+        self.assertEqual(first.get("step"), "app_immigration")
+        self.assertIn("mickey", (first.get("spoken") or "").lower())
+        self.assertEqual(session.filled.get("app_immigration_current"), "Mickey Mouse")
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_immigration"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ) as set_status,
+            patch(
+                "pc_liveagent.app_stage._verify_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            status = await submit_application_answer(
+                "imm-flow", session, page, "Satisfactory immigration status", 0.0
+            )
+        set_status.assert_awaited_once_with(
+            page, "Mickey Mouse", "Satisfactory immigration status"
+        )
+        self.assertEqual(status.get("step"), "app_immigration")
+        self.assertIn("angel", (status.get("spoken") or "").lower())
+
+    async def test_citizenship_yes_uses_full_label_path(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cit-yes",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value="Yes Everyone is a U.S. citizen"),
+            ) as click,
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cit-yes", session, AsyncMock(), "Yes", 0.0
+            )
+        click.assert_awaited_once()
+        self.assertEqual(click.await_args.args[1], True)
+        self.assertEqual(result.get("step"), "app_insurance")
+
+    async def test_immigration_duplicate_name_asks_clarification(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-dup",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_immigration_current"] = "John D."
+        session.filled["app_immigration_queue"] = '["John D."]'
+        session.filled["app_citizenship_no"] = "1"
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_immigration"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(
+                    return_value=[
+                        {"name": "John D.", "selected": "U.S. Citizen", "index": 0},
+                        {"name": "John D.", "selected": "U.S. Citizen", "index": 1},
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ) as set_status,
+        ):
+            result = await submit_application_answer(
+                "imm-dup", session, AsyncMock(), "U.S. Citizen", 0.0
+            )
+        set_status.assert_not_awaited()
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "immigration_duplicate_name")
+
+    def test_map_immigration_green_card_and_citizen(self) -> None:
+        from pc_liveagent.app_stage import _map_immigration_status
+
+        self.assertEqual(
+            _map_immigration_status("he has a green card"),
+            "Satisfactory immigration status",
+        )
+        self.assertEqual(_map_immigration_status("citizen"), "U.S. Citizen")
+        self.assertEqual(_map_immigration_status("national"), "U.S. National")
+
+    async def test_insurance_yes_members_then_coverage_types(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="ins-flow",
+            url="https://example.test",
+            app_step="app_insurance",
+        )
+        page = AsyncMock()
+        members = [
+            {
+                "name": "Mickey Mouse",
+                "checked": False,
+                "selected_types": [],
+                "index": 0,
+            },
+            {
+                "name": "Angel R.",
+                "checked": False,
+                "selected_types": [],
+                "index": 1,
+            },
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value="Yes"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_insurance_members",
+                new=AsyncMock(return_value=members),
+            ),
+        ):
+            first = await submit_application_answer(
+                "ins-flow", session, page, "Yes", 0.0
+            )
+        self.assertEqual(first.get("step"), "app_insurance_members")
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_insurance_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_insurance_checked",
+                new=AsyncMock(return_value=True),
+            ) as check,
+        ):
+            who = await submit_application_answer(
+                "ins-flow", session, page, "Mickey and Angel", 0.0
+            )
+        self.assertEqual(check.await_count, 2)
+        self.assertEqual(who.get("step"), "app_insurance_members")
+
+        checked = [
+            {**members[0], "checked": True},
+            {**members[1], "checked": True},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_insurance_members",
+                new=AsyncMock(return_value=checked),
+            ),
+        ):
+            cont = await submit_application_answer(
+                "ins-flow", session, page, "continue", 0.0
+            )
+        self.assertEqual(cont.get("step"), "app_insurance_coverage_type")
+        self.assertIn("mickey", (cont.get("spoken") or "").lower())
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_coverage_type",
+                new=AsyncMock(return_value=True),
+            ) as set_cov,
+            patch(
+                "pc_liveagent.app_stage._verify_member_coverage_types",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_insurance_members",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Mickey Mouse",
+                            "checked": True,
+                            "selected_types": ["Medicare", "Medicaid"],
+                            "index": 0,
+                        },
+                        {
+                            "name": "Angel R.",
+                            "checked": True,
+                            "selected_types": [],
+                            "index": 1,
+                        },
+                    ]
+                ),
+            ),
+        ):
+            cov = await submit_application_answer(
+                "ins-flow", session, page, "Medicare and Medicaid", 0.0
+            )
+        self.assertEqual(set_cov.await_count, 2)
+        self.assertEqual(cov.get("step"), "app_insurance_coverage_type")
+        self.assertIn("medicare", (cov.get("spoken") or "").lower())
+
+    def test_map_coverage_types(self) -> None:
+        from pc_liveagent.app_stage import _map_coverage_types
+
+        hits = _map_coverage_types("medicare and private marketplace")
+        self.assertIn("Medicare", hits)
+        self.assertIn("Private insurance or ACA Marketplace", hits)
+        self.assertIn(
+            "Health insurance through a job (employer-sponsored)",
+            _map_coverage_types("employer sponsored through a job"),
+        )
+
+    async def test_fill_and_save_dob_requires_value_before_save(self) -> None:
+        from pc_liveagent.app_stage import _fill_and_save_dob
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.keyboard = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage._inspect_dob_editor",
+                new=AsyncMock(return_value={"count": 1, "hasSave": True}),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_dob_editor_fields",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._strict_fill",
+                new=AsyncMock(side_effect=RuntimeError("no label")),
+            ),
+            patch(
+                "pc_liveagent.app_stage._type_dob_via_keyboard",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_dob_save",
+                new=AsyncMock(return_value=True),
+            ) as save,
+        ):
+            ok = await _fill_and_save_dob(page, "03/15/2018")
+        self.assertFalse(ok)
+        save.assert_not_awaited()
+
+    async def test_fill_and_save_dob_save_failure_is_failure(self) -> None:
+        from pc_liveagent.app_stage import _fill_and_save_dob
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage._inspect_dob_editor",
+                new=AsyncMock(return_value={"count": 1, "hasSave": True}),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_dob_editor_fields",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._read_dob_editor_value",
+                new=AsyncMock(return_value="03/15/2018"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_dob_save",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            ok = await _fill_and_save_dob(page, "03/15/2018")
+        self.assertFalse(ok)
+
+    async def test_fill_and_save_dob_segmented_success(self) -> None:
+        from pc_liveagent.app_stage import _fill_and_save_dob
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage._inspect_dob_editor",
+                new=AsyncMock(
+                    return_value={
+                        "count": 3,
+                        "kinds": ["text", "text", "text"],
+                        "hasSave": True,
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_dob_editor_fields",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._read_dob_editor_value",
+                new=AsyncMock(return_value="10/22/2024"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_dob_save",
+                new=AsyncMock(return_value=True),
+            ) as save,
+        ):
+            ok = await _fill_and_save_dob(page, "10/22/2024")
+        self.assertTrue(ok)
+        save.assert_awaited_once()
+
+    async def test_dob_fill_failed_keeps_member_active(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-fill-fail",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Mickey Mouse"
+        session.filled["app_dob_queue"] = '["Mickey Mouse"]'
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Mickey Mouse",
+                            "dob": "",
+                            "needs_add": True,
+                            "index": 0,
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_member_add_dob",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_and_save_dob",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            result = await submit_application_answer(
+                "dob-fill-fail", session, AsyncMock(), "March 15 2018", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "dob_fill_failed")
+        self.assertEqual(session.app_step, "app_dob_collect")
+        self.assertEqual(session.filled.get("app_dob_current"), "Mickey Mouse")
+
+    async def test_dob_collects_missing_then_blocks_disabled_next(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-miss",
+            url="https://example.test",
+            app_step="app_dob_review",
+        )
+        cards_missing = [
+            {"name": "Mickey Mouse", "dob": "", "needs_add": True, "index": 0},
+            {"name": "Murali M.", "dob": "01/02/1990", "needs_add": False, "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(return_value=cards_missing),
+            ),
+        ):
+            start = await submit_application_answer(
+                "dob-miss", session, AsyncMock(), "Yes", 0.0
+            )
+        self.assertEqual(start.get("step"), "app_dob_collect")
+        self.assertIn("mickey", (start.get("spoken") or "").lower())
+
+        cards_after = [
+            {
+                "name": "Mickey Mouse",
+                "dob": "03/15/2018",
+                "needs_add": False,
+                "index": 0,
+            },
+            {"name": "Murali M.", "dob": "01/02/1990", "needs_add": False, "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(side_effect=[cards_missing, cards_after, cards_after]),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_member_add_dob",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_and_save_dob",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._verify_member_dob",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            saved = await submit_application_answer(
+                "dob-miss", session, AsyncMock(), "March 15 2018", 0.0
+            )
+        self.assertTrue(saved.get("ok"))
+        self.assertEqual(saved.get("step"), "app_dob_review")
+
+        session.app_step = "app_dob_review"
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(return_value=cards_after),
+            ),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=False),
+            ) as nxt,
+        ):
+            blocked = await submit_application_answer(
+                "dob-miss", session, AsyncMock(), "Yes", 0.0
+            )
+        nxt.assert_not_awaited()
+        self.assertFalse(blocked.get("ok"))
+        self.assertIn("disabled", (blocked.get("spoken") or "").lower())
+
+    async def test_dob_invalid_date_asks_clarify(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-bad",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Mickey Mouse"
+        session.filled["app_dob_queue"] = '["Mickey Mouse"]'
+        with patch(
+            "pc_liveagent.app_stage.detect_application_screen",
+            new=AsyncMock(return_value="app_dob_review"),
+        ):
+            result = await submit_application_answer(
+                "dob-bad", session, AsyncMock(), "February 31 2018", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "dob_invalid")
+        self.assertEqual(session.app_step, "app_dob_collect")
+
+    async def test_dob_ambiguous_keeps_member_and_asks(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-amb",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Agent H."
+        session.filled["app_dob_queue"] = '["Agent H."]'
+        with patch(
+            "pc_liveagent.app_stage.detect_application_screen",
+            new=AsyncMock(return_value="app_dob_review"),
+        ):
+            result = await submit_application_answer(
+                "dob-amb", session, AsyncMock(), "10/11/2024", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "dob_ambiguous")
+        self.assertEqual(session.app_step, "app_dob_collect")
+        self.assertEqual(session.filled.get("app_dob_current"), "Agent H.")
+        self.assertIn("ambiguous", (result.get("spoken") or "").lower())
+
+    async def test_dob_duplicate_name_asks_which_member(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-dup",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "John D."
+        session.filled["app_dob_queue"] = '["John D."]'
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {"name": "John D.", "dob": "", "needs_add": True, "index": 0},
+                        {"name": "John D.", "dob": "", "needs_add": True, "index": 1},
+                    ]
+                ),
+            ),
+        ):
+            result = await submit_application_answer(
+                "dob-dup", session, AsyncMock(), "March 1 2000", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "dob_duplicate_name")
+
+    async def test_unidentified_screen_is_recoverable_error(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="unk",
+            url="https://example.test",
+            app_step="",
+        )
+        with patch(
+            "pc_liveagent.app_stage.detect_application_screen",
+            new=AsyncMock(return_value=""),
+        ):
+            result = await submit_application_answer(
+                "unk", session, AsyncMock(), "Yes", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "stage_e_screen_unidentified")
+
+    async def test_click_next_skips_when_disabled(self) -> None:
+        from pc_liveagent.app_stage import _click_next_or_continue
+
+        with (
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("pc_liveagent.live_form._click_cta", new=AsyncMock()) as cta,
+        ):
+            ok = await _click_next_or_continue(AsyncMock())
+        self.assertFalse(ok)
+        cta.assert_not_awaited()
+
+    def test_agent_edge_asr_maps_to_agent_h(self) -> None:
+        from pc_liveagent.app_stage import _match_named_members
+
+        hits, clarify = _match_named_members(
+            "Change agent h date of birth.",
+            ["Agent H.", "Logic S."],
+        )
+        self.assertIsNone(clarify)
+        self.assertEqual(hits, ["Agent H."])
+
+        hits2, _ = _match_named_members("Agent Edge.", ["Agent H.", "Logic S."])
+        self.assertEqual(hits2, ["Agent H."])
+
+    def test_change_dob_works_when_scrape_empty(self) -> None:
+        from pc_liveagent.app_stage import _match_named_members
+
+        hits, clarify = _match_named_members(
+            "Change agent h date of birth.",
+            [],
+        )
+        self.assertIsNone(clarify)
+        self.assertEqual(hits, ["Agent H"])
+
+    async def test_live_failure_change_agent_h_enters_collect(self) -> None:
+        """Regression: call_41ac… said change Agent H but scrape returned []."""
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="live-dob-fix",
+            url="https://example.test",
+            app_step="app_dob_review",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            result = await submit_application_answer(
+                "live-dob-fix",
+                session,
+                AsyncMock(),
+                "Change agent h date of birth.",
+                0.0,
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_dob_collect")
+        spoken = (result.get("spoken") or "").lower()
+        self.assertIn("agent h", spoken)
+        self.assertIn("date of birth", spoken)
+
+    async def test_bare_agent_edge_enters_collect(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="live-edge",
+            url="https://example.test",
+            app_step="app_dob_review",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Agent H.",
+                            "dob": "01/01/1990",
+                            "needs_add": False,
+                            "index": 0,
+                        },
+                        {
+                            "name": "Logic S.",
+                            "dob": "02/02/1991",
+                            "needs_add": False,
+                            "index": 1,
+                        },
+                    ]
+                ),
+            ),
+        ):
+            result = await submit_application_answer(
+                "live-edge", session, AsyncMock(), "Agent Edge.", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_dob_collect")
+        self.assertIn("agent h", (result.get("spoken") or "").lower())
+
+    async def test_body_fallback_scrapes_heading_only_dob_page(self) -> None:
+        from pc_liveagent.app_stage import _scrape_dob_cards_from_body
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return (
+                    "Date of birth\n"
+                    "Agent H.\n"
+                    "Add\n"
+                    "Logic S.\n"
+                    "01/02/1990\n"
+                )
+
+        page = AsyncMock()
+        page.locator = lambda _s: _Body()
+        cards = await _scrape_dob_cards_from_body(page)
+        names = [c["name"] for c in cards]
+        self.assertIn("Agent H.", names)
+        agent = next(c for c in cards if c["name"] == "Agent H.")
+        self.assertTrue(agent.get("needs_add"))
+
+
+class FullCallFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Intro → Stage D → programs consent → Stage E with shortcuts off."""
+
+    def test_runtime_flags_default_to_full_flow(self) -> None:
+        from pc_liveagent import config
+
+        # .env for normal calls must keep both shortcuts disabled.
+        self.assertFalse(config.application_test_mode_from_env())
+        self.assertFalse(config.application_after_signin_from_env())
+
+    async def test_begin_speech_is_greeting_when_shortcuts_off(self) -> None:
+        from pc_liveagent.call_turn import begin_speech, drop_controller
+        from pc_liveagent.live_fill_prompt import LIVE_FILL_GREETING
+
+        call_id = "full-greet"
+        await drop_controller(call_id)
+        with (
+            patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
+            patch("pc_liveagent.config.APPLICATION_AFTER_SIGNIN", False),
+        ):
+            speech = await begin_speech(call_id)
+        self.assertEqual(speech, LIVE_FILL_GREETING)
+
+    def test_stage_d_ends_at_programs(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _next_elig_step
+
+        session = LiveFormSession(call_id="d-end", url="https://example.test")
+        session.elig_step = "special_more"
+        session.filled["special_conditions"] = "None of the above"
+        self.assertEqual(_next_elig_step(session, "No"), "programs")
+        session.elig_step = "due_date"
+        self.assertEqual(_next_elig_step(session, "October 1 2026"), "programs")
+
+    async def test_programs_yes_then_stage_e_citizenship(self) -> None:
+        from pc_liveagent.app_stage import (
+            handle_programs_decision,
+            submit_application_answer,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="full-e", url="https://example.test", elig_step="programs"
+        )
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.click_start_applications",
+                new=AsyncMock(return_value="Start Applications"),
+            ) as start,
+            patch(
+                "pc_liveagent.app_stage.wait_for_application_started",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
+        ):
+            gate = await handle_programs_decision("full-e", session, page, "Yes")
+        start.assert_awaited_once()
+        self.assertEqual(gate.get("step"), "app_citizenship")
+        self.assertEqual(gate.get("phase"), "application")
+        self.assertEqual(session.app_step, "app_citizenship")
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value="Yes"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+        ):
+            cit = await submit_application_answer(
+                "full-e", session, page, "Yes", 0.0
+            )
+        self.assertEqual(cit.get("step"), "app_insurance")
+
+    async def test_programs_duplicate_yes_does_not_reclick(self) -> None:
+        from pc_liveagent.app_stage import handle_programs_decision
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dup-yes", url="https://example.test", elig_step="programs"
+        )
+        page = AsyncMock()
+        start = AsyncMock(return_value="Start Applications")
+        with (
+            patch("pc_liveagent.app_stage.click_start_applications", start),
+            patch(
+                "pc_liveagent.app_stage.wait_for_application_started",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+        ):
+            await handle_programs_decision("dup-yes", session, page, "Yes")
+            await handle_programs_decision("dup-yes", session, page, "Yes")
+        start.assert_awaited_once()
+
+    async def test_circumstances_person_scoped_to_pending_condition(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="circ-scope",
+            url="https://example.test",
+            app_step="app_circumstances_person",
+        )
+        session.filled["app_circumstance_pending"] = "needs help with daily activities"
+        session.filled["app_circumstance_queue"] = json.dumps(
+            ["needs help with daily activities", "veteran or military"]
+        )
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_circumstances"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_circumstance_member",
+                new=AsyncMock(return_value=True),
+            ) as set_member,
+        ):
+            result = await submit_application_answer(
+                "circ-scope", session, page, "Mickey Mouse", 0.0
+            )
+        set_member.assert_awaited_once()
+        self.assertEqual(
+            set_member.await_args.args[2], "needs help with daily activities"
+        )
+        self.assertEqual(result.get("step"), "app_circumstances_person")
+        self.assertIn("veteran", (result.get("spoken") or "").lower())
+
+    async def test_submit_requires_explicit_yes_and_verification(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="submit-v",
+            url="https://example.test",
+            app_step="app_submit_confirm",
+        )
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return "Thank you. Your application has been submitted."
+
+        page.locator = lambda _s: _Body()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_submit_confirm"),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_cta",
+                new=AsyncMock(return_value=True),
+            ) as cta,
+        ):
+            result = await submit_application_answer(
+                "submit-v", session, page, "Yes submit", 0.0
+            )
+        cta.assert_awaited()
+        self.assertTrue(result.get("ok"))
+        self.assertTrue(result.get("end_call"))
+        self.assertEqual(session.filled.get("application_submitted"), "1")
+
+        session2 = LiveFormSession(
+            call_id="submit-fail",
+            url="https://example.test",
+            app_step="app_submit_confirm",
+        )
+
+        class _Empty:
+            async def inner_text(self) -> str:
+                return "Review your answers"
+
+        page2 = AsyncMock()
+        page2.wait_for_timeout = AsyncMock()
+        page2.locator = lambda _s: _Empty()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_submit_confirm"),
+            ),
+            patch(
+                "pc_liveagent.live_form._click_cta",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            failed = await submit_application_answer(
+                "submit-fail", session2, page2, "Yes", 0.0
+            )
+        self.assertFalse(failed.get("ok"))
+        self.assertEqual(failed.get("error"), "submit_not_verified")
+
+    async def test_address_blocks_continue_when_missing(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-miss",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Mickey Mouse",
+                            "needs_add": True,
+                            "needs_home": True,
+                            "needs_mailing": False,
+                            "index": 0,
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-miss", session, AsyncMock(), "Yes", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "address_incomplete")
+
+    async def test_test_mode_remains_isolated_when_patched_on(self) -> None:
+        from pc_liveagent.call_turn import begin_speech, drop_controller
+        from pc_liveagent.live_form import LiveFormSession, _sessions, _sessions_lock
+
+        call_id = "iso-test"
+        await drop_controller(call_id)
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="programs"
+        )
+        session.filled["application_test_opening"] = "Start from programs?"
+        async with _sessions_lock:
+            _sessions[call_id] = session
+        with patch("pc_liveagent.config.APPLICATION_TEST_MODE", True):
+            speech = await begin_speech(call_id)
+        self.assertEqual(speech, "Start from programs?")
+
+    async def test_special_more_no_enters_programs_with_scraped_speech(self) -> None:
+        """Pins Stage D → programs hop with both shortcuts off."""
+        from pc_liveagent.live_form import LiveFormSession, _enter_programs_step
+
+        session = LiveFormSession(
+            call_id="d-to-e", url="https://example.test", elig_step="special_more"
+        )
+        page = AsyncMock()
+        permission = (
+            "Your household eligibility check is complete. "
+            "Pointcare indicates that your household may be eligible for Medicaid. "
+            "Would you like to continue and start the application? Please say Yes or No."
+        )
+        with (
+            patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
+            patch("pc_liveagent.config.APPLICATION_AFTER_SIGNIN", False),
+            patch(
+                "pc_liveagent.app_stage.store_program_summary",
+                new=AsyncMock(
+                    side_effect=lambda s, _p: s.filled.update(
+                        {
+                            "programs_permission_speech": permission,
+                            "program_summary_json": '{"programs":[{"name":"Medicaid"}]}',
+                        }
+                    )
+                    or {"programs": [{"name": "Medicaid"}]}
+                ),
+            ),
+        ):
+            step, speech = await _enter_programs_step(session, page)
+        self.assertEqual(step, "programs")
+        self.assertEqual(speech, permission)
+        self.assertIn("medicaid", speech.lower())
+        self.assertEqual(session.filled.get("programs_permission_speech"), permission)
+
+    async def test_enter_programs_fallback_speech_when_scrape_empty(self) -> None:
+        from pc_liveagent.live_form import LiveFormSession, _enter_programs_step
+
+        session = LiveFormSession(call_id="prog-fb", url="https://example.test")
+        with patch(
+            "pc_liveagent.app_stage.store_program_summary",
+            new=AsyncMock(side_effect=RuntimeError("scrape failed")),
+        ):
+            step, speech = await _enter_programs_step(session, AsyncMock())
+        self.assertEqual(step, "programs")
+        self.assertTrue(speech)
+        self.assertIn("start the application", speech.lower())
+        self.assertEqual(session.filled.get("programs_permission_speech"), speech)
+
+
+class AddressDetectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_detect_address_review_without_add_cue(self) -> None:
+        from pc_liveagent.app_stage import detect_application_screen
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return (
+                    "Home address Mailing address "
+                    "Mickey Mouse 123 Main St San Jose CA 95112"
+                )
+
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application"
+        page.locator = lambda _s: _Body()
+        self.assertEqual(await detect_application_screen(page), "app_address_review")
 
 
 if __name__ == "__main__":

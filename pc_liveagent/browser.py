@@ -202,9 +202,6 @@ def _chrome_processes_running() -> bool:
         return False
 
 
-AGENT_PROFILE_DIRECTORY = "Default"
-
-
 def _runtime_user_data_dir() -> Path:
     """Folder Chrome is launched with. Never Chrome's default folder (debugging is blocked there)."""
     try:
@@ -221,8 +218,14 @@ def _uses_agent_clone(user_data_dir: Path) -> bool:
         return False
 
 
-def _runtime_profile_directory(user_data_dir: Path) -> str:
-    return AGENT_PROFILE_DIRECTORY if _uses_agent_clone(user_data_dir) else CHROME_PROFILE_DIRECTORY
+def _runtime_profile_directory(_user_data_dir: Path) -> str:
+    """Folder name inside the agent Chrome directory.
+
+    Keep the source name (Profile 2). Copying that profile into a folder named
+    Default makes Chrome open a second empty profile, so a sign-in does not stick.
+    """
+    name = (CHROME_PROFILE_DIRECTORY or "").strip()
+    return name or "Default"
 
 
 def _seed_marker(user_data_dir: Path) -> Path:
@@ -234,8 +237,56 @@ def _seed_token() -> str:
     return f"{CHROME_SOURCE_PROFILE_DIR}|{CHROME_PROFILE_DIRECTORY}"
 
 
+def _read_os_crypt(local_state: Path) -> dict | None:
+    """Chrome cookie key. A copied profile stays signed out if this key differs."""
+    try:
+        data = json.loads(local_state.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    crypt = data.get("os_crypt") if isinstance(data, dict) else None
+    if isinstance(crypt, dict) and crypt.get("encrypted_key"):
+        return crypt
+    return None
+
+
+def _cookie_bytes(profile: Path) -> int:
+    for rel in ("Network/Cookies", "Cookies"):
+        path = profile / rel
+        if path.is_file():
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
+    return 0
+
+
+def _sync_os_crypt(user_data_dir: Path) -> None:
+    """Keep the source profile's cookie key in the agent Chrome folder."""
+    crypt = _read_os_crypt(CHROME_PROFILE_DIR / "Local State")
+    if not crypt:
+        return
+    dest_state = user_data_dir / "Local State"
+    try:
+        data = json.loads(dest_state.read_text(encoding="utf-8")) if dest_state.exists() else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if data.get("os_crypt") == crypt:
+        return
+    data["os_crypt"] = crypt
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    dest_state.write_text(json.dumps(data), encoding="utf-8")
+    logger.info("Synced Chrome login key into %s", user_data_dir)
+
+
 def _seed_agent_profile(user_data_dir: Path) -> None:
-    """Copy the chosen Chrome profile into the agent folder once (or when source changes)."""
+    """Copy the chosen Chrome profile into the agent folder once.
+
+    A later call reuses that folder, including a sign-in done in the agent
+    window. It does not delete the folder and it does not read the caller's
+    normal Chrome while that window has the login files open.
+    """
     if not _uses_agent_clone(user_data_dir):
         return
     source = CHROME_SOURCE_PROFILE_DIR
@@ -244,10 +295,16 @@ def _seed_agent_profile(user_data_dir: Path) -> None:
             f"Chrome profile folder not found: {source}. "
             "Check CHROME_PROFILE_PATH in .env."
         )
-    dest = user_data_dir / AGENT_PROFILE_DIRECTORY
+    dest = user_data_dir / _runtime_profile_directory(user_data_dir)
     marker = _seed_marker(user_data_dir)
     token = _seed_token()
-    if dest.is_dir() and marker.exists() and marker.read_text(encoding="utf-8").strip() == token:
+    if dest.is_dir():
+        logger.info("Reusing agent Chrome profile at %s", dest)
+        try:
+            if not marker.exists() or marker.read_text(encoding="utf-8").strip() != token:
+                marker.write_text(token, encoding="utf-8")
+        except OSError:
+            logger.warning("Could not write Chrome seed marker at %s", marker)
         return
     user_data_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
@@ -293,15 +350,15 @@ def _seed_agent_profile(user_data_dir: Path) -> None:
             )
         if completed.returncode >= 8:
             logger.warning(
-                "Some profile files were locked while seeding from %s. "
-                "Close normal Chrome windows that use that profile, then delete "
-                "%s and retry if Google login is missing.",
+                "Profile files were locked while copying from %s. "
+                "The normal Chrome window was left open. Sign in once in the "
+                "agent window; later calls reuse %s.",
                 source,
-                user_data_dir,
+                dest,
             )
+            marker.write_text(token, encoding="utf-8")
+            return
     else:
-        import shutil
-
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(
@@ -316,6 +373,10 @@ def _seed_agent_profile(user_data_dir: Path) -> None:
                 "Service Worker",
             ),
         )
+    # Copied cookies only decrypt with the source key. A sign-in made later in
+    # this window uses the agent key and must not be overwritten on the next call.
+    if _cookie_bytes(dest) >= 50_000:
+        _sync_os_crypt(user_data_dir)
     marker.write_text(token, encoding="utf-8")
     logger.info(
         "Agent Chrome ready with source profile %s (%s)",
@@ -334,7 +395,11 @@ def _cdp_belongs_to(user_data_dir: Path) -> bool:
 def _kill_debug_chrome() -> None:
     """Stop any Chrome holding the agent debug port so a new profile can launch."""
     if sys.platform != "win32":
-        subprocess.run(["pkill", "-9", "-f", f"remote-debugging-port={CDP_PORT}"], check=False)
+        subprocess.run(
+            ["pkill", "-9", "-f", f"remote-debugging-port={CDP_PORT}"],
+            check=False,
+            timeout=8,
+        )
         return
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
@@ -342,13 +407,17 @@ def _kill_debug_chrome() -> None:
         "-or $_.CommandLine -like '*PointcareAgentChrome*' }} | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Timed out stopping debug Chrome; continuing launch")
 
 
 def _kill_chrome_using(user_data_dir: Path) -> None:
@@ -362,13 +431,17 @@ def _kill_chrome_using(user_data_dir: Path) -> None:
         f"Where-Object {{ $_.CommandLine -like '*{needle}*' }} | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Timed out stopping Chrome for %s; continuing launch", user_data_dir)
 
 
 def _chrome_using(user_data_dir: Path) -> bool:
@@ -398,6 +471,7 @@ def _chrome_using(user_data_dir: Path) -> bool:
             ["powershell", "-NoProfile", "-Command", script],
             stderr=subprocess.DEVNULL,
             text=True,
+            timeout=8,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return int((out or "0").strip() or 0) > 0
@@ -515,6 +589,19 @@ async def _ensure_chrome_process(start_url: str = "") -> None:
     # If an old agent window is still on 9222, drop it when the env profile changed.
     if await asyncio.to_thread(_cdp_up):
         if await asyncio.to_thread(_cdp_belongs_to, user_data_dir):
+            # User closed the window but a half-dead debug process can still answer
+            # HTTP with no page targets — relaunch so Get Started → Sign in can run.
+            if not await asyncio.to_thread(_cdp_has_page_targets):
+                await _restart_agent_chrome(
+                    user_data_dir,
+                    profile_directory,
+                    start_url,
+                    reason="cdp_up_but_no_page_targets",
+                )
+                logger.info(
+                    "Chrome ready (relaunch after closed window) cdp=%s", CDP_URL
+                )
+                return
             CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
             port = await asyncio.to_thread(_devtools_port, user_data_dir)
             if port:
@@ -525,18 +612,13 @@ async def _ensure_chrome_process(start_url: str = "") -> None:
             "Debug Chrome is open for a different profile; restarting for %s",
             chrome_profile_label(),
         )
-        # Detach session page refs before tearing down the shared CDP connection.
-        try:
-            from . import live_form
-
-            await live_form.detach_all_pages_for_browser_restart(
-                reason="chrome_profile_switch"
-            )
-        except Exception:
-            logger.exception("detach_all_pages_for_browser_restart failed")
-        await asyncio.to_thread(_kill_debug_chrome)
-        await _disconnect_playwright(force=True, reason="chrome_profile_switch")
-        await asyncio.sleep(1.5)
+        await _restart_agent_chrome(
+            user_data_dir,
+            profile_directory,
+            start_url,
+            reason="chrome_profile_switch",
+        )
+        return
 
     await asyncio.to_thread(_seed_agent_profile, user_data_dir)
 
@@ -569,24 +651,97 @@ async def _ensure_chrome_process(start_url: str = "") -> None:
     )
 
 
+def _cdp_has_page_targets() -> bool:
+    """True when the debug port lists at least one page target."""
+    try:
+        return any(
+            isinstance(t, dict) and str(t.get("type") or "") == "page"
+            for t in cdp_list_targets()
+        )
+    except Exception:
+        return False
+
+
+def _browser_looks_alive(browser: Browser) -> bool:
+    """False after the user closes Chrome or the CDP socket dies."""
+    try:
+        if hasattr(browser, "is_connected") and not browser.is_connected():
+            return False
+        _ = browser.contexts
+        return True
+    except Exception:
+        return False
+
+
+async def _restart_agent_chrome(
+    user_data_dir: Path,
+    profile_directory: str,
+    start_url: str,
+    *,
+    reason: str,
+) -> None:
+    """Kill the agent debug Chrome and launch a fresh maximized window."""
+    global CDP_URL
+    logger.warning("Restarting agent Chrome reason=%s folder=%s", reason, user_data_dir)
+    try:
+        from . import live_form
+
+        await live_form.detach_all_pages_for_browser_restart(reason=reason)
+    except Exception:
+        logger.exception("detach_all_pages_for_browser_restart failed reason=%s", reason)
+    await asyncio.to_thread(_kill_debug_chrome)
+    await asyncio.to_thread(_kill_chrome_using, user_data_dir)
+    await _disconnect_playwright(force=True, reason=reason)
+    await asyncio.sleep(1.0)
+    await asyncio.to_thread(_seed_agent_profile, user_data_dir)
+    _launch_chrome(user_data_dir, profile_directory, start_url)
+    CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
+    await _wait_for_cdp(user_data_dir)
+
+
 async def _connect() -> Browser:
     global _playwright, _browser
     if _browser is not None:
-        try:
-            _ = _browser.contexts
+        if _browser_looks_alive(_browser):
             return _browser
-        except Exception:
-            logger.warning("Existing Playwright CDP browser unusable; reconnecting")
-            await _disconnect_playwright(force=True, reason="stale_browser")
+        logger.warning("Existing Playwright CDP browser unusable; reconnecting")
+        await _disconnect_playwright(force=True, reason="stale_browser")
+    if not await asyncio.to_thread(_cdp_up, CDP_URL):
+        raise RuntimeError(f"Chrome CDP is not reachable at {CDP_URL}")
     logger.info("Starting Playwright CDP connection to %s", CDP_URL)
     _playwright = await async_playwright().start()
-    _browser = await _playwright.chromium.connect_over_cdp(CDP_URL)
+    try:
+        _browser = await _playwright.chromium.connect_over_cdp(CDP_URL)
+    except Exception:
+        await _disconnect_playwright(force=True, reason="cdp_connect_failed")
+        raise
+    if not _browser_looks_alive(_browser):
+        await _disconnect_playwright(force=True, reason="cdp_connected_dead")
+        raise RuntimeError("Connected to Chrome CDP but the browser is already closed")
     logger.info(
         "Playwright connected over CDP %s contexts=%s",
         CDP_URL,
         len(_browser.contexts),
     )
     return _browser
+
+
+async def _page_from_browser(browser: Browser) -> Page:
+    """Reuse the default CDP context/tab. Never call new_context over CDP.
+
+    ``connect_over_cdp`` rejects ``new_context()`` once the window was closed
+    (TargetClosedError). Prefer an existing page, else open a tab.
+    """
+    contexts = list(browser.contexts or [])
+    if not contexts:
+        raise RuntimeError(
+            "CDP browser has no contexts (Chrome window was closed). Restart required."
+        )
+    context = contexts[0]
+    live = [p for p in context.pages if not p.is_closed()]
+    if live:
+        return live[0]
+    return await context.new_page()
 
 
 async def _disconnect_playwright(*, force: bool = False, reason: str = "") -> None:
@@ -660,37 +815,81 @@ def _already_on(page_url: str, target: str) -> bool:
     return have == want or have.startswith(want) or want in have
 
 
-async def open_page(url: str | None = None) -> Page:
-    """Use the visible tab in your Chrome profile and open the target URL there."""
-    async with _lock:
-        await _ensure_chrome_process(url or "")
-        browser = await _connect()
-        context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        page = context.pages[0] if context.pages else await context.new_page()
-        await page.bring_to_front()
-        if not HEADLESS:
-            await _maximize(page)
-        if url and not _already_on(page.url, url):
-            logger.info("Navigating existing tab from %s to %s", page.url, url)
-            last_exc: Exception | None = None
-            for attempt in range(3):
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    last_exc = None
+async def _open_page_once(url: str | None) -> Page:
+    """Attach to agent Chrome, open/navigate one tab, maximize the window."""
+    await _ensure_chrome_process(url or "")
+    browser = await _connect()
+    page = await _page_from_browser(browser)
+    await page.bring_to_front()
+    if not HEADLESS:
+        await _maximize(page)
+    if url and not _already_on(page.url, url):
+        logger.info("Navigating existing tab from %s to %s", page.url, url)
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("goto attempt %s failed: %s", attempt + 1, exc)
+                if is_playwright_closed_error(exc):
                     break
-                except Exception as exc:
-                    last_exc = exc
-                    logger.warning("goto attempt %s failed: %s", attempt + 1, exc)
+                try:
                     await page.wait_for_timeout(800)
-            if last_exc:
-                live = [item for item in context.pages if not item.is_closed()]
-                if not live:
-                    raise last_exc
-                page = live[-1]
-                logger.warning("Page navigation failed (%s); using open tab %s", last_exc, page.url)
-            await page.wait_for_timeout(800)
-        logger.info("Chrome tab is on %s", page.url)
-        return page
+                except Exception:
+                    break
+        if last_exc:
+            if is_playwright_closed_error(last_exc):
+                raise last_exc
+            try:
+                live = [item for item in page.context.pages if not item.is_closed()]
+            except Exception:
+                live = []
+            if not live:
+                raise last_exc
+            page = live[-1]
+            logger.warning(
+                "Page navigation failed (%s); using open tab %s", last_exc, page.url
+            )
+            try:
+                await page.wait_for_timeout(800)
+            except Exception:
+                pass
+    logger.info("Chrome tab is on %s", page.url)
+    return page
+
+
+async def open_page(url: str | None = None) -> Page:
+    """Use the visible tab in your Chrome profile and open the target URL there.
+
+    If the user closed the agent Chrome window, CDP may still answer with no
+    usable context. Detect that, relaunch a maximized window, and retry once.
+    """
+    async with _lock:
+        try:
+            return await _open_page_once(url)
+        except Exception as exc:
+            if not (
+                is_playwright_closed_error(exc)
+                or "no contexts" in str(exc).lower()
+                or "already closed" in str(exc).lower()
+            ):
+                raise
+            user_data_dir = _runtime_user_data_dir()
+            profile_directory = _runtime_profile_directory(user_data_dir)
+            logger.warning(
+                "open_page recovered from closed Chrome err=%s; relaunching",
+                exc,
+            )
+            await _restart_agent_chrome(
+                user_data_dir,
+                profile_directory,
+                url or "",
+                reason="open_page_closed_browser",
+            )
+            return await _open_page_once(url)
 
 
 def cdp_list_targets() -> list[dict]:

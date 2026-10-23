@@ -478,6 +478,10 @@ _STEP_QUESTION_CUES: dict[str, str] = {
     "support": r"more than half of your support|half of your support",
     "child_more": r"another child",
     "programs": r"continue to the application|qualify for programs|Medi-Cal",
+    "proceed_application": (
+        r"start the application|eligibility check is finished|can i start"
+    ),
+    "confirm_start_application": r"start the application|say yes to start",
 }
 
 def _yes_no_from_recent_transcript(
@@ -743,6 +747,12 @@ async def on_call_started(call_id: str, form_url: str = "") -> dict[str, Any]:
             "history": (failed.history[-10:] if failed else []),
             "browser": browser,
         }
+    if config.APPLICATION_TEST_MODE and (
+        session.filled.get("application_test_opening") or ""
+    ).strip():
+        from .call_turn import announce_application_test_opening
+
+        await announce_application_test_opening(call_id)
     browser = await describe_live_browser(session, call_id=call_id)
     opened = bool(browser.get("opened")) and session.status == "open"
     if not opened:

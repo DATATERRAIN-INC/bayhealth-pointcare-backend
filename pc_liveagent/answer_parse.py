@@ -21,8 +21,12 @@ from .live_form import (
     YES_NO_ELIG_STEPS,
     _age_option_labels,
     _choice_phrase,
+    _detect_income_period_switch,
     _extract_age_numbers,
+    _income_amount_scale_unclear,
     _income_period_choice,
+    _income_range_natural_clarify,
+    _income_scale_clarify_speech,
     _is_no,
     _is_yes,
     _map_age_label,
@@ -31,6 +35,7 @@ from .live_form import (
     _map_special_condition_labels,
     _resolve_income_period_label,
     _spoken_has_age_range_connector,
+    _wants_income_period_reselect,
     classify_yes_no,
 )
 
@@ -47,12 +52,17 @@ _FAST_PATH_DETAILS = frozenset(
         "marital_single",
         "marital_option",
         "spouse_role",
+        "confirm_rel_correction",
+        "confirm_age_correction",
         "relationship_mapped",
+        "relationship_other_text",
         "special_mapped",
         "special_multi",
         "age_mapped",
         "age_free",  # clear spoken age; Playwright opens chips and verifies
         "income_period",
+        "income_period_switch",
+        "income_period_reselect",
         "income_range_mapped",
         "name",
         "special_person",
@@ -114,10 +124,52 @@ def normalize_utterance(raw: str) -> str:
     return text
 
 
+def _collapse_letter_by_letter_spelling(text: str) -> str:
+    """Join clear letter-by-letter spelling into one name token.
+
+    ``H u s s e y`` / ``H-U-S-S-E-Y`` → ``Hussey``.
+    Does not join legitimate multi-word names like ``Anne Marie``.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    # Drop "spelled …" / "it's spelled as …" wrappers.
+    raw = re.sub(
+        r"^(?:(?:it'?s|that'?s|the\s+name\s+is)\s+)?"
+        r"(?:spelled?|spelling)\s*(?:as\s+|is\s+|out\s+)?",
+        "",
+        raw,
+        flags=re.I,
+    ).strip()
+    # Tokenize on spaces and hyphens used between letters.
+    parts = [p for p in re.split(r"[\s\-–—]+", raw) if p]
+    if len(parts) < 3:
+        return text.strip()
+    # Every token must be a single alphabetic letter (optional trailing apostrophe).
+    if not all(re.fullmatch(r"[A-Za-z]'?", part) for part in parts):
+        return text.strip()
+    joined = "".join(part[0] for part in parts)
+    # Preserve a trailing apostrophe only if a token carried one mid-name (rare).
+    if any(part.endswith("'") for part in parts[:-1]):
+        # Rebuild with apostrophes after those letters (e.g. O' B R I E N → O'Brien).
+        bits: list[str] = []
+        for part in parts:
+            bits.append(part[0])
+            if part.endswith("'"):
+                bits.append("'")
+        joined = "".join(bits)
+    if "'" in joined:
+        # Title-case around apostrophe: o'brien → O'Brien
+        segs = joined.split("'")
+        return "'".join(seg.capitalize() for seg in segs if seg is not None)
+    return joined.capitalize()
+
+
 def sanitize_person_name(raw: str) -> str:
     """Strip ASR sentence punctuation; keep apostrophes/hyphens/accents.
 
-    Also unwrap phrases like "Last name is Martin" / "First name is John".
+    Also unwrap phrases like "Last name is Martin" / "First name is John",
+    and collapse letter-by-letter spelling (``H u s s e y`` → ``Hussey``).
     """
     text = normalize_utterance(raw)
     if not text:
@@ -145,6 +197,8 @@ def sanitize_person_name(raw: str) -> str:
     text = re.sub(r"\s+\.", ".", text)
     # Drop trailing ASR filler ("Angel or" → "Angel").
     text = re.sub(r"\s+\b(or|and|uh|um|ah)\b\s*$", "", text, flags=re.I).strip()
+    # Letter-by-letter spelling from ASR must not keep spaces between letters.
+    text = _collapse_letter_by_letter_spelling(text)
     return text
 
 
@@ -322,11 +376,15 @@ def extract_email(text: str) -> str:
 
 
 def _with_full_question(step: str, clarify: str, *, options: list[str] | None = None) -> str:
-    """Full question + specific clarify; never clarify alone for Yes/No steps."""
+    """Full question + specific clarify; never clarify alone for Yes/No steps.
+
+    Does not append internal validation chrome. Does not enumerate income bands.
+    """
+    del options  # Kept for call-site compatibility; use build_options_help_speech.
     try:
         from .elig_meta import format_question
 
-        question = format_question(step, options=options)
+        question = format_question(step)
     except Exception:
         question = (ELIG_QUESTIONS.get(step) or "").strip()
     clarify = (clarify or "").strip()
@@ -338,19 +396,30 @@ def _with_full_question(step: str, clarify: str, *, options: list[str] | None = 
         return question
     if question.lower().startswith(clarify.lower()):
         return question
-    return f"{question} {clarify}"
+    # Avoid stacking the same question when clarify already restates it.
+    if "required to continue" in clarify.lower():
+        clarify = re.sub(
+            r"\s*This field is required to continue\.?",
+            "",
+            clarify,
+            flags=re.I,
+        ).strip()
+    return f"{question} {clarify}".strip()
 
 
 def _options_clarify(step: str, options: list[str] | None, fallback: str) -> str:
-    if options:
-        shown = [item for item in options if item and len(item) < 60][:8]
-        if shown:
-            return _with_full_question(
-                step,
-                f"Please choose one of: {', '.join(shown)}.",
-                options=options,
-            )
-    return _with_full_question(step, fallback, options=options)
+    """Speak available choices without internal validation or income-band lists."""
+    if step == "income_range":
+        return _income_range_natural_clarify("", period="Annual")
+    try:
+        from .live_form import build_options_help_speech
+
+        spoken = build_options_help_speech(step, options)
+        if spoken:
+            return spoken
+    except Exception:
+        pass
+    return _with_full_question(step, fallback)
 
 
 def resolve_answer(
@@ -437,11 +506,75 @@ def resolve_answer(
                 answer=("No" if token.startswith("n") else "Yes"),
                 detail="yes_no_clear",
             )
+        # Application start gate: accept clear start/continue intent as Yes.
+        if step in (
+            "proceed_application",
+            "confirm_start_application",
+            "programs",
+        ) and re.search(
+            r"\b(start|continue|proceed|go ahead|quick apply)\b",
+            text,
+            re.I,
+        ):
+            return ResolveResult(answer="Yes", detail="yes")
+        # Member confirm: a relationship chip name is an in-place correction,
+        # not an unclear Yes/No (avoids Claude timeout → stuck confirm).
+        if step in ("spouse_confirm", "person_confirm", "child_confirm"):
+            low = (text or "").lower()
+            if step == "spouse_confirm" and re.search(
+                r"\b(spouse|partner)\b.{0,24}\b(correct|right)\b"
+                r"|\b(correct|right)\b.{0,24}\b(spouse|partner)\b",
+                low,
+            ):
+                return ResolveResult(answer="Yes", detail="yes")
+            if step == "spouse_confirm":
+                if re.search(r"\bpartner\b", low):
+                    return ResolveResult(
+                        answer="Partner", detail="confirm_rel_correction"
+                    )
+                if re.search(r"\bspouse\b", low):
+                    return ResolveResult(
+                        answer="Spouse", detail="confirm_rel_correction"
+                    )
+            else:
+                from .live_form import _default_relationship_options
+
+                rel_step = (
+                    "person_rel" if step == "person_confirm" else "child_rel"
+                )
+                pool = list(options or []) or _default_relationship_options(
+                    rel_step
+                )
+                mapped = _map_relationship_label(text, pool)
+                if mapped:
+                    return ResolveResult(
+                        answer=mapped, detail="confirm_rel_correction"
+                    )
+            from .live_form import _is_relationship_only_age_utterance
+
+            if not _is_relationship_only_age_utterance(text) and (
+                _extract_age_numbers(text)
+                or re.search(
+                    r"\b(baby|babies|toddler|teen(?:ager)?|adult|senior|years?\s+old)\b",
+                    low,
+                )
+            ):
+                return ResolveResult(
+                    answer=(text or "").strip(),
+                    detail="confirm_age_correction",
+                )
+        # Never attach dashboard button labels (Continue Quick Apply, etc.) here.
+        gate_opts = (
+            None
+            if step
+            in ("proceed_application", "confirm_start_application", "programs")
+            else options
+        )
         return ResolveResult(
             clarify=_with_full_question(
                 step,
                 "I need a clear yes or no for this one.",
-                options=options,
+                options=gate_opts,
             ),
             detail="yes_no_unclear",
         )
@@ -494,6 +627,24 @@ def resolve_answer(
         )
 
     if answer_type == "income_period" or step == "income_when":
+        # Do not send income-amount utterances to the period resolver.
+        period_guess = _income_period_choice(text)
+        looks_like_amount = bool(
+            re.search(r"\$|\d|thousand|million|\bk\b|dollar", text, re.I)
+        )
+        if looks_like_amount and period_guess not in {
+            "Annual",
+            "Monthly",
+            "Bi-weekly",
+        }:
+            return ResolveResult(
+                clarify=_with_full_question(
+                    step,
+                    "Please say Annual, Monthly, or Bi-weekly for the income period.",
+                    options=options,
+                ),
+                detail="income_period_unclear",
+            )
         resolved = _resolve_income_period_label(text, options)
         if not resolved:
             canonical = _income_period_choice(text)
@@ -516,32 +667,40 @@ def resolve_answer(
         )
 
     if answer_type == "income_range" or step == "income_range":
+        # Classify period-change / reselect before treating the utterance as an amount.
+        switch_to = _detect_income_period_switch(text)
+        if switch_to:
+            return ResolveResult(
+                answer=f"__INCOME_PERIOD_SWITCH__:{switch_to}",
+                detail="income_period_switch",
+            )
+        if _wants_income_period_reselect(text):
+            return ResolveResult(
+                answer="__INCOME_PERIOD_RESELECT__",
+                detail="income_period_reselect",
+            )
+        if _income_amount_scale_unclear(text):
+            return ResolveResult(
+                clarify=_income_scale_clarify_speech(text, "Annual"),
+                detail="income_scale_unclear",
+            )
         if options:
             mapped = _map_income_range_label(text, options)
             if mapped:
                 return ResolveResult(answer=mapped, detail="income_range_mapped")
             return ResolveResult(
-                clarify=_options_clarify(
-                    step,
-                    [item for item in options if "$" in item or re.search(r"\d", item)]
-                    or options,
-                    "Please say which income range matches what you earn.",
-                ),
+                clarify=_income_range_natural_clarify(text, period="Annual"),
                 detail="income_range_ambiguous",
             )
         # Without live options, pass free text through for Playwright remapping.
         if re.search(
-            r"\$|\d|thousand|hundred|zero|first|lowest|option|dollar|\bk\b",
+            r"\$|\d|thousand|hundred|million|zero|first|lowest|option|dollar|\bk\b",
             text,
             re.I,
         ):
             return ResolveResult(answer=text, detail="income_range_free")
         return ResolveResult(
-            clarify=_options_clarify(
-                step,
-                options,
-                "Please say an income range like forty thousand to fifty thousand.",
-            ),
+            clarify=_income_range_natural_clarify(text, period="Annual"),
             detail="income_range_unclear",
         )
 
@@ -587,11 +746,20 @@ def resolve_answer(
         mapped_rel = _map_relationship_label(text, list(rel_opts))
         if mapped_rel:
             return ResolveResult(answer=mapped_rel, detail="relationship_mapped")
+        # Explicit "Other" even when the chip label casing differs.
+        if re.search(r"\bother\b", text, re.I) and not re.search(
+            r"\b(mother|brother|father|grandmother|grandfather)\b", text, re.I
+        ):
+            other_hit = next(
+                (label for label in rel_opts if label.lower().rstrip(" *") == "other"),
+                "Other",
+            )
+            return ResolveResult(answer=other_hit, detail="relationship_mapped")
         return ResolveResult(
             clarify=_options_clarify(
                 step,
                 list(rel_opts),
-                "Please say the relationship, like Child, Stepchild, or Grandchild.",
+                "Please say the relationship, like Child, Stepchild, or Other.",
             ),
             detail="relationship_unclear",
         )

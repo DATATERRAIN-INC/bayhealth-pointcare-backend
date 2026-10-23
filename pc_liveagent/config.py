@@ -24,6 +24,81 @@ CHROME_NO_SANDBOX = os.environ.get("CHROME_NO_SANDBOX", "false").lower() in (
     "yes",
 )
 HEADLESS = os.environ.get("HEADLESS", "false").lower() in ("true", "1", "yes")
+
+
+def application_test_mode_from_env(env: dict | None = None) -> bool:
+    """True only when the application-only test flag is explicitly enabled.
+
+    Disabled by default. A production APP_ENV or POINTCARE_ENV stays off unless
+    POINTCARE_APPLICATION_TEST_MODE_ALLOW_PROD is also explicitly true, so a
+    copied local flag cannot turn this on for unrestricted production calls.
+    """
+    src = os.environ if env is None else env
+
+    def _flag(name: str) -> bool:
+        return str(src.get(name, "")).strip().lower() in ("true", "1", "yes")
+
+    if not _flag("POINTCARE_APPLICATION_TEST_MODE"):
+        return False
+    pointcare_env = (
+        str(src.get("APP_ENV") or src.get("POINTCARE_ENV") or "development")
+        .strip()
+        .lower()
+    )
+    if pointcare_env in ("production", "prod") and not _flag(
+        "POINTCARE_APPLICATION_TEST_MODE_ALLOW_PROD"
+    ):
+        return False
+    return True
+
+
+# Temporary Stage E application-only testing. Read once at import; tests patch this.
+# When on and the Chrome profile is already signed in: skip greeting, spoken
+# sign-in, logout, and Stage D; land on the saved program summary / application.
+# Keep POINTCARE_APPLICATION_AFTER_SIGNIN false while using this flag.
+# Default remains off so production runs the full intro → Stage D → Stage E flow.
+APPLICATION_TEST_MODE = application_test_mode_from_env()
+
+
+def application_after_signin_from_env(env: dict | None = None) -> bool:
+    """True only when intro and sign-in should stay, and Stage D should not start.
+
+    Disabled by default. Production stays off unless
+    POINTCARE_APPLICATION_AFTER_SIGNIN_ALLOW_PROD is also explicitly true.
+    Separate from APPLICATION_TEST_MODE (which also skips the intro). Prefer
+    only one of these flags on at a time; TEST_MODE takes precedence in startup.
+    """
+    src = os.environ if env is None else env
+
+    def _flag(name: str) -> bool:
+        return str(src.get(name, "")).strip().lower() in ("true", "1", "yes")
+
+    if not _flag("POINTCARE_APPLICATION_AFTER_SIGNIN"):
+        return False
+    pointcare_env = (
+        str(src.get("APP_ENV") or src.get("POINTCARE_ENV") or "development")
+        .strip()
+        .lower()
+    )
+    if pointcare_env in ("production", "prod") and not _flag(
+        "POINTCARE_APPLICATION_AFTER_SIGNIN_ALLOW_PROD"
+    ):
+        return False
+    return True
+
+
+APPLICATION_AFTER_SIGNIN = application_after_signin_from_env()
+
+# Visible at process start so operators can confirm shortcuts are off for full calls.
+import logging as _logging
+
+_logging.getLogger(__name__).info(
+    "pointcare_flow_flags APPLICATION_TEST_MODE=%s APPLICATION_AFTER_SIGNIN=%s "
+    "(full call requires both false; restart after .env changes)",
+    APPLICATION_TEST_MODE,
+    APPLICATION_AFTER_SIGNIN,
+)
+
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "25"))
 PORT = int(os.environ.get("PORT", "8001"))
 # Public HTTPS origin used in chrome_url / open_url (preferred over request Host).

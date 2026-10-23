@@ -10,10 +10,27 @@ from .answer_parse import normalize_utterance
 
 @dataclass(frozen=True)
 class ControlIntent:
-    kind: str  # none | repeat | next | go_back | redo | change | skip
+    kind: str  # none | repeat | list_options | next | go_back | redo | change | skip
     target: str = ""  # age | name | first_name | last_name | answer | ""
     value: str = ""  # optional new value embedded in the utterance
 
+
+# Explicit ask for the available choices — do not treat as an answer.
+_LIST_OPTIONS_RE = re.compile(
+    r"\b("
+    r"what\s+are\s+(?:the\s+|my\s+|all\s+)?(?:options|choices|selections)"
+    r"(?:\s+available)?|"
+    r"what\s+(?:options|choices)\s+(?:are\s+)?(?:available|there)|"
+    r"what\s+(?:can|do)\s+i\s+(?:say|choose|pick|select)|"
+    r"(?:can\s+you\s+)?(?:please\s+)?(?:repeat|say|list|read)\s+"
+    r"(?:the\s+)?(?:options|choices)(?:\s+again)?|"
+    r"list\s+(?:the\s+)?(?:options|choices)|"
+    r"what\s+are\s+(?:my\s+)?(?:available\s+)?(?:choices|options)|"
+    r"tell\s+me\s+(?:the\s+)?(?:options|choices)|"
+    r"which\s+(?:options|choices)\s+(?:are\s+)?(?:available|there)"
+    r")\b",
+    re.I,
+)
 
 _NEXT_RE = re.compile(
     r"\b("
@@ -80,11 +97,13 @@ _CHANGE_RE = re.compile(
     r"\b("
     r"change\s+that|"
     r"change\s+(?:my\s+)?answer|"
-    r"correct\s+(?:my\s+)?(?:answer|name|age)|"
+    r"correct\s+(?:my\s+)?(?:answer|name|age|relationship)|"
     r"i\s+want\s+to\s+correct|"
+    r"(?:i\s+)?(?:need|want)\s+to\s+change|"
     r"can\s+i\s+change|"
-    r"change\s+(?:what\s+i\s+entered|the\s+(?:name|age|answer))|"
-    r"change\s+(?:the\s+)?(?:age|name|first\s+name|last\s+name)"
+    r"(?:age|name|relationship)\s+is\s+wrong|"
+    r"change\s+(?:what\s+i\s+entered|the\s+(?:name|age|answer|relationship))|"
+    r"change\s+(?:the\s+)?(?:age|name|first\s+name|last\s+name|relationship)"
     r")\b",
     re.I,
 )
@@ -100,7 +119,7 @@ _SKIP_RE = re.compile(
 )
 
 _CHANGE_VALUE_RE = re.compile(
-    r"change\s+(?:the\s+)?(?P<target>age|name|first\s+name|last\s+name|answer)"
+    r"change\s+(?:the\s+)?(?P<target>age|name|first\s+name|last\s+name|relationship|answer)"
     r"\s+(?:to|into)\s+(?P<value>.+)$",
     re.I,
 )
@@ -117,6 +136,9 @@ def detect_control_intent(utterance: str) -> ControlIntent:
         return ControlIntent("none")
 
     # Order matters: next before repeat (both may contain "question").
+    # Options-help before next/repeat so "what are the options" is never answered.
+    if _LIST_OPTIONS_RE.search(text):
+        return ControlIntent("list_options")
     if _NEXT_RE.search(text):
         return ControlIntent("next")
     if _GO_BACK_RE.search(text):

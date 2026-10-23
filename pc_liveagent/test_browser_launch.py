@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -367,13 +368,23 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with (
+            patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
+            patch("pc_liveagent.config.APPLICATION_AFTER_SIGNIN", False),
             patch("pc_liveagent.live_form.open_page", new=AsyncMock(return_value=page)),
             patch(
                 "pc_liveagent.live_form._logout_for_fresh_signin",
                 new=AsyncMock(),
             ),
             patch(
-                "pc_liveagent.live_form._page_wait",
+                "pc_liveagent.live_form._already_signed_in",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form._on_saved_household_surface",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.live_form.advance_welcome_screens",
                 new=AsyncMock(side_effect=boom),
             ),
         ):
@@ -481,6 +492,167 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             info = await describe_live_browser(session, call_id="call_err")
         self.assertFalse(info["opened"])
         self.assertIn("BROWSER_CLOSED", info["error"])
+
+
+class ClosedChromeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """After the user closes agent Chrome, reopen maximized and recover the tab."""
+
+    async def asyncTearDown(self) -> None:
+        import pc_liveagent.browser as browser_mod
+
+        browser_mod._browser = None
+        browser_mod._playwright = None
+
+    async def test_page_from_browser_reuses_context_never_new_context(self) -> None:
+        import pc_liveagent.browser as browser_mod
+
+        page = AsyncMock()
+        page.is_closed = lambda: False
+        context = AsyncMock()
+        context.pages = [page]
+        context.new_page = AsyncMock()
+        browser = AsyncMock()
+        browser.contexts = [context]
+        browser.new_context = AsyncMock(
+            side_effect=RuntimeError("new_context must not be called over CDP")
+        )
+
+        got = await browser_mod._page_from_browser(browser)
+        self.assertIs(got, page)
+        browser.new_context.assert_not_called()
+        context.new_page.assert_not_called()
+
+    async def test_open_page_relaunches_after_target_closed(self) -> None:
+        import pc_liveagent.browser as browser_mod
+
+        good = AsyncMock()
+        good.url = "https://my.pointcare.com/onboarding"
+        attempts = {"n": 0}
+
+        async def once(url=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError(
+                    "Browser.new_context: Target page, context or browser has been closed"
+                )
+            return good
+
+        with (
+            patch.object(browser_mod, "_open_page_once", side_effect=once),
+            patch.object(browser_mod, "_restart_agent_chrome", new=AsyncMock()) as restart,
+            patch.object(browser_mod, "_runtime_user_data_dir", return_value=Path("x")),
+            patch.object(browser_mod, "_runtime_profile_directory", return_value="Default"),
+        ):
+            page = await browser_mod.open_page("https://my.pointcare.com/onboarding")
+
+        self.assertIs(page, good)
+        self.assertEqual(attempts["n"], 2)
+        restart.assert_awaited_once()
+        self.assertEqual(
+            restart.await_args.kwargs.get("reason"), "open_page_closed_browser"
+        )
+
+    async def test_ensure_chrome_restarts_when_cdp_has_no_pages(self) -> None:
+        import pc_liveagent.browser as browser_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "Profile_2"
+            folder.mkdir()
+            with (
+                patch.object(browser_mod, "_runtime_user_data_dir", return_value=folder),
+                patch.object(browser_mod, "_runtime_profile_directory", return_value="Default"),
+                patch.object(browser_mod, "_cdp_up", return_value=True),
+                patch.object(browser_mod, "_cdp_belongs_to", return_value=True),
+                patch.object(browser_mod, "_cdp_has_page_targets", return_value=False),
+                patch.object(browser_mod, "_restart_agent_chrome", new=AsyncMock()) as restart,
+            ):
+                await browser_mod._ensure_chrome_process(
+                    "https://my.pointcare.com/onboarding"
+                )
+
+        restart.assert_awaited_once()
+        self.assertEqual(
+            restart.await_args.kwargs.get("reason"), "cdp_up_but_no_page_targets"
+        )
+
+
+class AgentProfileReuseTests(unittest.TestCase):
+    def test_profile_directory_keeps_source_name(self) -> None:
+        from pc_liveagent import browser as browser_mod
+
+        with patch.object(browser_mod, "CHROME_PROFILE_DIRECTORY", "Profile 2"):
+            self.assertEqual(
+                browser_mod._runtime_profile_directory(Path("C:/agent")),
+                "Profile 2",
+            )
+
+    def test_existing_agent_profile_is_not_replaced(self) -> None:
+        from pc_liveagent import browser as browser_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = root / "PointcareAgentChrome" / "Profile_2"
+            source = root / "Profile 2"
+            source.mkdir()
+            (source / "Preferences").write_text("{}", encoding="utf-8")
+            dest = agent / "Profile 2"
+            dest.mkdir(parents=True)
+            (dest / "Preferences").write_text("keep-me", encoding="utf-8")
+            with (
+                patch.object(browser_mod, "CHROME_AGENT_DATA", agent),
+                patch.object(browser_mod, "CHROME_SOURCE_PROFILE_DIR", source),
+                patch.object(browser_mod, "CHROME_PROFILE_DIRECTORY", "Profile 2"),
+                patch.object(browser_mod, "CHROME_PROFILE_DIR", root),
+                patch.object(
+                    browser_mod.shutil,
+                    "rmtree",
+                    side_effect=AssertionError("must not delete the agent profile"),
+                ),
+                patch.object(
+                    browser_mod.subprocess,
+                    "run",
+                    side_effect=AssertionError("must not copy over an existing profile"),
+                ),
+            ):
+                browser_mod._seed_agent_profile(agent)
+            self.assertEqual(
+                (dest / "Preferences").read_text(encoding="utf-8"),
+                "keep-me",
+            )
+
+    def test_locked_copy_does_not_delete_or_replace_key(self) -> None:
+        from pc_liveagent import browser as browser_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = root / "PointcareAgentChrome" / "Profile_2"
+            source = root / "Profile 2"
+            source.mkdir()
+            (source / "Preferences").write_text("{}", encoding="utf-8")
+            with (
+                patch.object(browser_mod, "CHROME_AGENT_DATA", agent),
+                patch.object(browser_mod, "CHROME_SOURCE_PROFILE_DIR", source),
+                patch.object(browser_mod, "CHROME_PROFILE_DIRECTORY", "Profile 2"),
+                patch.object(browser_mod, "CHROME_PROFILE_DIR", root),
+                patch.object(browser_mod.sys, "platform", "win32"),
+                patch.object(
+                    browser_mod.shutil,
+                    "rmtree",
+                    side_effect=AssertionError("must not delete a locked copy"),
+                ),
+                patch.object(
+                    browser_mod.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(args=[], returncode=8),
+                ),
+                patch.object(
+                    browser_mod,
+                    "_sync_os_crypt",
+                    side_effect=AssertionError("must not replace the login key"),
+                ),
+            ):
+                browser_mod._seed_agent_profile(agent)
+            self.assertTrue((agent / ".seeded_from").is_file())
 
 
 if __name__ == "__main__":

@@ -229,27 +229,33 @@ def submit_field_tool_spec(tool_url: str) -> dict[str, Any]:
         "name": "submit_field",
         "url": tool_url,
         "description": (
-            "Collect Mode tool. The server owns Stage D Household Eligibility order "
-            "and branching (Stage E Application is reserved for later). Submit exactly "
-            "one caller answer, stay silent while it runs, then speak only the returned "
-            "text. Use sign_in_google for Google, email for email sign-in, and "
-            "eligibility_answer only after sign-in for household-eligibility answers "
+            "Collect Mode tool. The server owns Stage D Household Eligibility and "
+            "Stage E Application order and branching. Submit exactly one caller "
+            "answer, stay silent while it runs, then speak only the returned text. "
+            "Use sign_in_google for Google, email for email sign-in, "
+            "eligibility_answer after sign-in for household-eligibility answers "
             "(Yes, No, marital options, names, relationships, ages, income, special "
-            "conditions). Never call eligibility_answer for language answers like "
-            "English. If the caller answers mid-question, stop and submit immediately. "
-            "A question you spoke is not an answer. Wait for a new caller utterance "
-            "before calling again. Never invent options or speak JSON."
+            "conditions, program-summary Yes/No), and application_answer only after "
+            "the server has started Stage E. Never call eligibility_answer for "
+            "language answers like English. If the caller answers mid-question, stop "
+            "and submit immediately. A question you spoke is not an answer. Wait for "
+            "a new caller utterance before calling again. Never invent options or "
+            "speak JSON."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "field_id": {
                     "type": "string",
-                    # application_answer reserved when Stage E Collect Mode is enabled.
-                    "enum": ["sign_in_google", "email", "eligibility_answer"],
+                    "enum": [
+                        "sign_in_google",
+                        "email",
+                        "eligibility_answer",
+                        "application_answer",
+                    ],
                     "description": (
-                        "sign_in_google | email | eligibility_answer "
-                        "(future: application_answer for Stage E)."
+                        "sign_in_google | email | eligibility_answer | "
+                        "application_answer (Stage E only)."
                     ),
                 },
                 "value": {

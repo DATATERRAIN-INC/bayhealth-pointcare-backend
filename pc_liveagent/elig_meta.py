@@ -51,6 +51,7 @@ ELIG_FIELD_META: dict[str, FieldMeta] = {
     "spouse_last": _meta("text"),
     "spouse_role": _meta("choice", options_hint=("Spouse", "Partner")),
     "spouse_age": _meta("age"),
+    "spouse_confirm": _meta("yes_no"),
     "children": _meta("yes_no"),
     "child_first": _meta("text"),
     "child_last": _meta("text"),
@@ -59,6 +60,7 @@ ELIG_FIELD_META: dict[str, FieldMeta] = {
         options_hint=("Child", "Stepchild", "Grandchild", "Foster Child", "Other"),
     ),
     "child_age": _meta("age"),
+    "child_confirm": _meta("yes_no"),
     "child_more": _meta("yes_no"),
     "student": _meta("yes_no"),
     "disabled": _meta("yes_no"),
@@ -66,8 +68,19 @@ ELIG_FIELD_META: dict[str, FieldMeta] = {
     "support": _meta("yes_no"),
     "person_first": _meta("text"),
     "person_last": _meta("text"),
-    "person_rel": _meta("text"),
+    "person_rel": _meta(
+        "choice",
+        # Default Pointcare person/relative form chips; live peek overrides when present.
+        options_hint=(
+            "Child",
+            "Stepchild",
+            "Grandchild",
+            "Foster Child",
+            "Other",
+        ),
+    ),
     "person_age": _meta("age"),
+    "person_confirm": _meta("yes_no"),
     "income_when": _meta(
         "income_period",
         options_hint=("Annual", "Monthly", "Bi-weekly"),
@@ -79,6 +92,8 @@ ELIG_FIELD_META: dict[str, FieldMeta] = {
     "babies_count": _meta("text"),
     "due_date": _meta("text", required=None, can_skip=False),
     "programs": _meta("yes_no"),
+    "proceed_application": _meta("yes_no"),
+    "confirm_start_application": _meta("yes_no"),
 }
 
 
@@ -86,25 +101,44 @@ def get_field_meta(step: str) -> FieldMeta:
     return ELIG_FIELD_META.get(step) or _meta("text", required=None)
 
 
-def format_question(step: str, *, options: list[str] | None = None) -> str:
-    """Full spoken question with required/optional hint when known."""
-    base = (ELIG_QUESTIONS.get(step) or "").strip()
+def format_question(
+    step: str,
+    *,
+    options: list[str] | None = None,
+    period: str | None = None,
+    include_choices: bool = False,
+) -> str:
+    """Full spoken question for the active step.
+
+    Never appends internal validation chrome such as
+    \"This field is required to continue.\" Choice lists are opt-in via
+    ``include_choices`` — prefer ``build_options_help_speech`` when the
+    caller explicitly asks for options.
+    """
+    if step == "income_range":
+        from .live_form import _income_range_question_for_period
+
+        base = _income_range_question_for_period(period or "Annual").strip()
+    elif step in ("child_rel", "person_rel", "spouse_role"):
+        from .live_form import relationship_question_speech
+
+        return relationship_question_speech(step, options)
+    else:
+        base = (ELIG_QUESTIONS.get(step) or "").strip()
     if not base:
         return "Could you say that again?"
     meta = get_field_meta(step)
-    hint = ""
-    if meta.required is True:
-        hint = " This field is required to continue."
-    elif meta.required is False or meta.can_skip:
-        hint = (
-            " This question is optional. You can answer it, or say skip if you prefer."
-        )
-    # Avoid duplicating "Please say Yes or No" style if already in base.
+    # Never list raw $ income chips for voice — callers cannot see the browser.
     extras: list[str] = []
-    if options:
+    if (
+        include_choices
+        and options
+        and meta.answer_type in ("choice", "age", "income_period")
+        and step != "income_range"
+    ):
         shown = [item for item in options if item and len(item) < 60][:8]
-        if shown and meta.answer_type in ("choice", "age", "income_range", "income_period"):
+        if shown:
             joined = ", ".join(shown)
             if joined.lower() not in base.lower():
                 extras.append(f" The choices are: {joined}.")
-    return f"{base}{hint}{''.join(extras)}".strip()
+    return f"{base}{''.join(extras)}".strip()

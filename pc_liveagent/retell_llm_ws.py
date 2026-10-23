@@ -281,6 +281,7 @@ async def handle_retell_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     call_id,
                     utterance,
                     response_id=response_id,
+                    transcript_user_index=decision.user_index,
                 )
                 if my_id != latest_response_id:
                     logger.info(

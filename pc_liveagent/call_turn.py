@@ -16,6 +16,7 @@ from typing import Any
 
 from . import config
 from .answer_parse import (
+    ResolveResult,
     extract_email,
     is_apple_choice,
     is_email_choice,
@@ -37,8 +38,11 @@ from .live_form import (
     EMAIL_SECURE_RETRY,
     _age_option_labels,
     _child_instance_id,
+    _detect_income_period_switch,
     _is_no,
     _is_yes,
+    _wants_income_period_reselect,
+    correct_member_field,
     correct_name_field,
     get_session,
     navigate_back_one,
@@ -59,6 +63,7 @@ _SLOW_ELIG_STEPS = frozenset(
         "child_last",
         "child_rel",
         "child_age",
+        "child_confirm",
         "child_more",
         "student",
         "disabled",
@@ -68,16 +73,20 @@ _SLOW_ELIG_STEPS = frozenset(
         "spouse_last",
         "spouse_role",
         "spouse_age",
+        "spouse_confirm",
         "person_first",
         "person_last",
         "person_rel",
         "person_age",
+        "person_confirm",
         "income_when",
         "income_range",
         "special",
         "special_person",
         "special_more",
         "programs",
+        "proceed_application",
+        "confirm_start_application",
     }
 )
 _elig_browser_tasks: dict[str, asyncio.Task] = {}
@@ -114,9 +123,8 @@ CLOSING = (
     "I've finished filling your household eligibility form. "
     "Thank you for your time. Goodbye."
 )
-# Stage E (application) reserved — after programs we close for now.
-# When enabled, start_stage_e() should drive application_answer fills.
-STAGE_E_ENABLED = False
+# Stage E Application Collect Mode — entered only after Yes on program-summary.
+STAGE_E_ENABLED = True
 
 _PENDING_SIGNIN_RE = re.compile(
     r"complete the visible google|say google again|has not finished|"
@@ -127,18 +135,54 @@ _PENDING_SIGNIN_RE = re.compile(
 _signin_watch_tasks: dict[str, asyncio.Task] = {}
 _sso_tasks: dict[str, asyncio.Task] = {}
 _email_auth_tasks: dict[str, asyncio.Task] = {}
+_app_browser_tasks: dict[str, asyncio.Task] = {}
+
+_SLOW_APP_STEPS = frozenset(
+    {
+        "app_agent_offer",
+        "app_citizenship",
+        "app_immigration",
+        "app_insurance",
+        "app_dob_review",
+        "app_address_review",
+        "app_marital_review",
+        "app_childcare_review",
+        "app_circumstances",
+        "app_tax",
+        "app_income",
+        "app_income_employed",
+        "app_income_self",
+        "app_income_more",
+        "app_expenses",
+        "app_documents",
+        "app_submit_confirm",
+    }
+)
 
 
 async def start_stage_e(call_id: str, form_url: str = "") -> TurnResult:
-    """Hook for Stage E application workflow after household eligibility."""
+    """Begin Stage E when application was already started (idempotent recovery)."""
+    from .app_stage import app_question_for_step
+    from .live_form import get_session
+
+    session = await get_session(call_id)
+    if session is None or not (session.app_step or "").strip():
+        return TurnResult(
+            speech=CLOSING,
+            end_call=True,
+            phase="closing",
+            detail="stage_e_not_ready",
+        )
+    step = session.app_step
+    speech = app_question_for_step(step, session)
+    ctrl = await get_controller(call_id)
+    ctrl.phase = "application"
+    ctrl.last_speech = speech
     return TurnResult(
-        speech=(
-            "Your household eligibility answers are saved. The full application "
-            "will continue in a later update. Thank you. Goodbye."
-        ),
-        end_call=True,
-        phase="closing",
-        detail="stage_e_not_enabled",
+        speech=speech,
+        end_call=False,
+        phase="application",
+        detail="stage_e",
     )
 
 
@@ -222,7 +266,7 @@ def _wants_email_go_back(text: str) -> bool:
 @dataclass
 class CallController:
     call_id: str
-    # language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|closing
+    # language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|application|closing
     phase: str = "language"
     turn_seq: int = 0
     # Dedupe key includes phase/step so consecutive Yes/No across questions apply.
@@ -265,6 +309,14 @@ class CallController:
     # tip of the user transcript so unchanged historical lines are not re-run.
     last_transcript_user_index: int = -1
     last_transcript_user_fp: str = ""
+    # User-turn index already applied to a field. A later step must not consume
+    # that same transcript event again. A higher index is a new spoken turn,
+    # even when the words match.
+    consumed_transcript_user_index: int = -1
+    # True after an eligibility browser attempt failed. A later Retell turn
+    # (higher user index) may repeat the same words, such as Yes after a
+    # failed confirmation. A replay of the consumed index is still dropped.
+    last_elig_attempt_failed: bool = False
     # Last response_id we already answered (provider-level event dedupe).
     last_handled_response_id: int | None = None
 
@@ -283,7 +335,13 @@ async def get_controller(call_id: str) -> CallController:
 
 
 async def drop_controller(call_id: str) -> None:
-    for bucket in (_signin_watch_tasks, _sso_tasks, _elig_browser_tasks, _email_auth_tasks):
+    for bucket in (
+        _signin_watch_tasks,
+        _sso_tasks,
+        _elig_browser_tasks,
+        _email_auth_tasks,
+        _app_browser_tasks,
+    ):
         task = bucket.pop(call_id, None)
         if task and not task.done():
             task.cancel()
@@ -333,6 +391,41 @@ def _correction_prompt(field: str) -> str:
     return f"Of course. What should the {nice} be?"
 
 
+def _same_member_form_step(step: str) -> bool:
+    """True when the active step belongs to an open spouse/child/person form."""
+    s = str(step or "")
+    return s.startswith(("spouse_", "child_", "person_"))
+
+
+def _step_group_safe(step: str) -> str:
+    s = str(step or "")
+    if s.startswith("spouse_"):
+        return "spouse_form"
+    if s.startswith("child_"):
+        return "child_form"
+    if s.startswith("person_"):
+        return "person_form"
+    return s
+
+
+_FIELD_ONLY_RE = re.compile(
+    r"^\s*(?:the\s+)?(?P<field>first\s+name|last\s+name|name|age|relationship)\s*"
+    r"(?:only|please|field)?[.!]?\s*$",
+    re.I,
+)
+
+
+def _field_from_confirm_utterance(text: str) -> str:
+    """Map a short confirm-correction reply onto a field name."""
+    m = _FIELD_ONLY_RE.match(text or "")
+    if not m:
+        return ""
+    raw = re.sub(r"\s+", "_", m.group("field").lower())
+    if raw == "name":
+        return "first_name"
+    return raw
+
+
 def _step_for_correction_field(field: str, current_step: str) -> str:
     """Best target elig_step for a correction field given where we are."""
     if field in ("first_name", "name"):
@@ -354,6 +447,8 @@ def _step_for_correction_field(field: str, current_step: str) -> str:
             return "person_age"
         return "child_age"
     if field == "relationship":
+        if current_step.startswith("spouse_"):
+            return "spouse_role"
         if current_step.startswith("person_"):
             return "person_rel"
         return "child_rel"
@@ -486,6 +581,7 @@ async def _run_eligibility_browser_background(
         else:
             next_step = str((session.elig_step if session else "") or "")
         if not result.get("ok"):
+            ctrl.last_elig_attempt_failed = True
             # Prefer live session step (special_person stays special_person on clarify).
             live_step = (
                 str(result.get("step") or "")
@@ -543,8 +639,38 @@ async def _run_eligibility_browser_background(
             )
             return
 
+        # Programs Yes → Stage E app_* step (do not close).
+        if str(next_step).startswith("app_") or result.get("phase") == "application":
+            ctrl.phase = "application"
+            speech = spoken or format_question(next_step)
+            # format_question may miss app_* — prefer spoken from browser result.
+            if not spoken and str(next_step).startswith("app_"):
+                from .app_stage import app_question_for_step
+
+                speech = app_question_for_step(str(next_step))
+            elif spoken:
+                speech = spoken
+            ctrl.last_speech = speech
+            logger.info(
+                "elig_browser_completed call_id=%s step=%s next=%s outcome=stage_e",
+                call_id,
+                step,
+                next_step,
+            )
+            await _deliver_question_once(
+                call_id, speech, key=f"stage_e:{next_step}:{turn_id}"
+            )
+            return
+
+        ctrl.last_elig_attempt_failed = False
         speech = spoken or format_question(next_step)
         ctrl.last_speech = speech
+        if result.get("await_field_correction"):
+            ctrl.pending_correction = {
+                "field": "",
+                "prompt": speech,
+                "need_field": True,
+            }
         logger.info(
             "elig_browser_completed call_id=%s step=%s next=%s browser_verified=1 epoch=%s",
             call_id,
@@ -565,11 +691,27 @@ async def _run_eligibility_browser_background(
             call_id, speech, key=f"next:{next_step}:{turn_id}"
         )
     except asyncio.CancelledError:
-        logger.info("elig_browser_cancelled call_id=%s epoch=%s", call_id, epoch)
+        # Disconnect / superseded nav — never treat as a successful person save.
+        logger.info(
+            "elig_browser_cancelled call_id=%s step=%s epoch=%s "
+            "(no commit; browser state must be re-verified on resume)",
+            call_id,
+            step,
+            epoch,
+        )
+        trace_event(
+            call_id,
+            "elig_browser_cancelled",
+            step=step,
+            turn_id=turn_id,
+            epoch=epoch,
+            committed=False,
+        )
         raise
     except Exception:
         logger.exception("elig_browser_failed call_id=%s step=%s", call_id, step)
         if not _aborted():
+            ctrl.last_elig_attempt_failed = True
             try:
                 await _deliver_question_once(
                     call_id,
@@ -640,6 +782,9 @@ async def begin_speech(call_id: str) -> str:
     Retell auto_reconnect opens a new socket mid-call. Resetting to language here
     caused a second sign-in ask while the browser was already on eligibility.
     """
+    session = None
+    if config.APPLICATION_TEST_MODE:
+        session = await get_session(call_id)
     async with _controllers_lock:
         existing = _controllers.get(call_id)
         if existing is not None and (
@@ -656,14 +801,99 @@ async def begin_speech(call_id: str) -> str:
             return speech
         ctrl = existing or CallController(call_id=call_id)
         _controllers[call_id] = ctrl
+    opening = _application_test_opening(session)
+    if opening:
+        if session is not None and session.app_step:
+            ctrl.phase = "application"
+        else:
+            ctrl.phase = "eligibility"
+            ctrl.eligibility_screen_verified = True
+        ctrl.eligibility_question_sent = True
+        ctrl.last_speech = opening
+        logger.info("application_test_opening call_id=%s", call_id)
+        return opening
     ctrl.phase = "language"
     ctrl.last_speech = LIVE_FILL_GREETING
     return LIVE_FILL_GREETING
 
 
+def _application_test_opening(session: Any) -> str:
+    if not config.APPLICATION_TEST_MODE or session is None:
+        return ""
+    if (
+        session.elig_step
+        not in ("programs", "proceed_application", "confirm_start_application")
+        and not session.app_step
+    ):
+        return ""
+    return (
+        (session.filled.get("application_test_opening") or "").strip()
+        or (session.filled.get("application_gate_speech") or "").strip()
+    )
+
+
+async def announce_application_test_opening(call_id: str) -> bool:
+    """Replace a greeting already spoken with the saved-household question.
+
+    No-op unless application test mode is on and the browser has already landed
+    on the program summary or an in-progress application.
+    """
+    if not config.APPLICATION_TEST_MODE:
+        return False
+    session = await get_session(call_id)
+    opening = _application_test_opening(session)
+    if not opening or session is None:
+        return False
+    ctrl = await get_controller(call_id)
+    greeted = ctrl.phase == "language"
+    if session.app_step:
+        ctrl.phase = "application"
+    else:
+        ctrl.phase = "eligibility"
+        ctrl.eligibility_screen_verified = True
+    ctrl.last_speech = opening
+    ctrl.eligibility_question_sent = True
+    if not greeted:
+        return True
+    from .retell_llm_ws import speak_now, websocket_connected
+
+    if not websocket_connected(call_id):
+        return True
+    return await speak_now(call_id, opening, interrupt_id=2)
+
+
+def _speech_after_signin(session: Any, spoken: str) -> str:
+    """Question after auth. Prefer the browser tool's spoken text (includes Stage D intro)."""
+    speech = _strip_ask(spoken or "")
+    # Never replace a non-empty post-auth spoken line — _begin_eligibility already
+    # built the household-eligibility purpose intro + first question. Rebuilding
+    # via _eligibility_question_for_session used to drop that intro.
+    if speech:
+        return speech
+    if session is not None:
+        stored = (session.filled.get("eligibility_opening_speech") or "").strip()
+        if stored:
+            return stored
+        if session.elig_step:
+            rebuilt = _eligibility_question_for_session(session)
+            if rebuilt:
+                return rebuilt
+    if config.APPLICATION_AFTER_SIGNIN:
+        return "I could not open the saved Pointcare application page."
+    return ELIG_QUESTIONS.get("marital", "")
+
+
 def _eligibility_question_for_session(session: Any) -> str:
     step = (session.elig_step if session else "") or "marital"
     if session is not None:
+        stored = (session.filled.get("eligibility_opening_speech") or "").strip()
+        # First delivery after Stage D open — keep the purpose intro.
+        if (
+            step == "marital"
+            and stored
+            and not session.filled.get("eligibility_opening_delivered")
+        ):
+            return stored
         from .live_form import _spoken_question_for_step
 
         return _spoken_question_for_step(session, step) or ELIG_QUESTIONS.get(
@@ -756,11 +986,7 @@ async def _promote_email_auth_success(
         )
         return ""
     session = await get_session(call_id)
-    speech = _strip_ask(str(result.get("spoken") or ""))
-    if session and session.elig_step:
-        speech = _eligibility_question_for_session(session)
-    if not speech:
-        speech = ELIG_QUESTIONS.get("marital", "")
+    speech = _speech_after_signin(session, str(result.get("spoken") or ""))
     async with ctrl.lock:
         if epoch is not None and ctrl.email_auth_epoch != epoch:
             return ""
@@ -1211,6 +1437,9 @@ async def deliver_first_eligibility_question(
     ok = await _speak_interrupt(call_id, text)
     if ok:
         ctrl.eligibility_question_sent = True
+        session = await get_session(call_id)
+        if session is not None and (session.filled.get("eligibility_opening_speech") or ""):
+            session.filled["eligibility_opening_delivered"] = "1"
         logger.info(
             "eligibility_question_delivery_outcome call_id=%s outcome=ws_sent "
             "(not confirmation caller heard audio)",
@@ -1275,9 +1504,8 @@ async def _run_google_sso_background(
             return
 
         session = await get_session(call_id)
-        speech = spoken or ELIG_QUESTIONS.get("marital", "")
+        speech = _speech_after_signin(session, spoken)
         if session and session.elig_step:
-            speech = _eligibility_question_for_session(session)
             logger.info(
                 "browser_screen_verified call_id=%s step=%s",
                 call_id,
@@ -1338,9 +1566,7 @@ async def _run_apple_sso_background(
             await _speak_interrupt(call_id, spoken or SIGN_IN_QUESTION)
             return
         session = await get_session(call_id)
-        speech = spoken or ELIG_QUESTIONS.get("marital", "")
-        if session and session.elig_step:
-            speech = _eligibility_question_for_session(session)
+        speech = _speech_after_signin(session, spoken)
         async with ctrl.lock:
             ctrl.sso_in_progress = False
             ctrl.phase = "eligibility"
@@ -1430,6 +1656,10 @@ async def _repeat_with_context(call_id: str, ctrl: CallController) -> str:
                     ctrl.pending_correction.get("field") or "first_name"
                 )
             )
+        if step == "programs" and session is not None:
+            stored = (session.filled.get("programs_permission_speech") or "").strip()
+            if stored:
+                return stored
         labels = await peek_choice_labels(call_id)
         question = format_question(step, options=labels or None)
         from .live_form import _section_context_for_step
@@ -1439,9 +1669,194 @@ async def _repeat_with_context(call_id: str, ctrl: CallController) -> str:
             # Explain section context without restarting or losing answers.
             return f"{context} {question}"
         return question
+    if phase == "application":
+        session = await get_session(call_id)
+        from .app_stage import app_question_for_step
+
+        step = (session.app_step if session else "") or ""
+        return app_question_for_step(step) if step else (ctrl.last_speech or CLOSING)
     if phase == "closing":
         return ctrl.last_speech or CLOSING
     return ctrl.last_speech or f"{CALL_PURPOSE} Could you say that again?"
+
+
+async def _process_application_turn(
+    call_id: str,
+    ctrl: CallController,
+    *,
+    text: str,
+    fp: str,
+    dedupe_ctx: str,
+    turn_id: str,
+    form_url: str,
+) -> TurnResult:
+    """Collect Mode Stage E — one spoken answer → Playwright → next question."""
+    from .app_stage import app_question_for_step
+
+    session = await get_session(call_id)
+    step = (session.app_step if session else "") or ""
+    if not step:
+        ctrl.phase = "closing"
+        speech = ctrl.last_speech or CLOSING
+        return TurnResult(
+            speech=speech, end_call=True, phase="closing", turn_id=turn_id, detail="app_done"
+        )
+
+    intent = detect_control_intent(text) if text else detect_control_intent("")
+    if intent.kind == "repeat":
+        speech = app_question_for_step(step)
+        ctrl.last_speech = speech
+        return TurnResult(
+            speech=speech, phase="application", turn_id=turn_id, detail="repeat"
+        )
+
+    if not text:
+        speech = app_question_for_step(step)
+        ctrl.last_speech = speech
+        return TurnResult(speech=speech, phase="application", turn_id=turn_id)
+
+    commit_key = f"app:{step}:{fp}"
+    if any(item.get("key") == commit_key for item in ctrl.committed[-12:]):
+        return TurnResult(
+            speech=ctrl.last_speech or app_question_for_step(step),
+            phase="application",
+            turn_id=turn_id,
+            detail="duplicate_app_answer",
+        )
+
+    ctrl.last_user_fp = fp
+    ctrl.last_dedupe_ctx = f"application:{step}"
+    ctrl.pending_op_id = turn_id
+
+    if step in _SLOW_APP_STEPS:
+        ctrl.elig_op_in_progress = True
+        epoch = ctrl.elig_nav_epoch
+
+        async def _run_app() -> None:
+            try:
+                result = await submit_field(
+                    call_id,
+                    "application_answer",
+                    text,
+                    url=form_url or config.POINTCARE_URL,
+                    request_id=f"ws-app:{turn_id}",
+                )
+                if _controllers.get(call_id) is not ctrl:
+                    return
+                if ctrl.elig_nav_epoch != epoch:
+                    return
+                spoken = _strip_ask(
+                    str(result.get("spoken") or result.get("message") or "")
+                )
+                next_step = str(result["step"]) if "step" in result else ""
+                if not result.get("ok"):
+                    speech = spoken or app_question_for_step(step)
+                    ctrl.last_speech = speech
+                    await _deliver_question_once(
+                        call_id, speech, key=f"app-fail:{step}:{turn_id}"
+                    )
+                    return
+                ctrl.committed.append(
+                    {
+                        "key": commit_key,
+                        "turn_id": turn_id,
+                        "step": step,
+                        "answer": text,
+                        "at": time.time(),
+                    }
+                )
+                if not next_step:
+                    ctrl.phase = "closing"
+                    speech = _closing_speech(spoken)
+                    ctrl.last_speech = speech
+                    await _deliver_question_once(
+                        call_id,
+                        speech,
+                        key=f"app-close:{turn_id}",
+                        end_call=bool(result.get("end_call", True)),
+                    )
+                    return
+                ctrl.phase = "application"
+                speech = spoken or app_question_for_step(next_step)
+                ctrl.last_speech = speech
+                await _deliver_question_once(
+                    call_id, speech, key=f"app-next:{next_step}:{turn_id}"
+                )
+            except Exception:
+                logger.exception("app_browser_failed call_id=%s step=%s", call_id, step)
+                try:
+                    await _deliver_question_once(
+                        call_id,
+                        app_question_for_step(step),
+                        key=f"app-err:{step}:{turn_id}",
+                    )
+                except Exception:
+                    pass
+            finally:
+                async with ctrl.lock:
+                    if ctrl.elig_nav_epoch == epoch:
+                        ctrl.elig_op_in_progress = False
+                        ctrl.pending_op_id = ""
+                task = _app_browser_tasks.get(call_id)
+                if task is asyncio.current_task():
+                    _app_browser_tasks.pop(call_id, None)
+
+        prev = _app_browser_tasks.get(call_id)
+        if prev and not prev.done():
+            prev.cancel()
+        _app_browser_tasks[call_id] = asyncio.create_task(
+            _run_app(), name=f"app-browser-{call_id}"
+        )
+        return TurnResult(
+            speech=ELIG_PROGRESS_ACK,
+            phase="application",
+            turn_id=turn_id,
+            detail="app_ack",
+        )
+
+    # Fast path (unlikely for Stage E — most steps are slow).
+    result = await submit_field(
+        call_id,
+        "application_answer",
+        text,
+        url=form_url or config.POINTCARE_URL,
+        request_id=f"ws-app:{turn_id}",
+    )
+    spoken = _strip_ask(str(result.get("spoken") or result.get("message") or ""))
+    next_step = str(result["step"]) if "step" in result else ""
+    if not result.get("ok"):
+        speech = spoken or app_question_for_step(step)
+        ctrl.last_speech = speech
+        return TurnResult(
+            speech=speech,
+            phase="application",
+            turn_id=turn_id,
+            ok=False,
+            detail=str(result.get("error") or "")[:200],
+        )
+    ctrl.committed.append(
+        {
+            "key": commit_key,
+            "turn_id": turn_id,
+            "step": step,
+            "answer": text,
+            "at": time.time(),
+        }
+    )
+    if not next_step:
+        ctrl.phase = "closing"
+        speech = _closing_speech(spoken)
+        ctrl.last_speech = speech
+        return TurnResult(
+            speech=speech,
+            end_call=bool(result.get("end_call", True)),
+            phase="closing",
+            turn_id=turn_id,
+            detail="application_complete",
+        )
+    speech = spoken or app_question_for_step(next_step)
+    ctrl.last_speech = speech
+    return TurnResult(speech=speech, phase="application", turn_id=turn_id)
 
 
 async def process_user_turn(
@@ -1450,6 +1865,7 @@ async def process_user_turn(
     *,
     response_id: int | None = None,
     form_url: str = "",
+    transcript_user_index: int | None = None,
 ) -> TurnResult:
     """Primary answer pipeline for Custom LLM WebSocket (and optional tool path)."""
     ctrl = await get_controller(call_id)
@@ -1579,6 +1995,25 @@ async def process_user_turn(
                 turn_id=turn_id,
             )
 
+        # Application test mode: a saved household is already on programs or
+        # Stage E. Do not treat the caller's first words as a language answer.
+        if config.APPLICATION_TEST_MODE:
+            test_session = await get_session(call_id)
+            if test_session and (
+                test_session.elig_step == "programs" or test_session.app_step
+            ):
+                if test_session.app_step:
+                    ctrl.phase = "application"
+                else:
+                    ctrl.phase = "eligibility"
+                    ctrl.eligibility_screen_verified = True
+                opening = (test_session.filled.get("application_test_opening") or "").strip()
+                if opening and (
+                    not ctrl.last_speech or ctrl.last_speech == LIVE_FILL_GREETING
+                ):
+                    ctrl.last_speech = opening
+                ctrl.eligibility_question_sent = True
+
         # If the browser already finished sign-in, never re-ask Google/email.
         if ctrl.phase in _pre_auth_phases:
             promoted = await sync_controller_to_eligibility(call_id)
@@ -1604,13 +2039,37 @@ async def process_user_turn(
         if ctrl.phase == "eligibility":
             session0 = await get_session(call_id)
             elig_step = (session0.elig_step if session0 else "") or "marital"
-        dedupe_ctx = f"{ctrl.phase}:{elig_step}"
+        # Same transcript event must not fill the next field after the step moves.
+        # A higher user index is a new Retell turn and may repeat the same word.
         if (
+            ctrl.phase == "eligibility"
+            and transcript_user_index is not None
+            and ctrl.consumed_transcript_user_index >= 0
+            and transcript_user_index <= ctrl.consumed_transcript_user_index
+        ):
+            speech = ctrl.last_speech or format_question(elig_step)
+            return TurnResult(
+                speech=speech,
+                phase=ctrl.phase,
+                turn_id=turn_id,
+                detail="stale_transcript_turn",
+            )
+        dedupe_ctx = f"{ctrl.phase}:{elig_step}"
+        same_words = bool(
             fp
             and fp == ctrl.last_user_fp
             and dedupe_ctx == ctrl.last_dedupe_ctx
             and ctrl.phase not in ("closing",)
-        ):
+        )
+        # A new spoken turn may repeat Yes after that confirmation failed.
+        # The same Retell user index is already returned as stale_transcript_turn.
+        fresh_after_failed = (
+            ctrl.phase == "eligibility"
+            and ctrl.last_elig_attempt_failed
+            and transcript_user_index is not None
+            and transcript_user_index > ctrl.consumed_transcript_user_index
+        )
+        if same_words and not fresh_after_failed:
             return TurnResult(
                 speech=ctrl.last_speech,
                 phase=ctrl.phase,
@@ -1970,7 +2429,17 @@ async def process_user_turn(
 
             # Navigation / repeat must win over a busy browser fill.
             early_intent = detect_control_intent(text) if text else detect_control_intent("")
-            if early_intent.kind == "go_back":
+            # Income period lives on the same page as income_range — "go back to
+            # monthly" must not click browser Back; fall through to answer resolve.
+            income_period_nav = bool(
+                text
+                and elig_step == "income_range"
+                and (
+                    _detect_income_period_switch(text)
+                    or _wants_income_period_reselect(text)
+                )
+            )
+            if early_intent.kind == "go_back" and not income_period_nav:
                 epoch = _begin_elig_navigation(ctrl)
                 ctrl.pending_correction = None
                 ctrl.last_user_fp = fp
@@ -2046,6 +2515,28 @@ async def process_user_turn(
                         turn_id=turn_id,
                         detail="correction_prompt_repeat",
                     )
+                # "age" / "first name" alone after "which field?" — pin the field.
+                if ctrl.pending_correction.get("need_field") or not (
+                    ctrl.pending_correction.get("field") or ""
+                ).strip():
+                    named = _field_from_confirm_utterance(text) or (
+                        intent_peek.target
+                        if intent_peek.kind == "change"
+                        else ""
+                    )
+                    if named and not intent_peek.value:
+                        prompt = _correction_prompt(named)
+                        ctrl.pending_correction = {
+                            "field": named,
+                            "prompt": prompt,
+                        }
+                        ctrl.last_speech = prompt
+                        return TurnResult(
+                            speech=prompt,
+                            phase=ctrl.phase,
+                            turn_id=turn_id,
+                            detail="correction_prompt",
+                        )
                 if intent_peek.kind == "change" and not intent_peek.value:
                     field = intent_peek.target or ctrl.pending_correction.get(
                         "field"
@@ -2069,55 +2560,138 @@ async def process_user_turn(
                         value = intent_peek.value
                     else:
                         value = text
-                    if field in ("first_name", "last_name", "name"):
-                        value = sanitize_person_name(value) or value
-                        ctrl.pending_correction = None
+                    # Same-form corrections (child/spouse/person): never click Back.
+                    if _same_member_form_step(step) or field in (
+                        "first_name",
+                        "last_name",
+                        "name",
+                        "age",
+                        "relationship",
+                    ):
+                        if field in ("name",):
+                            field = "first_name"
+                        if field in ("first_name", "last_name"):
+                            value = sanitize_person_name(value) or value
                         ctrl.last_user_fp = fp
                         ctrl.last_dedupe_ctx = dedupe_ctx
-                        edit = await correct_name_field(call_id, field, value)
+                        edit = await correct_member_field(call_id, field, value)
                         speech = _strip_ask(str(edit.get("spoken") or ""))
-                        ctrl.last_speech = speech
                         if edit.get("ok"):
+                            ctrl.pending_correction = None
                             session = await get_session(call_id)
                             step = (
                                 str(edit.get("step") or "")
                                 or (session.elig_step if session else step)
                                 or step
                             )
+                        else:
+                            # Keep pending so the caller can retry the value.
+                            ctrl.pending_correction = {
+                                "field": field,
+                                "prompt": speech
+                                or _correction_prompt(field),
+                            }
+                        ctrl.last_speech = speech
                         return TurnResult(
-                            speech=speech or format_question(step),
+                            speech=speech or _correction_prompt(field),
                             phase=ctrl.phase,
                             turn_id=turn_id,
                             ok=bool(edit.get("ok")),
-                            detail="name_corrected"
+                            detail="member_corrected"
                             if edit.get("ok")
-                            else "name_correct_failed",
+                            else "member_correct_failed",
                         )
                     ctrl.pending_correction = None
                     target_step = _step_for_correction_field(field, step)
-                    # Non-name corrections may still need a verified Back.
-                    for _ in range(4):
+                    # Only leave the form when the target is a different page group.
+                    if _step_group_safe(step) != _step_group_safe(target_step):
+                        for _ in range(4):
+                            session = await get_session(call_id)
+                            cur = (session.elig_step if session else "") or step
+                            if cur == target_step:
+                                step = cur
+                                break
+                            nav = await navigate_back_one(call_id)
+                            if not nav.get("ok"):
+                                break
+                            step = str(nav.get("step") or target_step)
+                    else:
+                        step = target_step
                         session = await get_session(call_id)
-                        cur = (session.elig_step if session else "") or step
-                        if cur == target_step:
-                            step = cur
-                            break
-                        nav = await navigate_back_one(call_id)
-                        if not nav.get("ok"):
-                            break
-                        step = str(nav.get("step") or target_step)
+                        if session is not None:
+                            session.elig_step = target_step
                     meta = get_field_meta(step)
                     text = value
                     # Fall through to normal resolve/submit for target_step.
 
             intent = detect_control_intent(text)
-            if intent.kind == "repeat":
-                labels = await peek_choice_labels(call_id)
-                speech = format_question(step, options=labels or None)
+            if intent.kind in ("repeat", "list_options"):
+                if step == "programs":
+                    session_p = await get_session(call_id)
+                    speech = (
+                        (
+                            (session_p.filled.get("programs_permission_speech") or "")
+                            if session_p
+                            else ""
+                        ).strip()
+                        or format_question("programs")
+                    )
+                elif intent.kind == "list_options" or step in (
+                    "child_rel",
+                    "person_rel",
+                    "marital",
+                    "spouse_role",
+                    "income_when",
+                ):
+                    from .live_form import build_options_help_speech
+
+                    labels = await peek_choice_labels(call_id)
+                    if step == "income_range":
+                        period_for_q = (
+                            (session.filled.get("income_when") or "Annual")
+                            if session
+                            else "Annual"
+                        )
+                        speech = format_question(
+                            step, period=period_for_q
+                        )
+                    else:
+                        speech = build_options_help_speech(step, labels or None)
+                else:
+                    labels = await peek_choice_labels(call_id)
+                    period_for_q = None
+                    if step == "income_range" and session is not None:
+                        period_for_q = session.filled.get("income_when") or "Annual"
+                    speech = format_question(
+                        step, options=labels or None, period=period_for_q
+                    )
                 ctrl.last_speech = speech
                 return TurnResult(
-                    speech=speech, phase=ctrl.phase, turn_id=turn_id, detail="repeat"
+                    speech=speech,
+                    phase=ctrl.phase,
+                    turn_id=turn_id,
+                    detail="list_options" if intent.kind == "list_options" else "repeat",
                 )
+            # Program-summary contextual questions — never Start Applications.
+            if step == "programs" and text:
+                from .app_stage import (
+                    programs_context_reply,
+                    summary_from_session_filled,
+                )
+
+                session_p = await get_session(call_id)
+                summary = summary_from_session_filled(
+                    session_p.filled if session_p else {}
+                )
+                ctx = programs_context_reply(text, summary)
+                if ctx:
+                    ctrl.last_speech = ctx
+                    return TurnResult(
+                        speech=ctx,
+                        phase=ctrl.phase,
+                        turn_id=turn_id,
+                        detail="programs_context",
+                    )
             if intent.kind == "next":
                 if ctrl.elig_op_in_progress:
                     return TurnResult(
@@ -2151,35 +2725,42 @@ async def process_user_turn(
                     speech=speech, phase=ctrl.phase, turn_id=turn_id, detail="next"
                 )
             if intent.kind == "go_back":
-                # Handled earlier so pending browser fills cannot block navigation.
-                epoch = _begin_elig_navigation(ctrl)
-                ctrl.pending_correction = None
-                nav = await navigate_back_one(call_id)
-                speech = _strip_ask(str(nav.get("spoken") or ""))
-                if nav.get("ok"):
-                    ctrl.last_speech = speech
-                    trace_event(
-                        call_id,
-                        "elig_go_back",
-                        turn_id=turn_id,
-                        epoch=epoch,
-                        step=str(nav.get("step") or ""),
-                        ok=True,
-                    )
+                # Same-page income period change is not browser Back.
+                if step == "income_range" and (
+                    _detect_income_period_switch(text)
+                    or _wants_income_period_reselect(text)
+                ):
+                    pass  # Fall through to resolve_answer / submit.
+                else:
+                    # Handled earlier so pending browser fills cannot block navigation.
+                    epoch = _begin_elig_navigation(ctrl)
+                    ctrl.pending_correction = None
+                    nav = await navigate_back_one(call_id)
+                    speech = _strip_ask(str(nav.get("spoken") or ""))
+                    if nav.get("ok"):
+                        ctrl.last_speech = speech
+                        trace_event(
+                            call_id,
+                            "elig_go_back",
+                            turn_id=turn_id,
+                            epoch=epoch,
+                            step=str(nav.get("step") or ""),
+                            ok=True,
+                        )
+                        return TurnResult(
+                            speech=speech,
+                            phase=ctrl.phase,
+                            turn_id=turn_id,
+                            detail="go_back",
+                        )
+                    ctrl.last_speech = speech or format_question(step)
                     return TurnResult(
-                        speech=speech,
+                        speech=ctrl.last_speech,
                         phase=ctrl.phase,
                         turn_id=turn_id,
-                        detail="go_back",
+                        ok=False,
+                        detail="go_back_failed",
                     )
-                ctrl.last_speech = speech or format_question(step)
-                return TurnResult(
-                    speech=ctrl.last_speech,
-                    phase=ctrl.phase,
-                    turn_id=turn_id,
-                    ok=False,
-                    detail="go_back_failed",
-                )
             if intent.kind == "skip":
                 skip_result = await skip_current_optional(call_id)
                 speech = _strip_ask(str(skip_result.get("spoken") or ""))
@@ -2222,10 +2803,11 @@ async def process_user_turn(
                 field = intent.target or ""
                 if not field:
                     prompt = (
-                        "Which field should I change — first name, last name, or age?"
+                        "Which field should I change — first name, last name, "
+                        "relationship, or age?"
                     )
                     ctrl.pending_correction = {
-                        "field": "first_name",
+                        "field": "",
                         "prompt": prompt,
                         "need_field": True,
                     }
@@ -2249,34 +2831,56 @@ async def process_user_turn(
                         turn_id=turn_id,
                         detail="correction_prompt",
                     )
-                if field in ("first_name", "last_name", "name"):
-                    value = sanitize_person_name(intent.value) or intent.value
+                # In-place member-form correction — never Back through children/marital.
+                if _same_member_form_step(step) or field in (
+                    "first_name",
+                    "last_name",
+                    "age",
+                    "relationship",
+                ):
+                    value = intent.value
+                    if field in ("first_name", "last_name"):
+                        value = sanitize_person_name(value) or value
                     ctrl.last_user_fp = fp
                     ctrl.last_dedupe_ctx = dedupe_ctx
-                    edit = await correct_name_field(call_id, field, value)
+                    edit = await correct_member_field(call_id, field, value)
                     speech = _strip_ask(str(edit.get("spoken") or ""))
+                    if edit.get("ok"):
+                        ctrl.pending_correction = None
+                    else:
+                        ctrl.pending_correction = {
+                            "field": field,
+                            "prompt": speech or _correction_prompt(field),
+                        }
                     ctrl.last_speech = speech
                     return TurnResult(
-                        speech=speech or format_question(step),
+                        speech=speech or _correction_prompt(field),
                         phase=ctrl.phase,
                         turn_id=turn_id,
                         ok=bool(edit.get("ok")),
-                        detail="name_corrected"
+                        detail="member_corrected"
                         if edit.get("ok")
-                        else "name_correct_failed",
+                        else "member_correct_failed",
                     )
-                # Non-name change with value: verified Back then apply.
+                # Outside member forms: map to the target step without blind Back loops
+                # when already on the same questionnaire group.
                 target_step = _step_for_correction_field(field, step)
-                for _ in range(4):
+                if _step_group_safe(step) != _step_group_safe(target_step):
+                    for _ in range(4):
+                        session = await get_session(call_id)
+                        cur = (session.elig_step if session else "") or step
+                        if cur == target_step:
+                            step = cur
+                            break
+                        nav = await navigate_back_one(call_id)
+                        if not nav.get("ok"):
+                            break
+                        step = str(nav.get("step") or target_step)
+                else:
+                    step = target_step
                     session = await get_session(call_id)
-                    cur = (session.elig_step if session else "") or step
-                    if cur == target_step:
-                        step = cur
-                        break
-                    nav = await navigate_back_one(call_id)
-                    if not nav.get("ok"):
-                        break
-                    step = str(nav.get("step") or target_step)
+                    if session is not None:
+                        session.elig_step = target_step
                 meta = get_field_meta(step)
                 text = intent.value
 
@@ -2285,13 +2889,62 @@ async def process_user_turn(
             resolve_opts = labels or None
             if step in ("spouse_age", "child_age", "person_age"):
                 resolve_opts = _age_option_labels(labels) or None
-            resolved = resolve_answer(
-                step, text, options=resolve_opts, meta=meta
+            # Application permission gate is Yes/No only — ignore dashboard CTAs.
+            if step in (
+                "proceed_application",
+                "confirm_start_application",
+                "programs",
+                "spouse_confirm",
+                "child_confirm",
+                "person_confirm",
+            ):
+                resolve_opts = None
+            # Custom "Other" relationship text — accept free text, never rematch chips.
+            awaiting_other = (
+                (session.filled.get("rel_other_awaiting") or "")
+                if session is not None
+                else ""
             )
+            if awaiting_other in ("person_rel", "child_rel") and step == awaiting_other:
+                cleaned_other = re.sub(r"\s+", " ", (text or "").strip()).strip(" .")
+                if cleaned_other and detect_control_intent(cleaned_other).kind == "none":
+                    resolved = ResolveResult(
+                        answer=cleaned_other,
+                        detail="relationship_other_text",
+                    )
+                else:
+                    resolved = resolve_answer(
+                        step, text, options=resolve_opts, meta=meta
+                    )
+            else:
+                resolved = resolve_answer(
+                    step, text, options=resolve_opts, meta=meta
+                )
             answer, clarify = resolved.answer, resolved.clarify
             resolver_used = "python"
+            # Prefer the selected income period in voice clarifies / questions.
+            if step == "income_range" and session is not None:
+                period_now = session.filled.get("income_when") or "Annual"
+                if resolved.detail == "income_scale_unclear":
+                    from .live_form import _income_scale_clarify_speech
+
+                    clarify = _income_scale_clarify_speech(text, period_now)
+                elif resolved.detail in (
+                    "income_range_ambiguous",
+                    "income_range_unclear",
+                ):
+                    from .live_form import _income_range_natural_clarify
+
+                    clarify = _income_range_natural_clarify(
+                        text, period=period_now
+                    )
             if clarify == "__REPEAT__":
-                speech = format_question(step, options=resolve_opts)
+                period_for_q = None
+                if step == "income_range" and session is not None:
+                    period_for_q = session.filled.get("income_when") or "Annual"
+                speech = format_question(
+                    step, options=resolve_opts, period=period_for_q
+                )
                 ctrl.last_speech = speech
                 return TurnResult(
                     speech=speech, phase=ctrl.phase, turn_id=turn_id, detail="repeat"
@@ -2375,20 +3028,50 @@ async def process_user_turn(
                     "timeout",
                     "error",
                 ):
-                    # Timeout/error: keep Python clarify; never invent options from
-                    # unrelated form labels, and never click a low-confidence guess.
-                    clarify = (
-                        claude.clarify_prompt
-                        or clarify
-                        or format_question(step, options=resolve_opts)
+                    # Timeout/error: deterministic local fallback — never invent
+                    # options, never append "Options include" to required-field chrome,
+                    # never click a low-confidence guess.
+                    from .live_form import (
+                        _income_range_natural_clarify,
+                        build_options_help_speech,
                     )
-                    if (
-                        resolve_opts
-                        and "Please choose" not in (clarify or "")
-                        and "Options include" not in (clarify or "")
-                    ):
-                        shown = ", ".join(resolve_opts[:6])
-                        clarify = f"{clarify} Options include: {shown}."
+
+                    if step == "income_range":
+                        period_now = (
+                            (session.filled.get("income_when") or "Annual")
+                            if session
+                            else "Annual"
+                        )
+                        local_fallback = _income_range_natural_clarify(
+                            text, period=period_now
+                        )
+                    else:
+                        local_fallback = build_options_help_speech(
+                            step, resolve_opts
+                        )
+                    if claude.reject_reason in ("timeout", "error"):
+                        # Prefer local contextual speech over Claude's delayed prompt.
+                        clarify = local_fallback or clarify or format_question(step)
+                    else:
+                        clarify = (
+                            claude.clarify_prompt
+                            or local_fallback
+                            or clarify
+                            or format_question(step)
+                        )
+                    # Strip any leaked internal validation wording.
+                    clarify = re.sub(
+                        r"\s*This field is required to continue\.?",
+                        "",
+                        clarify or "",
+                        flags=re.I,
+                    ).strip()
+                    clarify = re.sub(
+                        r"\s*Options include:.*$",
+                        "",
+                        clarify,
+                        flags=re.I,
+                    ).strip() or local_fallback or format_question(step)
                     answer = None
                     logger.info(
                         "answer_resolver=claude call_id=%s step=%s verified=0 "
@@ -2465,8 +3148,13 @@ async def process_user_turn(
             ctrl.last_user_fp = fp
             ctrl.last_dedupe_ctx = dedupe_ctx
             ctrl.pending_op_id = turn_id
+            ctrl.last_elig_attempt_failed = False
+            if transcript_user_index is not None and transcript_user_index >= 0:
+                ctrl.consumed_transcript_user_index = transcript_user_index
 
-            # Slow browser steps: ack immediately, apply in background, interrupt next Q.
+            # Slow browser steps: apply in background. Speak "One moment" only when
+            # the operation is still running after a short wait; otherwise the
+            # interrupt already delivered the next question (avoid a dead ack).
             if step in _SLOW_ELIG_STEPS:
                 ctrl.elig_nav_epoch += 1
                 epoch = ctrl.elig_nav_epoch
@@ -2480,6 +3168,43 @@ async def process_user_turn(
                     commit_key=commit_key,
                     epoch=epoch,
                 )
+                task = _elig_browser_tasks.get(call_id)
+                fast_done = False
+                if task is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=0.45)
+                        fast_done = task.done() and not task.cancelled()
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        fast_done = False
+                    except Exception:
+                        fast_done = False
+                if fast_done and ctrl.elig_nav_epoch == epoch:
+                    # Background already interrupted the next/clarify speech.
+                    speech = (ctrl.last_speech or "").strip()
+                    if speech and speech != ELIG_PROGRESS_ACK:
+                        logger.info(
+                            "elig_fast_complete call_id=%s step=%s turn_id=%s "
+                            "epoch=%s speech=%r",
+                            call_id,
+                            step,
+                            turn_id,
+                            epoch,
+                            speech[:60],
+                        )
+                        trace_event(
+                            call_id,
+                            "elig_fast_complete",
+                            turn_id=turn_id,
+                            step=step,
+                            epoch=epoch,
+                            phase=ctrl.phase,
+                        )
+                        return TurnResult(
+                            speech="",
+                            phase=ctrl.phase,
+                            turn_id=turn_id,
+                            detail="elig_fast_complete",
+                        )
                 ctrl.last_speech = ELIG_PROGRESS_ACK
                 logger.info(
                     "elig_ack_sent call_id=%s response_id=%s step=%s turn_id=%s epoch=%s "
@@ -2538,35 +3263,57 @@ async def process_user_turn(
                     "at": time.time(),
                 }
             )
-            # Explicit empty step closes Stage D (do not treat "" as missing).
+            # Explicit empty step closes (decline / submitted). app_* starts Stage E.
             next_step = str(result["step"]) if "step" in result else ""
+            if str(next_step).startswith("app_") or result.get("phase") == "application":
+                ctrl.phase = "application"
+                if not spoken and str(next_step).startswith("app_"):
+                    from .app_stage import app_question_for_step
+
+                    speech = app_question_for_step(str(next_step))
+                else:
+                    speech = spoken or format_question(next_step)
+                ctrl.last_speech = speech
+                ctrl.last_question_delivery_key = f"sync:stage_e:{next_step}:{turn_id}"
+                return TurnResult(
+                    speech=speech,
+                    phase="application",
+                    turn_id=turn_id,
+                    detail="stage_e",
+                )
             if not next_step:
-                if STAGE_E_ENABLED:
-                    ctrl.phase = "closing"
-                    stage_e = await start_stage_e(call_id, form_url)
-                    ctrl.last_speech = stage_e.speech
-                    return TurnResult(
-                        speech=stage_e.speech,
-                        end_call=stage_e.end_call,
-                        phase=ctrl.phase,
-                        turn_id=turn_id,
-                        detail="stage_e",
-                    )
                 ctrl.phase = "closing"
                 speech = _closing_speech(spoken)
                 ctrl.last_speech = speech
                 return TurnResult(
                     speech=speech,
-                    end_call=True,
+                    end_call=bool(result.get("end_call", True)),
                     phase=ctrl.phase,
                     turn_id=turn_id,
-                    detail="eligibility_complete",
+                    detail=str(result.get("action") or "eligibility_complete"),
                 )
 
             speech = spoken or format_question(next_step)
             ctrl.last_speech = speech
+            if result.get("await_field_correction"):
+                ctrl.pending_correction = {
+                    "field": "",
+                    "prompt": speech,
+                    "need_field": True,
+                }
             ctrl.last_question_delivery_key = f"sync:{next_step}:{turn_id}"
             return TurnResult(speech=speech, phase=ctrl.phase, turn_id=turn_id)
+
+        if ctrl.phase == "application":
+            return await _process_application_turn(
+                call_id,
+                ctrl,
+                text=text,
+                fp=fp,
+                dedupe_ctx=dedupe_ctx,
+                turn_id=turn_id,
+                form_url=form_url,
+            )
 
         # closing / unknown
         return TurnResult(
